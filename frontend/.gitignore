@@ -1,0 +1,11 @@
+node_modules
+dist
+*.local
+.DS_Store
+
+# `tsc -b` used to emit the compiled twin of vite.config.ts next to the source, where Vite
+# loads it in preference to the .ts — so edits to the .ts silently did nothing. noEmit is set
+# in tsconfig.node.json; these patterns stop a stray emission from being committed again.
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo

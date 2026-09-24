@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="pytest" tests="2" failures="1" errors="0" skipped="0">
+  <testcase classname="SN_SPM_WPOS_ALIGN_Drift_002" name="test_sn_spm_wpos_align_drift_002" time="742.310">
+    <failure message="AssertionError: expect AlignStatus.LOCKED, real AlignStatus.DRIFT">/data/atlog/align_case.py:88: in run_align
+/data/atlog/align_check.py:203: in verify_lock
+E       AssertionError: expect AlignStatus.LOCKED, real AlignStatus.DRIFT</failure>
+  </testcase>
+  <testcase classname="SN_OTHER_case" name="test_sn_other_case" time="12.500"/>
+</testsuite>

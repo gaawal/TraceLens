@@ -1,0 +1,66 @@
+@base = http://127.0.0.1:8000/api
+
+### 添加上位机
+POST {{base}}/machines/
+Content-Type: application/json
+
+{
+  "name": "L4-测试环境",
+  "host": "10.1.124.94",
+  "ssh_port": 22,
+  "username": "user",
+  "role": "upper",
+  "auth_type": "password",
+  "password": "change-me"
+}
+
+### 资源设置
+PATCH {{base}}/resource-settings/current/
+Content-Type: application/json
+
+{
+  "station_xml_path": "~/SW/config/sw/slcm/stations.xml",
+  "version_file_path": "~/SW/version",
+  "log_root_template": "/log/{username}/debug",
+  "lower_username": "root",
+  "lower_ssh_port": 22,
+  "lower_auth_type": "password",
+  "lower_password": "change-me"
+}
+
+### 发现拓扑
+POST {{base}}/environments/1/discover/
+Content-Type: application/json
+
+{}
+
+### 查询版本
+POST {{base}}/environments/1/query-version/
+Content-Type: application/json
+
+{}
+
+### 扫描日志目录
+GET {{base}}/environment-logs/1/subsystems/
+
+### 预览日志计划
+POST {{base}}/environment-logs/1/plan/
+Content-Type: application/json
+
+{
+  "start_time": "2026-08-05T15:00:00",
+  "end_time": "2026-08-05T16:00:00",
+  "subsystems": ["spws"],
+  "fms": ["dspwsft"]
+}
+
+### 获取时间窗日志
+POST {{base}}/environment-logs/1/stream/
+Content-Type: application/json
+
+{
+  "start_time": "2026-08-05T15:00:00",
+  "end_time": "2026-08-05T16:00:00",
+  "subsystems": ["spws"],
+  "fms": []
+}

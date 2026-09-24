@@ -1,0 +1,46 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tracelens-redis
+    env_file:
+      - .env
+    command: >
+      sh -c 'if [ -n "$$TRACELENS_REDIS_PASSWORD" ]; then
+        exec redis-server --save "" --appendonly no --maxmemory $${TRACELENS_REDIS_MAXMEMORY:-2gb} --maxmemory-policy allkeys-lru --requirepass "$$TRACELENS_REDIS_PASSWORD";
+      else
+        exec redis-server --save "" --appendonly no --maxmemory $${TRACELENS_REDIS_MAXMEMORY:-2gb} --maxmemory-policy allkeys-lru;
+      fi'
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: tracelens-backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      SQLITE_PATH: /app/data/db.sqlite3
+      TRACELENS_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+  deployment-worker:
+    build: .
+    container_name: tracelens-deployment-worker
+    env_file:
+      - .env
+    command: python manage.py deployment_worker
+    volumes:
+      - ./data:/app/data
+    environment:
+      SQLITE_PATH: /app/data/db.sqlite3
+      TRACELENS_REDIS_URL: redis://redis:6379/0
+      TRACELENS_DEPLOYMENT_WORKER_CONCURRENCY: ${TRACELENS_DEPLOYMENT_WORKER_CONCURRENCY:-4}
+      TRACELENS_DEPLOYMENT_EMBEDDED_SCHEDULER: "false"
+    depends_on:
+      - redis
+    restart: unless-stopped
+

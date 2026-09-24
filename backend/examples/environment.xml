@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Environment>
+  <LowerMachines>
+    <LowerMachine name="L3-01" ip="192.168.1.20" />
+    <LowerMachine name="L3-02" ip="192.168.1.21" />
+  </LowerMachines>
+</Environment>

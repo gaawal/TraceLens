@@ -1,0 +1,5 @@
+# Optional local speech-to-text service for TraceLens AI Assistant.
+fastapi>=0.115,<1
+python-multipart>=0.0.20,<1
+uvicorn[standard]>=0.30,<1
+faster-whisper>=1.1,<2
