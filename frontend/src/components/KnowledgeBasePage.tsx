@@ -30,7 +30,7 @@ function historyAction(action: string): string {
  * out"). Analysis now runs through TracePilot, so this page owns the case library and offers
  * the two entry points into that flow: 检索历史案例 and AI 诊断.
  */
-export function KnowledgeBasePage({ onOpenAtLogAnalysis }: { onOpenAtLogAnalysis?: () => void } = {}) {
+export function KnowledgeBasePage() {
   const [cases, setCases] = useState<AbnormalCase[]>([]);
   const [query, setQuery] = useState('');
   const [enabledFilter, setEnabledFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
@@ -152,6 +152,8 @@ export function KnowledgeBasePage({ onOpenAtLogAnalysis }: { onOpenAtLogAnalysis
     return registerPageContextReader(handler, 10);
   }, [query, enabledFilter, cases, filtered, enabledCount, categories, featureGroupCount, detail, editing]);
 
+  // 这一页就是案例库：只展示案例。抬头说明、汇总条、以及跳到「用例分析」的入口都去掉
+  // —— 那些是页面上的额外叙述，看案例的人不需要先读一段介绍。
   return <main className="knowledge-page">
     <section className="knowledge-page-header">
       <div className="knowledge-analysis-actions">
@@ -165,7 +167,7 @@ export function KnowledgeBasePage({ onOpenAtLogAnalysis }: { onOpenAtLogAnalysis
               detail: {
                 skill_id: 'auto',
                 scope_key: 'knowledge:analysis',
-                scope_label: '案例与分析',
+                scope_label: '案例库',
                 title: `案例诊断 · ${query || '当前日志'}`.slice(0, 60),
                 context: { page: 'knowledge', knowledge_query: query, case_id: detail?.id || editing?.id || null },
               },
@@ -174,20 +176,7 @@ export function KnowledgeBasePage({ onOpenAtLogAnalysis }: { onOpenAtLogAnalysis
         >
           <ShieldCheck size={14} /> AI 诊断
         </button>
-        {onOpenAtLogAnalysis && (
-          <button type="button" className="button ghost compact" onClick={onOpenAtLogAnalysis} title="按 ATLog 用例 URL 做完整诊断">
-            用例分析（ATLog）
-          </button>
-        )}
       </div>
-      <div><span className="eyebrow">ABNORMAL KNOWLEDGE BASE</span><h1>案例分析</h1><p>同一个问题可持续沉淀多组现场特征；录入新案例时会自动检查疑似重复，避免知识库重复膨胀。</p></div>
-    </section>
-
-    <section className="knowledge-summary-strip">
-      <div><BookOpenCheck size={18}/><strong>{cases.length}</strong><span>异常案例</span></div>
-      <div><strong>{enabledCount}</strong><span>启用案例</span></div>
-      <div><strong>{featureGroupCount}</strong><span>现场特征组</span></div>
-      <div><strong>{categories}</strong><span>故障分类</span></div>
     </section>
 
     <section className="knowledge-query-bar unified-query-shell">
@@ -201,7 +190,6 @@ export function KnowledgeBasePage({ onOpenAtLogAnalysis }: { onOpenAtLogAnalysis
         </div>
         <button className="button primary remote-search-apply" onClick={() => void refresh()} disabled={loading}><Search size={14}/> 搜索</button>
         <button className="button ghost knowledge-refresh-button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? 'spin' : ''} size={14}/> 刷新</button>
-        <small>新案例仍从日志定位中录入；重复现场可直接补充到已有案例。</small>
       </div>
     </section>
 

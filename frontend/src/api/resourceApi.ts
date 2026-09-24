@@ -2004,15 +2004,53 @@ export interface CpdReportQueryResult {
   cached_at?: string;
 }
 
-export interface CpdDataQuery { subsystem: string; module: string; start_time: string; end_time: string }
-export interface CpdDataFile { name: string; path: string; size: number; sheets: Array<{name: string; matched_rows: number; time_column: string | null; filter_status: string; invalid_time_rows: number}> }
-export interface CpdDataIndex { root: string; files: CpdDataFile[]; errors: Array<{path: string; error: string}> }
-export interface CpdSheetPreview { path: string; sheet: string; headers: string[]; rows: Array<{line: number; cells: unknown[]}>; total: number; page: number; page_size: number; time_column?: string; warning?: string; invalid_time_rows?: number }
-export async function getCpdDataFiles(environmentId: number, query: CpdDataQuery): Promise<CpdDataIndex> {
-  return api(`/cpd-reports/${environmentId}/data-files/?${new URLSearchParams({...query})}`);
+// 旧的「按时间列过滤行」数据接口已不再被界面使用（见 CpdDataBrowser）：
+// 它要求表里有时间列，结构不同的表会直接显示为空。后端端点保留给脚本使用，
+// 前端只走 data-browser / sheet / data-file 这条「原样渲染」路径。
+
+// ---------------------------------------------------------------- 测校数据在线浏览
+// 只做「列出文件 → 渲染表格/图片」，不判断表里有没有时间列，也不按时间窗过滤行。
+export interface CpdDataBrowserFile {
+  name: string;
+  path: string;
+  size: number;
+  kind: 'excel' | 'image' | string;
+  sheets?: string[];
 }
-export async function getCpdExcelPreview(environmentId: number, query: CpdDataQuery & { path: string; sheet: string; page: string; page_size: string; sort_column: string; descending: string }): Promise<CpdSheetPreview> {
-  return api(`/cpd-reports/${environmentId}/excel-preview/?${new URLSearchParams({...query})}`);
+export interface CpdDataBrowserIndex {
+  root: string;
+  files: CpdDataBrowserFile[];
+  errors: Array<{ path: string; error: string }>;
+}
+export interface CpdRawSheet {
+  path: string;
+  sheet: string;
+  sheets: string[];
+  headers: string[];
+  rows: Array<{ line: number; cells: unknown[] }>;
+  total: number;
+  page: number;
+  page_size: number;
+  empty?: boolean;
+}
+
+export async function getCpdDataBrowser(environmentId: number, subsystem: string, module: string): Promise<CpdDataBrowserIndex> {
+  return api(`/cpd-reports/${environmentId}/data-browser/?${new URLSearchParams({ subsystem, module })}`);
+}
+
+export async function getCpdSheet(environmentId: number, query: {
+  subsystem: string; module: string; path: string; sheet?: string;
+  page?: string; page_size?: string; sort_column?: string; descending?: string;
+}): Promise<CpdRawSheet> {
+  const search = new URLSearchParams();
+  Object.entries(query).forEach(([key, value]) => { if (value !== undefined && value !== '') search.set(key, String(value)); });
+  return api(`/cpd-reports/${environmentId}/sheet/?${search.toString()}`);
+}
+
+/** 图片直链：<img src> 直接用它，不必先下载再转 base64。 */
+export function cpdDataFileUrl(environmentId: number, subsystem: string, module: string, path: string): string {
+  const search = new URLSearchParams({ subsystem, module, path });
+  return `${API_BASE}/cpd-reports/${environmentId}/data-file/?${search.toString()}`;
 }
 
 export async function getCpdReportSnapshot(environmentId: number, refresh = false): Promise<{ environment_id: number; tree: CpdReportTree; reports: CpdReportSummary[]; cache_status?: string; fingerprint?: string; cached_at?: string; catalog_count?: number }> {

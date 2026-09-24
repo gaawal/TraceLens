@@ -1,5 +1,5 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
-import { CpdDataDialog } from './CpdDataDialog';
+import { CpdDataBrowser } from './CpdDataBrowser';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
@@ -398,7 +398,7 @@ export function CpdReportPage({ environment, onLocateLogs }: Props) {
     </section>
 
 
-    {cpdData && <CpdDataDialog key={`${environment.id}:${cpdData.full_path}`} environment={environment} report={cpdData} onClose={() => setCpdData(undefined)} />}
+    {cpdData && <CpdDataBrowser key={`${environment.id}:${cpdData.full_path}`} environment={environment} report={cpdData} onClose={() => setCpdData(undefined)} />}
     {content && <div className="resource-modal-backdrop" onMouseDown={() => setContent(undefined)}><section className="cpd-report-viewer cpd-report-viewer-v014" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">REPORT TEXT</span><h2>{content.file}</h2><p>{content.path}</p></div><button className="icon-button" onClick={() => setContent(undefined)}><X size={18}/></button></header><pre>{content.text}</pre></section></div>}
   </main>;
 }

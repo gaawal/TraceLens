@@ -185,3 +185,153 @@ def preview_cpd_excel(environment, subsystem, module, path, sheet, start_time, e
             with remote_workbook(sftp, root, path) as workbook:
                 return {'path': path, 'sheets': workbook.sheetnames, **preview_sheet(workbook, sheet or workbook.sheetnames[0], start, end, **options)}
         finally: sftp.close()
+
+
+# --------------------------------------------------------------------------- 在线渲染
+# 「数据」页只需要把检索到的文件按路径列出来、点开看到表格内容。
+# 这里刻意不做任何结构判断：不找时间列、不按时间窗过滤、不因为「缺时间列」就返回空表。
+# 以前的路径把「表里必须有时间列」当成前提，于是结构不同的表直接显示不出任何内容。
+
+IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg')
+CONTENT_TYPES = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.bmp': 'image/bmp', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+}
+
+
+def walk_data_files(sftp, root: str):
+    """递归列出测校数据目录下的 Excel 与图片（不含临时文件）。"""
+    pending, visited = [root], set()
+    while pending:
+        path = pending.pop()
+        if path in visited:
+            continue
+        visited.add(path)
+        for item in sftp.listdir_attr(path):
+            child = posixpath.join(path, item.filename)
+            if item.filename in {'.', '..'} or '/' in item.filename or item.filename.startswith('~$'):
+                continue
+            if stat.S_ISDIR(item.st_mode):
+                pending.append(child)
+            elif stat.S_ISREG(item.st_mode):
+                lowered = item.filename.lower()
+                if lowered.endswith('.xlsx'):
+                    yield {'name': item.filename, 'path': child, 'size': item.st_size, 'kind': 'excel'}
+                elif lowered.endswith(IMAGE_SUFFIXES):
+                    yield {'name': item.filename, 'path': child, 'size': item.st_size, 'kind': 'image'}
+
+
+def list_cpd_data_files(environment, subsystem: str, module: str):
+    """数据浏览用的文件清单：只报「有什么文件、里面有哪些工作表」。"""
+    root = data_root(environment, subsystem, module)
+    files, errors = [], []
+    with ssh_session(environment.upper_machine) as lease:
+        sftp = lease.client.open_sftp()
+        try:
+            for item in walk_data_files(sftp, root):
+                if item['kind'] != 'excel':
+                    files.append(item)
+                    continue
+                try:
+                    with remote_workbook(sftp, root, item['path']) as workbook:
+                        sheets = list(workbook.sheetnames)
+                    files.append({**item, 'sheets': sheets})
+                except Exception as exc:  # noqa: BLE001 - 单个坏文件不该挡住其它文件
+                    errors.append({'path': item['path'], 'error': str(exc)})
+        finally:
+            sftp.close()
+    return {'root': root, 'files': sorted(files, key=lambda f: f['path']), 'errors': errors}
+
+
+def read_sheet_rows(sheet):
+    """把一张表读成 (headers, rows)：第一行非空行当表头，其余当数据。
+
+    与 :func:`sheet_rows` 的区别是**不找时间列**：找不到时间列时旧实现返回空表头 + 空行，
+    看上去就是「这个文件没数据」。这里只做一件事——把单元格渲染出来。
+    """
+    headers: list[str] = []
+    rows: list[tuple[int, list]] = []
+    for number, row in enumerate(sheet.iter_rows(values_only=True), 1):
+        values = list(row)
+        if not any(cell not in (None, '') for cell in values):
+            continue
+        if not headers:
+            headers = ['' if cell is None else str(cell).strip() for cell in values]
+            continue
+        rows.append((number, values))
+    return headers, rows
+
+
+def preview_sheet_raw(workbook, sheet_name: str, *, page=1, page_size=100, sort_column=None, descending=False):
+    """原样渲染一张表：不做时间过滤、不校验结构；只分页 + 可选排序。"""
+    if sheet_name not in workbook.sheetnames:
+        raise ValueError('Sheet 不存在')
+    page, page_size = max(1, int(page)), max(1, min(500, int(page_size)))
+    headers, rows = read_sheet_rows(workbook[sheet_name])
+    if len(headers) == 0 and not rows:
+        return {'sheet': sheet_name, 'headers': [], 'rows': [], 'total': 0, 'page': page, 'page_size': page_size, 'empty': True}
+
+    def scalar(value):
+        if isinstance(value, datetime):
+            return value.isoformat(sep=' ')
+        if isinstance(value, (date, time)):
+            return value.isoformat()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    sort_index = int(sort_column) if sort_column is not None and str(sort_column) != '' else None
+    if sort_index is not None and not 0 <= sort_index < len(headers):
+        raise ValueError('排序列无效')
+    total = len(rows)
+    if sort_index is not None:
+        def key(item):
+            values = item[1]
+            value = values[sort_index] if sort_index < len(values) else None
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            return (0, value if numeric else 0, '' if numeric else str(value or ''))
+        rows = sorted(rows, key=key, reverse=bool(descending))
+    window = rows[(page - 1) * page_size: page * page_size]
+    return {
+        'sheet': sheet_name,
+        'headers': headers,
+        'rows': [{'line': number, 'cells': [scalar(cell) for cell in values]} for number, values in window],
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+    }
+
+
+def preview_cpd_sheet_raw(environment, subsystem, module, path, sheet, **options):
+    root = data_root(environment, subsystem, module)
+    with ssh_session(environment.upper_machine) as lease:
+        sftp = lease.client.open_sftp()
+        try:
+            with remote_workbook(sftp, root, path) as workbook:
+                name = sheet or workbook.sheetnames[0]
+                return {'path': path, 'sheets': workbook.sheetnames, **preview_sheet_raw(workbook, name, **options)}
+        finally:
+            sftp.close()
+
+
+def read_cpd_data_file(environment, subsystem, module, path):
+    """读取测校目录下的单个文件字节（图片/表格），用于前端直接渲染。"""
+    root = data_root(environment, subsystem, module)
+    normalized = posixpath.normpath(path)
+    lowered = normalized.lower()
+    if not normalized.startswith(root + '/') or '..' in PurePosixPath(path).parts:
+        raise ValueError('只能读取当前环境测校数据目录内的文件')
+    if not (lowered.endswith('.xlsx') or lowered.endswith(IMAGE_SUFFIXES)):
+        raise ValueError('不支持的文件类型')
+    suffix = posixpath.splitext(lowered)[1]
+    with ssh_session(environment.upper_machine) as lease:
+        sftp = lease.client.open_sftp()
+        try:
+            if sftp.stat(normalized).st_size > 128 * 1024 * 1024:
+                raise ValueError('文件超过 128 MiB，请另行下载查看')
+            with sftp.open(normalized, 'rb') as remote:
+                payload = remote.read()
+        finally:
+            sftp.close()
+    return payload, CONTENT_TYPES.get(suffix, 'application/octet-stream')

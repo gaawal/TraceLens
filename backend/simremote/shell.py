@@ -48,8 +48,11 @@ class _FindSpec:
         if not self.groups:
             return True
         for group in self.groups:
+            # 空组 = 这一组没有任何 -name 约束，也就是「全都要」。
+            # 以前这里 continue 掉，函数最后 return False —— 于是**不带 -name 的 find 永远输出空**，
+            # 而且退出码是 0，调用方完全看不出问题（CPD 报告目录扫描就是这么变成 0 份报告的）。
             if not group:
-                continue
+                return True
             if all(_name_matches(name, mode, pattern) for mode, pattern in group):
                 return True
         return False

@@ -138,6 +138,70 @@ class CpdReportViewSet(viewsets.ViewSet):
         except Exception as exc:
             return Response({"message": str(exc)}, status=502)
 
+    @action(detail=True, methods=["get"], url_path="data-browser")
+    def data_browser(self, request, pk=None):
+        """「数据」页的文件清单：按路径列出检索到的 Excel 与图片，不做任何结构判断。
+
+        与 data-files 的区别是不需要时间窗、不判断「有没有时间列」——
+        结构不同的表也要能点开看。
+        """
+        from apps.reports.cpd_data_service import list_cpd_data_files
+
+        try:
+            q = request.query_params
+            return Response(list_cpd_data_files(self._environment(pk), q.get("subsystem", ""), q.get("module", "")))
+        except Environment.DoesNotExist:
+            return Response({"message": "环境不存在"}, status=404)
+        except ValueError as exc:
+            return Response({"message": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cpd.api.data_browser.failed environment=%s", pk)
+            return Response({"message": str(exc)}, status=502)
+
+    @action(detail=True, methods=["get"], url_path="sheet")
+    def sheet(self, request, pk=None):
+        """原样渲染一张工作表（分页 + 可选排序），不按时间过滤、不校验表结构。"""
+        from apps.reports.cpd_data_service import preview_cpd_sheet_raw
+
+        try:
+            q = request.query_params
+            return Response(preview_cpd_sheet_raw(
+                self._environment(pk), q.get("subsystem", ""), q.get("module", ""),
+                q.get("path", ""), q.get("sheet", ""),
+                page=q.get("page", 1), page_size=q.get("page_size", 100),
+                sort_column=q.get("sort_column"), descending=q.get("descending") == "true",
+            ))
+        except Environment.DoesNotExist:
+            return Response({"message": "环境不存在"}, status=404)
+        except ValueError as exc:
+            return Response({"message": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cpd.api.sheet.failed environment=%s", pk)
+            return Response({"message": str(exc)}, status=502)
+
+    @action(detail=True, methods=["get"], url_path="data-file")
+    def data_file(self, request, pk=None):
+        """取测校目录下的单个文件字节（图片直接渲染，Excel 供下载/外部打开）。"""
+        from django.http import HttpResponse
+
+        from apps.reports.cpd_data_service import read_cpd_data_file
+
+        try:
+            q = request.query_params
+            payload, content_type = read_cpd_data_file(
+                self._environment(pk), q.get("subsystem", ""), q.get("module", ""), q.get("path", ""),
+            )
+        except Environment.DoesNotExist:
+            return Response({"message": "环境不存在"}, status=404)
+        except ValueError as exc:
+            return Response({"message": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cpd.api.data_file.failed environment=%s", pk)
+            return Response({"message": str(exc)}, status=502)
+        response = HttpResponse(payload, content_type=content_type)
+        response["Cache-Control"] = "private, max-age=300"
+        return response
+
     @action(detail=True, methods=["get"], url_path="content")
     def content(self, request, pk=None):
         try:

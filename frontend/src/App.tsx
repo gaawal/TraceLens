@@ -7745,10 +7745,9 @@ export default function App() {
       <button type="button" className={active === 'resources' ? 'active' : undefined} onClick={() => setWorkspacePage('resources')}><ServerCog size={16} /> 环境资源</button>
       <button type="button" className={active === 'logs' ? 'active' : undefined} onClick={openGlobalLogLocator}><FileSearch size={16} /> 日志定位</button>
       <button type="button" className={active === 'data' ? 'active' : undefined} onClick={() => openDataPage()}><Database size={16} /> 数据提取</button>
-      {/* 用例分析 and 案例与分析 are separate jobs: one triages automation-case reports, the
-          other curates the reusable knowledge base. Merging them hid the case workspace behind
-          a second click, so they are two entries again. */}
-      <button type="button" className={active === 'knowledge' ? 'active' : undefined} onClick={() => setWorkspacePage('knowledge')}><BookOpenCheck size={16} /> 案例与分析</button>
+      {/* 用例分析 and 案例库 are separate jobs: one triages automation-case reports, the other
+          curates the reusable knowledge base. This entry only shows cases, so it says so. */}
+      <button type="button" className={active === 'knowledge' ? 'active' : undefined} onClick={() => setWorkspacePage('knowledge')}><BookOpenCheck size={16} /> 案例库</button>
       <button type="button" className={active === 'atlog' ? 'active' : undefined} onClick={() => setWorkspacePage('atlog')}><FlaskConical size={16} /> 用例分析</button>
       <button type="button" className={active === 'audit' ? 'active' : undefined} onClick={openLogAudit}><ClipboardList size={16} /> 审计</button>
       <button type="button" className={active === 'settings' ? 'active' : undefined} onClick={() => { setPreferredSettingsTab('resource'); setWorkspacePage('platform-settings'); }}><Settings size={16} /> 设置</button>
@@ -7892,7 +7891,7 @@ export default function App() {
           {renderWorkspaceNav('knowledge')}
           <div className="topbar-actions"><span className="resource-backend-hint">{APP_VERSION}</span></div>
         </header>
-        <KnowledgeBasePage onOpenAtLogAnalysis={() => setWorkspacePage('atlog')} />
+        <KnowledgeBasePage />
         {globalOverlays}
       </div>
     );
