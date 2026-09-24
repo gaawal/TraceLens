@@ -1463,6 +1463,80 @@ export async function testLogFormatRuleDraft(payload: LogFormatRuleDraft, text: 
   return api('/log-format-rules/test-draft/', { method: 'POST', body: JSON.stringify({ ...payload, text }) });
 }
 
+/**
+ * 「AI 一键自动配置」 — 一条真实日志样例 → 一份完整的规则配置。
+ *
+ * 按钮是确定性触发，只有识别用模型；后端会把模型给出的每个字段值/参数值拿去和样例原文
+ * 逐字比对，对不上的直接丢掉。所以这个接口不会返回一条「保存后什么都提不出来」的规则。
+ */
+export interface RuleAutoconfigWarning {
+  warnings?: string[];
+  confidence?: 'high' | 'medium' | 'low' | string;
+}
+
+export interface DataExtractorAutoconfigResult extends RuleAutoconfigWarning {
+  ok: true;
+  target: 'data_extractor';
+  name: string;
+  description: string;
+  matchKeyword: string;
+  caseSensitive: boolean;
+  subsystems: string[];
+  modules: string[];
+  sourceCategories: string[];
+  outputFormat: 'table' | 'text';
+  fields: Array<{
+    id: string;
+    key: string;
+    name: string;
+    sampleValue: string;
+    valueType: 'number' | 'integer' | 'boolean' | 'string';
+    sourceUnit: string;
+    plotUnit: string;
+    unitConversionEnabled: boolean;
+    unitConversions: Array<{ id: string; leftValue: number; leftUnit: string; rightValue: number; rightUnit: string }>;
+    structuredPath: string[];
+    why?: string;
+  }>;
+}
+
+export interface SemanticRuleAutoconfigResult extends RuleAutoconfigWarning {
+  ok: true;
+  target: 'semantic_rule';
+  kind: 'keyword' | 'template';
+  name: string;
+  keyword: string;
+  sampleMessage: string;
+  parameters: Array<{ id: string; label: string; sampleValue: string }>;
+  displayTemplate: string;
+  supplementalDescription: string;
+  customLabelTemplate: string;
+  customLabelColor: string;
+  scope: 'function' | 'log' | 'both';
+  displayMode: 'semantic' | 'label' | 'both';
+}
+
+export type RuleAutoconfigResult = DataExtractorAutoconfigResult | SemanticRuleAutoconfigResult;
+
+export type RuleAutoconfigFocus = 'all' | 'fields' | 'units' | 'scope' | 'semantic' | 'label';
+
+export async function autoconfigureRule(payload: {
+  target: 'data_extractor' | 'semantic_rule';
+  sample: string;
+  /** 让配置框里的按钮只填它负责的那部分，不动用户已经调好的其它设置。 */
+  focus?: RuleAutoconfigFocus;
+  kind?: 'keyword' | 'template';
+  hints?: Record<string, unknown>;
+  structured_candidates?: Array<Record<string, unknown>>;
+}): Promise<RuleAutoconfigResult> {
+  // 识别要走模型，比普通接口慢；给足超时，别让用户以为按钮没反应。
+  return api<RuleAutoconfigResult>('/tools/rule-autoconfig/', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(120000),
+  });
+}
+
 export interface UrlLogImportMember {
   name: string;
   filename: string;

@@ -17,6 +17,8 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { autoconfigureRule, type SemanticRuleAutoconfigResult } from '../api/resourceApi';
+import { AiAutoconfigButton, type AiAutoconfigOutcome } from './AiAutoconfigButton';
 import {
   buildPatternTokens,
   createDisplayRuleId,
@@ -481,6 +483,126 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
     }
   }
 
+  /**
+   * 把 AI 给出的参数值在正文里定位成 ParameterMark。
+   *
+   * 参数只用「样例原文逐字子串」表达，所以定位是确定性的 —— 不依赖模型给下标
+   * （模型给的下标经常是错的，而错一位整条模板就废了）。同一个值出现多次时只标第一处，
+   * 除非用户本来就勾了「同步标记相同文本」。
+   */
+  function marksForParameters(message: string, parameters: readonly { id: string; sampleValue: string }[]): ParameterMark[] {
+    const marks: ParameterMark[] = [];
+    // 光标只前进不后退：AI 给出的参数顺序就是它们在日志里的出现顺序，按顺序定位能避免
+    // 「重试次数 3」被定位到 PID「1234」里那个 3 上（真实踩过：模板预览变成 [12{重试次数}4]）。
+    let cursor = 0;
+    const embedded = (at: number, length: number) => {
+      const isWord = (ch: string | undefined) => Boolean(ch && /[\w]/.test(ch));
+      return isWord(message[at - 1]) || isWord(message[at + length]);
+    };
+    const findFrom = (value: string, from: number, skipEmbedded: boolean) => {
+      let at = message.indexOf(value, Math.max(0, from));
+      while (at >= 0) {
+        const overlaps = marks.some((mark) => at < mark.end && at + value.length > mark.start);
+        // 单个字符/纯数字的参数值最容易撞进别的数字里，优先挑不被字母数字包夹的那一处。
+        if (!overlaps && (!skipEmbedded || !embedded(at, value.length))) return at;
+        at = message.indexOf(value, at + 1);
+      }
+      return -1;
+    };
+    for (const parameter of parameters) {
+      const value = parameter.sampleValue;
+      if (!value) continue;
+      let at = findFrom(value, cursor, true);
+      if (at < 0) at = findFrom(value, cursor, false);
+      if (at < 0) at = findFrom(value, 0, true);
+      if (at < 0) continue;
+      marks.push({ parameterId: parameter.id, start: at, end: at + value.length });
+      cursor = at + value.length;
+    }
+    return marks.sort((left, right) => left.start - right.start);
+  }
+
+  /** 「AI 一键自动配置」语义规则：识别正文里会变化的部分，填好语义说明、参数和标签。 */
+  async function autoConfigureSemantic(focus: 'all' | 'semantic' | 'label' = 'all'): Promise<AiAutoconfigOutcome> {
+    const current = semanticEditor;
+    if (!current) throw new Error('请先打开新增/编辑语义规则。');
+    const raw = current.sampleRaw.trim() || current.sampleMessage.trim();
+    if (!raw) throw new Error('请先粘贴样例日志，AI 才能识别这条日志该显示成什么语义。');
+    const result = await autoconfigureRule({
+      target: 'semantic_rule',
+      sample: raw,
+      kind: current.rule.kind,
+      focus,
+      hints: {
+        // 浏览器已经知道「第 8 个字段之后才是正文」，把这份确定性结果交给后端，
+        // 别让模型去猜日志格式。
+        sampleMessage: current.sampleMessage || extractDisplayRuleMessage(raw),
+        subsystems: sourceSeed?.sourceTargets?.map((item) => item.subsystem) ?? [],
+        modules: sourceSeed?.sourceTargets?.map((item) => item.module) ?? [],
+        functionName: sourceSeed?.functionName,
+        // 已有参数名交给后端：不然模型会为标签发明一个 {模块名} 之类的占位符，
+        // 而这个占位符没有对应参数，保存时会被校验直接拦下来。
+        parameterLabels: current.rule.parameters.map((parameter) => parameter.label),
+      },
+    }) as SemanticRuleAutoconfigResult;
+
+    const message = result.sampleMessage || extractDisplayRuleMessage(raw) || raw;
+    const parameters: DisplayRuleParameter[] = result.kind === 'template'
+      ? result.parameters.map((parameter) => ({ id: parameter.id, label: parameter.label, sampleValue: parameter.sampleValue }))
+      : [];
+    const marks = result.kind === 'template' ? marksForParameters(message, parameters) : [];
+    const keptIds = new Set(marks.map((mark) => mark.parameterId));
+    const keptParameters = parameters.filter((parameter) => keptIds.has(parameter.id));
+    const droppedCount = parameters.length - keptParameters.length;
+
+    // 按 focus 只改它负责的那块：语义说明框的按钮不该顺手改标签，反之亦然。
+    const labelPatch = {
+      customLabelTemplate: result.customLabelTemplate || current.rule.customLabelTemplate,
+      customLabelColor: result.customLabelColor || current.rule.customLabelColor,
+      displayMode: result.displayMode,
+    };
+    const semanticPatch = {
+      sampleMessage: message,
+      parameters: keptParameters,
+      patternTokens: result.kind === 'template' ? buildPatternTokens(message, marks) : current.rule.patternTokens,
+      displayTemplate: result.displayTemplate || current.rule.displayTemplate,
+      supplementalDescription: result.supplementalDescription || current.rule.supplementalDescription,
+    };
+    setSemanticEditor({
+      ...current,
+      sampleRaw: raw,
+      sampleMessage: message,
+      marks,
+      testInput: raw,
+      testState: undefined,
+      rule: {
+        ...current.rule,
+        ...(focus === 'all' ? {
+          name: result.name || current.rule.name,
+          keyword: result.kind === 'keyword' ? (result.keyword || current.rule.keyword) : undefined,
+          scope: result.scope,
+        } : {}),
+        ...(focus === 'label' ? labelPatch : semanticPatch),
+        ...(focus === 'all' && result.displayMode === 'both' ? labelPatch : {}),
+      },
+    });
+
+    const warnings = [...(result.warnings ?? [])];
+    if (droppedCount > 0) warnings.push(`有 ${droppedCount} 个参数在正文里定位不到，已丢弃（避免保存后显示成字面量）。`);
+    const filledLabel = focus !== 'semantic' && Boolean(result.customLabelTemplate);
+    return {
+      message: focus === 'label'
+        ? (filledLabel ? `已填入标签「${result.customLabelTemplate}」与颜色` : '已切换为标签展示模式')
+        : [
+            '已填入语义说明',
+            result.kind === 'template' ? `${keptParameters.length} 个参数` : (result.keyword ? `关键字「${result.keyword}」` : ''),
+            filledLabel ? `标签「${result.customLabelTemplate}」` : '',
+          ].filter(Boolean).join(' · '),
+      warnings,
+      confidence: result.confidence,
+    };
+  }
+
   function currentEditorRule(): DisplayRule | undefined {
     if (!semanticEditor) return undefined;
     return {
@@ -610,7 +732,7 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
 
     {semanticEditor && <div className="rule-drawer-backdrop semantic-rule-drawer-backdrop" onMouseDown={closeSemanticEditor}>
       <aside className="rule-drawer semantic-rule-drawer" onMouseDown={(e) => e.stopPropagation()}>
-        <header><div><span className="eyebrow">SEMANTIC RULE</span><h2>{displayRules.some((r) => r.id === semanticEditor.rule.id) ? '编辑语义规则' : '新增语义规则'}</h2><p>完整保留智能模板的样例划选、参数捕获、展示模板和测试解析能力。</p></div><button className="icon-button" onClick={closeSemanticEditor}><X size={18}/></button></header>
+        <header><div><span className="eyebrow">SEMANTIC RULE</span><h2>{displayRules.some((r) => r.id === semanticEditor.rule.id) ? '编辑语义规则' : '新增语义规则'}</h2><p>完整保留智能模板的样例划选、参数捕获、展示模板和测试解析能力。</p></div><div className="rule-drawer-header-actions"><AiAutoconfigButton onRun={() => autoConfigureSemantic('all')} disabled={!semanticEditor.sampleRaw.trim() && !semanticEditor.sampleMessage.trim()} disabledHint="先在第 1 步粘贴样例日志" label="AI 一键识别并配置" title="读取样例日志，自动识别正文里会变化的部分，并填好语义说明、参数和自定义标签"/><button className="icon-button" onClick={closeSemanticEditor}><X size={18}/></button></div></header>
         <div className="rule-drawer-body semantic-rule-drawer-body">
           <div className="rule-editor-toolbar">
             <div className="rule-kind-switch">
@@ -629,7 +751,7 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
 
           {semanticEditor.rule.kind === 'template' && <>
             <section className="rule-editor-step">
-              <div className="rule-step-heading"><span>1</span><div><strong>粘贴样例日志</strong><small>可以粘贴完整原始日志，系统会自动提取第 8 个字段之后的正文。</small></div></div>
+              <div className="rule-step-heading rule-step-heading-with-action"><span>1</span><div><strong>粘贴样例日志</strong><small>可以粘贴完整原始日志，系统会自动提取第 8 个字段之后的正文。</small></div><AiAutoconfigButton onRun={() => autoConfigureSemantic('all')} disabled={!semanticEditor.sampleRaw.trim()} disabledHint="先粘贴样例日志" label="AI 识别正文与参数" compact title="从样例日志识别正文和会变化的部分，自动填好参数"/></div>
               <textarea className="rule-sample-input" value={semanticEditor.sampleRaw} onChange={(event) => updateSample(event.target.value)} placeholder="粘贴一条完整日志，例如：[2026-...] ... init_and_release() <DSPWSFT> Measurer DSPWSFT begin init."/>
             </section>
             <section className="rule-editor-step">
@@ -645,7 +767,7 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
           </>}
 
           {(semanticEditor.rule.displayMode ?? 'semantic') !== 'label' && <section className="rule-editor-step">
-            <div className="rule-step-heading rule-step-heading-with-action"><span>{semanticEditor.rule.kind === 'template' ? '3' : '1'}</span><div><strong>语义说明</strong><small>显示在函数标题或日志正文左侧，用于解释这条日志代表什么。</small></div>{canAutoRecognizeSemantic && <button type="button" className="button secondary compact semantic-auto-button" onClick={() => void autoRecognizeSemantic()} disabled={semanticRecognition.loading}>{semanticRecognition.loading ? <LoaderCircle className="spin" size={14}/> : <Sparkles size={14}/>} 自动识别语义</button>}</div>
+            <div className="rule-step-heading rule-step-heading-with-action"><span>{semanticEditor.rule.kind === 'template' ? '3' : '1'}</span><div><strong>语义说明</strong><small>显示在函数标题或日志正文左侧，用于解释这条日志代表什么。</small></div><div className="rule-step-heading-actions">{canAutoRecognizeSemantic && <button type="button" className="button secondary compact semantic-auto-button" onClick={() => void autoRecognizeSemantic()} disabled={semanticRecognition.loading} title="读取该函数所在的 Python 源码 docstring 作为语义说明">{semanticRecognition.loading ? <LoaderCircle className="spin" size={14}/> : <Sparkles size={14}/>} 自动识别语义（源码）</button>}<AiAutoconfigButton onRun={() => autoConfigureSemantic('semantic')} disabled={!semanticEditor.sampleRaw.trim() && !semanticEditor.sampleMessage.trim()} disabledHint="先粘贴样例日志" label="AI 重写语义" compact title="按样例日志重写语义说明（不依赖 Python 源码）"/></div></div>
             <textarea ref={templateTextareaRef} className="rule-display-template-input" value={semanticEditor.rule.displayTemplate} onChange={(event) => updateRule({ displayTemplate: event.target.value })} placeholder={semanticEditor.rule.kind === 'template' ? '例如：状态切换 {参数1}' : '例如：状态切换'}/>
             <label className="rule-supplemental-description">
               <span>补充说明 <small>可选 · 可填写异常含义、处置建议或排查策略</small></span>
@@ -656,7 +778,7 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
           </section>}
 
           {(semanticEditor.rule.displayMode ?? 'semantic') !== 'semantic' && <section className="rule-editor-step custom-label-editor-step">
-            <div className="rule-step-heading"><span>{semanticEditor.rule.kind === 'template' ? ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '4' : '3') : ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '2' : '1')}</span><div><strong>自定义标签</strong><small>显示在日志行右侧；可使用固定文本、提取参数或两者组合。</small></div></div>
+            <div className="rule-step-heading rule-step-heading-with-action"><span>{semanticEditor.rule.kind === 'template' ? ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '4' : '3') : ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '2' : '1')}</span><div><strong>自定义标签</strong><small>显示在日志行右侧；可使用固定文本、提取参数或两者组合。</small></div><AiAutoconfigButton onRun={() => autoConfigureSemantic('label')} disabled={!semanticEditor.sampleRaw.trim() && !semanticEditor.sampleMessage.trim()} disabledHint="先粘贴样例日志" label="AI 生成标签" compact title="按样例日志生成标签文本与颜色"/></div>
             <div className="custom-label-config-grid">
               <label className="custom-label-template-field"><span>标签文本</span><textarea ref={labelTemplateTextareaRef} className="rule-display-template-input" value={semanticEditor.rule.customLabelTemplate ?? ''} onChange={(event) => updateRule({ customLabelTemplate: event.target.value })} placeholder={semanticEditor.rule.kind === 'template' ? '例如：{参数1} 或 状态 {参数1}' : '例如：READY'}/></label>
               <label className="custom-label-color-field"><span>标签颜色</span><div className="custom-label-color-control"><input type="color" value={semanticEditor.rule.customLabelColor ?? '#2563eb'} onChange={(event) => updateRule({ customLabelColor: event.target.value })}/><code>{semanticEditor.rule.customLabelColor ?? '#2563eb'}</code><span className="rule-custom-label-preview" style={{ '--rule-label-color': semanticEditor.rule.customLabelColor || '#2563eb' } as React.CSSProperties}>{semanticEditor.rule.customLabelTemplate || '标签预览'}</span></div></label>

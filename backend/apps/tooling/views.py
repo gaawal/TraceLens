@@ -100,6 +100,45 @@ class ToolViewSet(viewsets.ViewSet):
         return Response(tool.as_dict())
 
 
+    @action(detail=False, methods=["post"], url_path="rule-autoconfig")
+    def rule_autoconfig(self, request):
+        """一键自动配置：把一条真实日志样例识别成数据提取器 / 语义规则配置。
+
+        Triggered by an explicit button in each rule drawer. The model only *proposes*;
+        every proposed field/parameter is verified against the sample text before it is
+        returned, so the button can never fill a rule that extracts nothing.
+        """
+        from apps.tooling.rule_autoconfig import (
+            autoconfigure_data_extractor,
+            autoconfigure_semantic_rule,
+        )
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        target = str(payload.get("target") or "").strip().lower()
+        sample = str(payload.get("sample") or "")
+        hints = payload.get("hints") if isinstance(payload.get("hints"), dict) else {}
+        try:
+            if target == "data_extractor":
+                candidates = payload.get("structured_candidates") if isinstance(payload.get("structured_candidates"), list) else []
+                result = autoconfigure_data_extractor(
+                    sample, hints=hints, structured_candidates=candidates, focus=str(payload.get("focus") or "all")
+                )
+            elif target == "semantic_rule":
+                result = autoconfigure_semantic_rule(
+                    sample, kind=str(payload.get("kind") or "keyword"), hints=hints, focus=str(payload.get("focus") or "all")
+                )
+            else:
+                return Response({"message": "target 必须是 data_extractor 或 semantic_rule。"}, status=400)
+        except ValueError as exc:
+            # 样例不足 / 模型没给出可解析结果：这是用户能自己修的输入问题，不是网关故障。
+            return Response({"message": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except LLMClientError as exc:
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("tools.rule_autoconfig.failed target=%s", target)
+            return Response({"message": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(result)
+
     @action(detail=False, methods=["get"], url_path="assistant-voice-capabilities")
     def assistant_voice_capabilities(self, request):
         return Response(voice_service_capabilities())

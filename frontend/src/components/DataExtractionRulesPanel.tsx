@@ -1,5 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { Check, Database, FlaskConical, Pencil, Plus, Save, Search, Trash2, X } from 'lucide-react';
+import { autoconfigureRule, type DataExtractorAutoconfigResult } from '../api/resourceApi';
+import { AiAutoconfigButton, type AiAutoconfigOutcome } from './AiAutoconfigButton';
 import type { DisplayRuleEditorRequest } from '../rendering/displayRules';
 import { extractDisplayRuleMessage } from '../rendering/displayRules';
 import {
@@ -217,11 +219,16 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
 
   function testRule() {
     if (!draft) return;
-    const validation = validateDataExtractionRule(draft);
+    runTestFor(draft);
+  }
+
+  /** 用给定规则跑一次测试提取。自动配置后立刻调用它，让用户看到「真的提出来了」。 */
+  function runTestFor(rule: DataExtractionRule) {
+    const validation = validateDataExtractionRule(rule);
     if (validation) { setTestResult({ ok: false, message: validation }); return; }
-    const values = extractDataValues(sample || draft.sampleMessage, draft);
+    const values = extractDataValues(sample || rule.sampleMessage, rule);
     if (!values) { setTestResult({ ok: false, message: '当前样例未命中，请检查参数名、参数值的划选位置和类型。' }); return; }
-    const parts = draft.fields.map((field) => {
+    const parts = rule.fields.map((field) => {
       const name = field.name || field.key;
       const raw = values[name];
       if ((field.valueType === 'number' || field.valueType === 'integer') && (typeof raw === 'string' || typeof raw === 'number')) {
@@ -235,6 +242,103 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
       return `${name}=${String(raw ?? '')}`;
     });
     setTestResult({ ok: true, message: parts.join(' · ') });
+  }
+
+  /**
+   * 「AI 一键自动配置」：拿样例日志识别出可采集的参数，把字段、单位、作用范围、名称一次填好。
+   *
+   * 填完立刻跑一次测试提取 —— 按钮承诺的是「自动配置好」，用户有权立刻看到它到底提没提出东西。
+   */
+  async function autoConfigureDraft(focus: 'all' | 'fields' | 'scope' = 'all'): Promise<AiAutoconfigOutcome> {
+    const current = draft;
+    if (!current) throw new Error('请先打开新增/编辑数据提取器。');
+    const text = sample.trim();
+    if (!text) throw new Error('请先粘贴或从当前日志带入样例，AI 才能识别要采集什么。');
+    const result: DataExtractorAutoconfigResult = await autoconfigureRule({
+      target: 'data_extractor',
+      sample: text,
+      focus,
+      hints: {
+        subsystems: current.subsystems,
+        modules: current.modules,
+        sourceCategories: current.sourceCategories,
+        functionName: sourceSeed?.functionName,
+      },
+      structured_candidates: structuredCandidates.map((candidate) => ({
+        displayPath: candidate.displayPath,
+        sampleValue: candidate.sampleValue,
+      })),
+    }) as DataExtractorAutoconfigResult;
+
+    // 按 focus 只合并它负责的那部分：作用范围的按钮不该顺手把字段换掉。
+    const next: DataExtractionRule = {
+      ...current,
+      ...(focus === 'scope' ? {
+        subsystems: result.subsystems.length ? result.subsystems : current.subsystems,
+        modules: result.modules.length ? result.modules : current.modules,
+        sourceCategories: result.sourceCategories.length ? result.sourceCategories : current.sourceCategories,
+      } : {
+        name: result.name || current.name,
+        description: result.description || current.description,
+        matchKeyword: result.matchKeyword || current.matchKeyword,
+        caseSensitive: result.caseSensitive,
+        outputFormat: result.outputFormat,
+        // 字段整份替换：自动配置的意义就是一次给出一套自洽的字段定义，
+        // 和旧字段混在一起会出现重复的保存字段名，反而保存不了。
+        fields: result.fields.map((field) => ({ ...field })) as DataExtractionField[],
+      }),
+      updatedAt: Date.now(),
+    };
+    update(next);
+    setPendingKey(undefined);
+    setSelection(undefined);
+    // 立刻验证一次，让用户看到识别结果是真的能提出数值，而不是看起来像。
+    window.setTimeout(() => runTestFor(next), 0);
+    return {
+      message: focus === 'scope'
+        ? `已填入作用范围 · 子系统 ${scopeText(next.subsystems)} · FM ${scopeText(next.modules)}`
+        : `已填入 ${next.fields.length} 个字段 · 匹配短语「${next.matchKeyword || '未设（按参数名匹配）'}」`,
+      warnings: result.warnings,
+      confidence: result.confidence,
+    };
+  }
+
+  /**
+   * 单个字段的单位换算配置框：只让 AI 补这一个字段的单位，别动别的字段。
+   *
+   * 单位配错会让绘图数值整体差一个量级，所以这里按 key 精确回填，
+   * 后端也只保留能在样例里找到依据、且左右等价的换算规则。
+   */
+  async function autoConfigureFieldUnits(field: DataExtractionField): Promise<AiAutoconfigOutcome> {
+    const current = draft;
+    if (!current) throw new Error('请先打开新增/编辑数据提取器。');
+    const text = sample.trim();
+    if (!text) throw new Error('请先粘贴或从当前带入样例，AI 才能判断单位。');
+    const result: DataExtractorAutoconfigResult = await autoconfigureRule({
+      target: 'data_extractor',
+      sample: text,
+      focus: 'units',
+    }) as DataExtractorAutoconfigResult;
+    const match = result.fields.find((item) => item.key === field.key || item.name === field.name);
+    if (!match) throw new Error(`AI 没有在样例里找到字段「${field.key}」的单位信息。`);
+    const hasUnit = Boolean(match.sourceUnit || match.plotUnit || match.unitConversions.length);
+    update({
+      fields: current.fields.map((item) => item.id === field.id ? {
+        ...item,
+        sourceUnit: match.sourceUnit || item.sourceUnit,
+        plotUnit: match.plotUnit || item.plotUnit,
+        unitConversions: match.unitConversions.length ? match.unitConversions : item.unitConversions,
+        unitConversionEnabled: hasUnit ? true : item.unitConversionEnabled,
+      } : item),
+      updatedAt: Date.now(),
+    });
+    return {
+      message: hasUnit
+        ? `已填入单位：${[match.sourceUnit ? `原单位 ${match.sourceUnit}` : '', match.plotUnit ? `目标 ${match.plotUnit}` : '', match.unitConversions.length ? `${match.unitConversions.length} 条换算规则` : ''].filter(Boolean).join(' · ')}`
+        : '样例里没有单位后缀，该字段保持无单位。',
+      warnings: result.warnings,
+      confidence: result.confidence,
+    };
   }
 
   function save() {
@@ -259,7 +363,7 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
     </tbody></table></div>
 
     {draft && <div className="rule-drawer-backdrop semantic-rule-drawer-backdrop" onMouseDown={() => setDraft(undefined)}><aside className="rule-drawer semantic-rule-drawer data-rule-drawer" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span className="eyebrow">DATA EXTRACTOR</span><h2>{rules.some((rule) => rule.id === draft.id) ? '编辑数据提取器' : '新增数据提取器'}</h2><p>普通日志支持语义划选；JSON / 字典日志会自动识别 key 路径，勾选字段后即可提取。</p></div><button className="icon-button" onClick={() => setDraft(undefined)}><X size={18}/></button></header>
+      <header><div><span className="eyebrow">DATA EXTRACTOR</span><h2>{rules.some((rule) => rule.id === draft.id) ? '编辑数据提取器' : '新增数据提取器'}</h2><p>普通日志支持语义划选；JSON / 字典日志会自动识别 key 路径，勾选字段后即可提取。</p></div><div className="rule-drawer-header-actions"><AiAutoconfigButton onRun={() => autoConfigureDraft('all')} disabled={!sample.trim()} disabledHint="先在第 1 步粘贴或带入样例日志" label="AI 一键识别并配置" title="读取第 1 步的样例日志，自动识别可采集的参数、单位、作用范围，并把整份配置填好"/><button className="icon-button" onClick={() => setDraft(undefined)}><X size={18}/></button></div></header>
       <div className="rule-drawer-body semantic-rule-drawer-body">
         <div className="rule-editor-toolbar"><div className="rule-kind-switch"><button type="button" className="active">参数语义提取</button></div><label className="rule-enabled-control"><input type="checkbox" checked={draft.enabled} onChange={(event) => update({ enabled: event.target.checked })}/> 启用数据提取</label><label className="rule-enabled-control"><input type="checkbox" checked={draft.liveCapture === true} onChange={(event) => update({ liveCapture: event.target.checked })}/> 实时采集</label></div>
         <div className="rule-form-grid two-columns">
@@ -269,7 +373,7 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
         </div>
 
         <section className="rule-editor-step">
-          <div className="rule-step-heading"><span>1</span><div><strong>划选日志内容</strong><small>普通日志可继续划选参数名和对应参数值；如果样例中包含 JSON / 字典，系统会在下方自动识别字段，直接勾选即可。可选 Match 仅用于缩小匹配范围。</small></div></div>
+          <div className="rule-step-heading rule-step-heading-with-action"><span>1</span><div><strong>划选日志内容</strong><small>普通日志可继续划选参数名和对应参数值；如果样例中包含 JSON / 字典，系统会在下方自动识别字段，直接勾选即可。可选 Match 仅用于缩小匹配范围。</small></div><AiAutoconfigButton onRun={() => autoConfigureDraft('fields')} disabled={!sample.trim()} disabledHint="先粘贴样例日志" label="AI 自动识别字段" compact title="从样例日志识别可采集的参数并填好字段定义与单位"/></div>
           <textarea ref={sampleRef} className="rule-selection-textarea data-selection-textarea" value={sample} onChange={(event) => { setSample(event.target.value); update({ sampleMessage: event.target.value }); }} onSelect={captureSelection} onMouseUp={captureSelection} onKeyUp={captureSelection} placeholder="粘贴或从当前日志带入样例，例如：参数1  参数2  0.01  2.0"/>
           <div className="rule-selection-actions data-selection-actions"><span>当前选中：<strong>{selection?.text || '请在上方划选文本'}</strong>{pendingKey && <em>待绑定参数名：{pendingKey.text}</em>}</span><div className="rule-selection-control-group"><button type="button" className="button secondary compact-button" disabled={!selection} onClick={setAsMatchKeyword}>设为 Match</button><button type="button" className="button secondary compact-button" disabled={!selection} onClick={setAsKey}>设为参数名</button><button type="button" className="button primary compact-button" disabled={!selection || !pendingKey} onClick={setAsValue}>设为参数值</button></div></div>
           {structuredCandidates.length > 0 && <div className="data-structured-detect">
@@ -280,13 +384,13 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
         </section>
 
         <section className="rule-editor-step">
-          <div className="rule-step-heading"><span>2</span><div><strong>字段定义</strong><small>参数值类型会根据样例自动判断；数值字段支持千分位和任意单位后缀；单位换算关系由你自行定义，可按多条等价规则链式换算后再绘图。匹配依据仍是参数名、参数值及其相对顺序。</small></div></div>
+          <div className="rule-step-heading rule-step-heading-with-action"><span>2</span><div><strong>字段定义</strong><small>参数值类型会根据样例自动判断；数值字段支持千分位和任意单位后缀；单位换算关系由你自行定义，可按多条等价规则链式换算后再绘图。匹配依据仍是参数名、参数值及其相对顺序。</small></div><AiAutoconfigButton onRun={() => autoConfigureDraft('fields')} disabled={!sample.trim()} disabledHint="先粘贴样例日志" label="AI 重识别字段" compact title="重新从样例识别字段、类型和单位换算（会整份替换当前字段）"/></div>
           <div className="data-field-editor-list">{draft.fields.map((field) => <div className="data-field-editor" key={field.id}>
             <div className="data-field-main-row"><code>{field.key}</code>{(field.structuredPath || []).length > 0 && <b className="data-field-structured-badge">字典</b>}<span>→</span><input value={field.name} onChange={(event) => patchField(field.id, { name: event.target.value })} aria-label="保存字段名"/><select value={field.valueType} onChange={(event) => patchField(field.id, { valueType: event.target.value as DataValueType })}><option value="number">浮点数</option><option value="integer">整数</option><option value="boolean">布尔</option><option value="string">文本</option></select><small>样例 {field.sampleValue}</small><button onClick={() => removeField(field.id)}><X size={13}/></button></div>
             {(field.valueType === 'number' || field.valueType === 'integer') && <div className={`data-field-unit-config ${isDataUnitConversionEnabled(field) ? 'expanded' : 'collapsed'}`}>
               <label className="data-field-unit-toggle"><input type="checkbox" checked={isDataUnitConversionEnabled(field)} onChange={(event) => patchField(field.id, { unitConversionEnabled: event.target.checked })}/><span><strong>单位转换（可选）</strong><small>{isDataUnitConversionEnabled(field) ? '已启用，展开配置自定义换算关系。' : '勾选后配置目标单位与换算规则。'}</small></span></label>
               {isDataUnitConversionEnabled(field) && <div className="data-field-unit-details">
-                <div className="data-field-unit-head"><div><small>单位名称和换算比例完全自定义。原始提取值始终保留，绘图/统计只使用换算后的数值。</small></div><button type="button" className="button secondary compact-button" onClick={() => addUnitConversion(field.id)}><Plus size={13}/> 添加规则</button></div>
+                <div className="data-field-unit-head"><div><small>单位名称和换算比例完全自定义。原始提取值始终保留，绘图/统计只使用换算后的数值。</small></div><div className="data-field-unit-head-actions"><AiAutoconfigButton onRun={() => autoConfigureFieldUnits(field)} disabled={!sample.trim()} disabledHint="先粘贴样例日志" label="AI 识别单位" compact title={`只让 AI 判断「${field.name || field.key}」这一个字段在样例里的单位后缀和换算关系`}/><button type="button" className="button secondary compact-button" onClick={() => addUnitConversion(field.id)}><Plus size={13}/> 添加规则</button></div></div>
                 <div className="data-field-unit-targets">
                   <label><span>无单位后缀时按</span><input value={(field.sourceUnit || 'auto') === 'auto' ? '' : (field.sourceUnit || '')} onChange={(event) => patchField(field.id, { sourceUnit: event.target.value.trim() || 'auto' })} placeholder="自动识别日志后缀"/></label>
                   <span className="data-field-unit-arrow">→</span>
@@ -302,7 +406,7 @@ export function DataExtractionRulesPanel({ rules, sourceSeed, onChange }: Props)
         </section>
 
         <section className="rule-editor-step">
-          <div className="rule-step-heading"><span>3</span><div><strong>作用范围</strong><small>为空表示全部；建议限定到具体子系统 / FM，减少每行日志需要检查的规则数量。</small></div></div>
+          <div className="rule-step-heading rule-step-heading-with-action"><span>3</span><div><strong>作用范围</strong><small>为空表示全部；建议限定到具体子系统 / FM，减少每行日志需要检查的规则数量。</small></div><AiAutoconfigButton onRun={() => autoConfigureDraft('scope')} disabled={!sample.trim()} disabledHint="先粘贴样例日志" label="AI 识别范围" compact title="按当前页面的子系统 / FM 与样例日志自动限定作用范围"/></div>
           <div className="data-scope-inline-row"><div className="rule-form-grid three-columns data-scope-fields"><label><span>日志类型</span><input value={draft.sourceCategories.join(', ')} onChange={(event) => update({ sourceCategories: splitList(event.target.value) })} placeholder="debug, executor"/></label><label><span>子系统</span><input value={draft.subsystems.join(', ')} onChange={(event) => update({ subsystems: splitList(event.target.value) })} placeholder="例如：子系统A"/></label><label><span>FM / 模块</span><input value={draft.modules.join(', ')} onChange={(event) => update({ modules: splitList(event.target.value) })} placeholder="例如：模块A"/></label></div><label className="data-case-inline-toggle"><input type="checkbox" checked={draft.caseSensitive} onChange={(event) => update({ caseSensitive: event.target.checked })}/> 匹配时区分大小写</label></div>
         </section>
 
