@@ -4,18 +4,30 @@
 - `backend/`：Django 6 + DRF + drf-spectacular + SQLite + Redis（日志指纹索引加速层）。
   ASGI 入口 `config/asgi.py`（uvicorn），也提供 `config/wsgi.py`。
 - `frontend/`：Vite + React + TypeScript，dev server 5173，`/api` 代理到 `127.0.0.1:8000`。
-- `scripts/`：本地一键启停脚本（`sim_up.sh` / `sim_down.sh` / `sim_status.sh` / `sim_realign.sh` /
-  `redis_restart.sh` / `stt_up.sh`）。共享配置源是 `scripts/env.sh`。
+- `scripts/`：**`sim.sh` 是唯一入口**（`start|stop|restart|status|logs|init|realign|selftest`，
+  组件 `redis assets fleet site stream backend frontend stt` 可挑选），
+  配 `_spawn.py`（独立会话启动器）/ `env.sh`（共享配置 + 端口探测 helper）；
+  另有 `sim_realign.sh` / `redis_restart.sh` / `sim_setup.sh` / `stt_up.sh` 单点工具。
+  旧的 `sim_up.sh` / `sim_down.sh` / `sim_status.sh` 已被 `sim.sh` 取代并删除。
 
 ## 本地模拟环境（simremote）
 - 目的：在没有真实上下位机的情况下，用假 SSH/SFTP 服务器提供符合**代码路径规则**的日志，
   让「环境资源 → 远程日志查询 / 实时监听」全链路可跑。
 - 入口：`cd backend && .venv/bin/python -m simremote.cli {init|serve|seed|status|stream|stream-status|
   stream-stop|selftest|stop|site-serve|site-url|site-stop}`。
-- 模拟报告站：`cli site-serve` 绑 `127.0.0.1:8901`，发布 ATLog 用例目录与 CPD 报告/数据表格
-  （见下方「模拟 CPD 资产与报告站虚拟挂载」）。
-- 拓扑：上位机 `sim-upper.localhost:2222`（SCH），下位机 `sim-lower1.localhost:2223`（LCH1）；
-  账号 `tracepilot` / `tracelens`；环境名 `SIM-EUV-01`；版本 `SPM-V2026.09.21`。
+- 模拟报告站：`cli site-serve` 绑 **网络 IP + 127.0.0.1**（默认 `fleet.bind_hosts()`）的 8901，
+  发布 ATLog 用例目录与 CPD 报告/数据表格（见下方「模拟 CPD 资产与报告站虚拟挂载」）。
+- 拓扑：上位机与下位机是**同一个网络 IP、靠端口区分** —— `192.168.1.10:2222`（SIM-SCH-01/SCH）、
+  `192.168.1.10:2223`（SIM-LCH1-01/LCH1）；账号 `tracepilot` / `tracelens`；
+  环境名 `SIM-EUV-01`；版本 `SPM-V2026.09.23`。
+  - 地址由 `fleet.detect_machine_host()` 探测：枚举 `ifconfig` + `_address_rank()` 内网优先。
+    **绝不要用「UDP 连 8.8.8.8」探地址** —— 挂 VPN 会拿到 utun 的 `28.0.0.1`，
+    非内网且会被后端 `_is_private_host` 拒。可用环境变量 `SIM_MACHINE_HOST` 覆盖。
+  - 按地址精确定位机器用 `fleet.machine_by_endpoint(host, port)`（只用 `host` 会同时命中上下位机）。
+  - `seed._drop_stale_sim_entities()`：**先删同名环境、再删旧机器**。`Environment.upper_machine`
+    是 PROTECT，旧环境不退绑旧机器就永远删不掉 → 前端出现两条同名 SIM-EUV-01、其一恒 error。
+  - executor 树目录名跟随 `lower.host`（`elog/<IP>/<子系统>/`）；改地址后内容一样时
+    用一次 `os.replace` **改名**旧目录，别指望 `prune_tree`（40 文件/轮）跑完。
 - **不含 DHH**（用户明确要求）。
 - 日志根：`/log/{username}/debug`、`/log/{username}/run/`、`/log/{username}/debug/elog`。
 - **实时日志源 `simremote/livesim.py`**：扮演机台上持续 append 的守护进程，让前端「实时监听」
@@ -23,10 +35,12 @@
   `run/stream.pid`，状态 `run/stream_state.json`），`stream-status` / `stream-stop` 管理。
   4 条流（上位机）：`spwsp/spwsp.log`（观察位）、`mecore/cpcore.log`（编码器抖动）、
   `cpfr/cpfr.log`（冷却流量低）、`sil/sil.log`（光源互锁）。
-  50 步剧本循环（spwsp 26 / cpcore 9 / cpfr 8 / sil 7）：1 类正常节拍 + 关联故障链
+  `_ROUND_ROWS` 76 行 / 12 个阶段（spwsp 36 / cpcore 13 / cpfr 12 / sil 15），一轮 ≈38s@0.5s：
+  1 类正常节拍 + 关联故障链
   `ERR_MECORE_ENC_JITTER → ERR_CPFR_FLOW_LOW → ERR_CPFR_THERM_OVERLOAD → ERR_SIL_INTERLOCK_TRIP`
   →（扫片侧）`ERR_SPWSP_RETRY_SCHEDULED → ERR_SPWSP_STAGE_HANDSHAKE → ERR_SPWSP_SCAN_HALTED`，
-  靠 `trace=` / `cause=` 与同一个 lot/wafer 串起来；一轮里有 11 行带 `trace=`。
+  靠 `trace=` / `cause=` 与同一个 lot/wafer 串起来。
+  阶段序（spwsp）：`WAFER_LOAD(1) → ALIGNMENT(2) → EXPOSURE(3) → … → SCAN_HALT(11) → SCAN_RECOVER(12)`。
   **活动文件上限 1000 行**：写满即 `archive_current`（改名 `<模块>_<关闭边界>.log` + 重建空段），
   日志目录里只留最新一份归档；被替换下来的旧归档由 `rotate()` → `reclaim()` 用
   ``os.replace`` **搬进 `run/recycle/<模块>_prev.log`**（固定名，下一轮直接覆盖），
@@ -35,16 +49,34 @@
   回收只认 state 里 `owned` 账本记下的路径，绝不按 glob 批量删 —— 否则误伤 loggen 的合法归档。
   启动 `prepare()` 时再试一次回收（新进程通常落在新 turn 上，删除配额是新的）。
   `stream-status` 里的「已回收 / 待回收」就是这套账本。
+- **改了日志正文/剧本后必须重启日志源**（剧本在启动时编译进进程）；`init` 会重写日志树。
+  两个都做才不会有新旧格式混在同一份文件里（切点之前仍是旧格式，属正常历史，会随轮转消失）。
 
 ## 日志正文规则（调用链）—— 改任何日志内容前先读这一节
-- 项目**内置的日志内容规则**：`[函数名] >() enter <入参>` 是入口、`[函数名] <() leave <耗时/状态>` 是出口。
+- 项目**内置的日志内容规则**：`[函数名] >() enter <关键字> 开始 <入参>` 是入口、
+  `[函数名] <() leave <关键字> end <耗时/状态>` 是出口。
   权威定义在 `frontend/src/rendering/foldingRules.ts` 的 `builtin-explicit-boundary`
   （`startKeyword: '> ()'` / `endKeyword: '< ()'`），`App.tsx` 显示为「函数开始 >()」「函数结束 <()」。
 - 解析：`logParser.ts` 的 `START_MARKER_REGEX = />\s*\(\s*\)/`、`END_MARKER_REGEX = /<\s*\(\s*\)/`；
   函数名取**方向符之前最后一个 `[函数名]`**。配对键 = `ruleId::functionName`，同名 **LIFO** 闭合。
   名字不一致 → 永远合不上；嵌套写反 → 错乱嵌套或标「缺少出口」。
+- ⚠️ 标记是 `>()` / `<()`，**括号紧贴方向符、中间没有空格**。写诊断正则时别写成
+  `[<>] \(\)`（那要求中间有空格），会得出「一行都没匹配上」的假结论 ——
+  先 `print(loggen.ENTRY_MARKER)` 核对再写。
 - 用户口述的「入口》出口《」= 半角 `>` / `<` 加圆括号，不是全角书名号。
 - 拼装统一走 `loggen.log_message(function, phase, body)`；`loggen.PHASE_ENTER/BODY/LEAVE` 是相位常量。
+- **关键字模板**：`loggen.PHASE_KEYWORDS`（函数名 → 中文短语，如 `ScanLot: 批次扫片`、
+  `CheckFlow: 获取冷却流量`）由 `log_message()` 自动插在方向符**之后**：
+  `... enter 批次扫片 开始 ...` / `... 批次扫片 end ...`。**新增调用链函数必须同步登记**，
+  否则静默退回英文函数名（看到「ScanWafer 开始」就是漏登记）。selftest 有全覆盖断言。
+- **流程阶段框**：`loggen.expand_stage_groups(rows)` 给「每条流上连续的同阶段」套
+  `[Stage_<码>]` 框，入参 `(流标识, 阶段码或 None, 级别, 函数, 相位, 正文)`，
+  返回**固定五元组** `(流标识, 级别, 函数, 相位, 正文)`（形状与 `_ROUND_ROWS` 扁平化一致）。
+  框也吃 `PHASE_KEYWORDS`，入口/出口带 `step=n/N`；`_STAGE_STATUS` 定义各阶段收尾状态。
+  码 `None` = 不套框，**跨整轮的父帧（`ScanLot`/`ScanWafer`）绝不能套框**（子阶段先闭合 → LIFO 破）。
+  ⚠️ 展开器出口**只有一种形状**：曾经阶段框头/尾行按 `(..., 函数, 相位, 级别, ...)` 另建元组，
+  与普通行 `(..., 级别, 函数, 相位, ...)` 混在同一个返回值里 → 症状极隐蔽（`[Stage_X]` 跑进级别槽、
+  函数名变 `enter`、rpc 变 `fm:enter:NNN`，**只查行数查不出来**）。
 - **约定：入口/出口行固定 INFO，异常级别只落在正文行** —— 别写 `[X] <() leave status=ok` 配 FATAL。
 - 线程号必须**按模块固定**（不能用 `seq % N` 逐行变），否则前端认不出同一条执行泳道，
   折叠与「×N 聚合」全部失效（`sameExecutionLane` 比 component/process/thread）。
@@ -65,11 +97,13 @@
   「当前段 + 覆盖窗口的归档」一起读，窗口断言（`awk 窗口过滤：最近 30 分钟命中`）也要跟着读
   归档，否则会因轮转而假失败（实测只读当前段得 11 行 < 阈值 20）。
 - 长跑进程（日志源/机群/报告站）必须放进**独立会话**再启动：macOS 没有 `setsid`，
-  光 `nohup` 会被调用方进程组一起回收。可行做法是 `subprocess.Popen(..., start_new_session=True)`
-  （存活服务实测 `pgid == sid == pid`）。`sim_up.sh` 用「子 shell + nohup」形态启动，
-  只适合由用户自己的终端执行。
-- `nohup` 重定向到文件的 Python 进程 stdout 是**块缓冲**，被 SIGKILL 时一行都不落盘 ——
-  排查长跑进程要用 `python -u`。
+  光 `nohup` 会被调用方进程组一起回收。统一走 `scripts/_spawn.py`
+  （内部是 `subprocess.Popen(..., start_new_session=True)`，实测 `PPID=1` 且 `pgid == sid == pid`）。
+- `nohup`/重定向到文件的 Python 进程 stdout 是**块缓冲**，被 SIGKILL 时一行都不落盘 ——
+  排查长跑进程、以及所有由 `sim.sh` 拉起的子进程，一律加 `python -u`。
+- **端口通 ≠ 服务健康**：Vite 跑在「已被替换/删除的 node_modules」上时端口照通，
+  只在浏览器里报 `Failed to resolve import`。健康判据用 `curl /src/main.tsx` 是否 200。
+  `sim.sh start frontend` 已内置该探测 + `npm ls --depth=0` 依赖完整性检查（`--force-deps` 强制重装）。
 - 远端 `tail -F` 的 stdout 是**管道**，stdio 全缓冲：一行 ~150B 要攒满 ~4KB（≈27 行）才 flush。
   0.5s/行时第一行要等 ~14s 才出现在 SSE 里。自检等待窗口必须 ≥28s，否则隔几次假失败一次
   （真实机台也是这个行为，不是模拟器缺陷）。

@@ -86,8 +86,11 @@ agent_created: true
 - 语义要准确：只有报告类才显示"断言"，日志类显示"异常行"。
 
 ### 7. 脚本与自检（不做完这步等于没做）
-- `scripts/sim_up.sh`：启动段 + 收尾打印"可直接粘贴的模拟 URL"清单；
-- `scripts/sim_down.sh` / `sim_status.sh`：停止与状态；
+- `scripts/sim.sh`：**仿真栈的唯一入口**，子命令 `start|stop|restart|status|logs|init|realign|selftest`，
+  组件可挑选（`redis assets fleet site stream backend frontend stt`）。新增组件时**三处都要接**：
+  `KNOWN_COMPONENTS` / `START_ORDER` / `STOP_ORDER`，再补 `start_component()`、`stop_component()`、
+  `log_path_for()` 和 `c_start_*` / `c_stop_*` 实现。收尾横幅要打印"可直接粘贴的模拟 URL"清单。
+- `scripts/_spawn.py`：唯一被认可的长跑进程启动方式（见下节）。
 - `backend/simremote/selftest.py`：新增 `check_*`，**必须包含跨文件一致性断言**
   （例：24 批里失败报告 6 份 ↔ 含非 OK 行的表格 6 份，两边一一对应）
   和**反向断言**（例：公网 URL 必须被拒绝、异常行条数必须等于文件内真错误行数）。
@@ -106,10 +109,17 @@ agent_created: true
   回收只搬走账本里除最新一份之外的路径，**绝不按 glob 批量删** —— 会误伤 `loggen` 的合法归档。
   搬不动的留在账本里下轮再试；`prepare()` 启动时也试一次（新进程通常落在新 turn，配额是新的）。
 - **长跑进程必须放进独立会话**：它跨 turn 存活才有意义。macOS **没有 `setsid`**，
-  光 `nohup` 会被调用方进程组一起回收（日志文件 0 字节 = 被 SIGKILL）。可用
-  `subprocess.Popen(..., start_new_session=True)`；存活中的机群/报告站实测都是 `pgid == sid`。
-  同理，脚本里 `nohup` 重定向到文件的 Python 进程是**块缓冲**的，被强杀时一行日志都不落盘
-  —— 排查长跑进程一律加 `-u`。
+  光 `nohup` 会被调用方进程组一起回收（日志文件 0 字节 = 被 SIGKILL）。统一用
+  `scripts/_spawn.py`（内部就是 `subprocess.Popen(..., start_new_session=True)`）；
+  存活中的机群/报告站/日志源实测都是 `PPID=1 且 pgid == sid == pid`，跑 `sim.sh start`
+  之后应能随时用这套判据复验。同理，长跑 Python 进程一律加 `-u`，否则 stdout 是块缓冲的，
+  被强杀时一行日志都不落盘。
+- **状态判断一律以端口/进程为准，不要只信 pidfile**：pidfile 可能是被回收的旧进程留下的
+  陈旧 pid。`env.sh` 里有现成的 `port_open` / `port_pid` / `pid_alive` / `read_pid` /
+  `cli_running`。
+- **bash 多字节陷阱**：`"$VAR（中文"` 会把全角字符字节并进变量名，触发 `unbound variable`。
+  所有"变量紧跟中文/全角标点"的地方必须写 `${VAR}`。`printf '%-12s'` 也不会按显示宽度补空格
+  （CJK 占 2 列但算 3 字节），中英混排的表格要自己算宽度。
 - **启动时对既有历史段只做 `trim_to_capacity`，不要整段收档**：收档出来的文件会被下一轮
   轮转当成"自己上一轮"收走；裁剪则既保住"最近 N 小时"查询有行可读，又不越界。
 - **自检/查询的窗口断言要读「当前段 + 覆盖窗口的归档」**：活动文件刚轮转过的几十秒里只有
@@ -118,9 +128,9 @@ agent_created: true
   （`fm_targets.length !== 1` 直接拒绝），且必须已存在一个 `status === 'ready'` 的任务
   （只有环境/组件没有任务时是 0 源）。所以别把 3 类异常分散到 3 条流上就算完 ——
   那条会被订阅的流自己得凑齐「≥3 类异常 + 1 类正常」，否则单模块视图里只有 1 类。
-- CLI 要有 `stream` / `stream-status` / `stream-stop`，并**真的在** `sim_up.sh` 里启动
-  （只写进 banner 提示不算 —— 实测 `sim_up.sh` 曾经只在提示里提到日志源，没有启动块），
-  另外接进 `sim_down.sh` / `sim_status.sh`，否则每次验证都要手动起进程。
+- CLI 要有 `stream` / `stream-status` / `stream-stop`，并**真的在** `scripts/sim.sh` 里启动
+  （只写进 banner 提示不算 —— 实测早期版本曾经只在提示里提到日志源，没有启动块），
+  另外接进 `sim.sh stop` / `sim.sh status` 的分支，否则每次验证都要手动起进程。
 
 验证这类资产走两条腿：`curl -N -X POST /api/environment-logs/<id>/live/` 看 SSE 是否先
 `event: ready` 再持续 `event: logs`；selftest 里用「把日志根临时指向临时目录 + 把上限压到
@@ -133,14 +143,16 @@ agent_created: true
 真实日志不是散句，规则是：
 
 ```
-[函数名] >() enter <入参>        <- 入口
-[函数名] <普通正文>              <- 函数体内日志
-[函数名] <() leave <耗时/状态>    <- 出口
+[函数名] >() enter <关键字> 开始 <入参>    <- 入口
+[函数名] <普通正文>                        <- 函数体内日志
+[函数名] <() leave <关键字> end <耗时/状态> <- 出口
 ```
 
 - 权威定义：`frontend/src/rendering/foldingRules.ts` 的内置规则 `builtin-explicit-boundary`
   （`startKeyword: '> ()'` / `endKeyword: '< ()'`）；`App.tsx` 显示成「函数开始 >()」「函数结束 <()」。
   解析在 `logParser.ts`：`/>\s*\(\s*\)/` 与 `/<\s*\(\s*\)/`，函数名取**方向符之前最后一个 `[函数名]`**。
+  ⚠️ 标记本身是 `>()` / `<()`，**括号紧贴方向符、中间没有空格** —— 写诊断正则时别写成
+  `[<>] \(\)`（那要求方向符后有个空格），否则会得出"一行都没匹配上"的假结论。
 - 配对键是 `ruleId::functionName`：**同名** + **按 LIFO 闭合**。名字差一个字母就永远合不上；
   嵌套写反会画出错乱嵌套或标「缺少出口」。跨流交错没事（不同文件本来就是不同进程），
   但**同一条流内部的顺序就是它的调用栈轨迹**。
@@ -153,19 +165,99 @@ agent_created: true
 - `rpc` 保持 `文件:函数:行` 形状，行号用 `loggen.source_line(函数名)` 固定；
   mode 用 `loggen.call_mode(函数名)` —— 同一次调用的入口/出口 mode 必须一致。
 - **加上就写进自检**：`selftest.check_log_call_chain()` 校验剧本的同名配对 / LIFO 闭合 /
-  方向符紧邻函数名 / 边界行级别，并抽查落盘正文；`_validate_call_chain()` 可直接复用。
+  方向符紧邻函数名 / 边界行级别 / 关键字模板 / 阶段框；`_validate_call_chain()` 与
+  `_validate_stage_frames()` 可直接复用。
   同时 `check_live_stream()` 里断言实际推送的行含 `>()` / `<()`。
 - **失败用例的夹具要钉住错误行**：级别分布稀疏后，短夹具可能一条 ERROR 都覆盖不到，
   "异常行不误报"那条校验就失去样本（症状是 `抽取 0 条（文件内真错误行 0 条）`）。
   用 `loggen.ERROR_STEP_INDEX` 把程序里的 ERROR 正文钉到故障时刻，并按时间戳排序。
+
+### 10. 入口/出口要带**固定关键字模板**，并按流程阶段套框
+
+用户要的是"一眼能看出这行在干什么、现在走到哪个流程阶段"，所以入口/出口行不能只有英文
+函数名和裸参数：
+
+```
+[ScanWafer] >() enter 晶圆扫片 开始 wafer=W07 recipe=SPM-V2026.09.21
+[ScanWafer] <() leave 晶圆扫片 end wafer=W07 elapsed=86.4ms status=ok
+                   ^^^^^^^^ 关键字来自 loggen.PHASE_KEYWORDS，出入口同一份
+
+[Stage_EXPOSURE] >() enter 曝光阶段 开始 step=3/12 wafer=W07 lot=LOT-...
+  [ExposeWafer] >() enter 曝光扫描 开始 ...
+  [ExposeWafer] <() leave 曝光扫描 end ...
+[Stage_EXPOSURE] <() leave 曝光阶段 end step=3/12 status=aborted elapsed=...
+```
+
+**关键字模板**
+
+- 表在 `loggen.PHASE_KEYWORDS`（函数名 → 中文短语，如 `ScanLot: 批次扫片`、
+  `CheckFlow: 获取冷却流量`、`ExposeWafer: 曝光扫描`）。`log_message()` 自动插入：
+  入口 `... enter <关键字> 开始 <正文>`，出口 `... <关键字> end <正文>`。
+- **新增调用链函数必须同步登记**，否则会**静默**退回英文函数名当关键字
+  （看到「ScanWafer 开始」而不是「晶圆扫片 开始」就是漏登记）。
+  selftest 的「调用链函数都有关键字模板」就是查这个全覆盖。
+- 关键字放在方向符**之后**；函数名必须在方向符**之前**且是英文标识符
+  （`BOUNDARY_NAME_REGEX` 不接受中文，也不能紧邻另一个 `[]`）。
+
+**流程阶段框**
+
+- `loggen.expand_stage_groups(rows)` 给**每条流上连续的同阶段**套一个 `[Stage_<码>]` 框。
+  入参 `(流标识, 阶段码或 None, 级别, 函数, 相位, 正文)`，返回**固定五元组**
+  `(流标识, 级别, 函数, 相位, 正文)`。框自己也是调用链，同样吃 `PHASE_KEYWORDS`，
+  并在入口/出口带 `step=n/N` 标出流程进度。
+- ⚠️ **出口形状只有这一种**。曾经阶段框的头/尾行按 `(..., 函数, 相位, 级别, ...)` 另建元组，
+  而普通行是 `(..., 级别, 函数, 相位, ...)`，同一个返回值里两种行字段含义不同，
+  调用方按一种解包、另一种必然错位。症状很隐蔽：行还是那一行，
+  只是 `[Stage_EXPOSURE]` 跑到了「级别」槽里、函数名变成 `enter`，
+  打印出来 `[INFO]` 不见了、rpc 变成 `fm:enter:NNN` —— **只看长度和阶段码数量是查不出来的**。
+  改这类展开器时：内部行一律 `(位置, 流, 阶段码, 级别, 函数, 相位, 正文)`，出口只做一次切片。
+- 阶段码为 `None` = 不套框。**跨整轮的父帧（`ScanLot`/`ScanWafer`）绝不能套框**：
+  子阶段会先闭合、父帧被迫跨框，LIFO 直接破掉。
+- 阶段收尾状态写在 `loggen._STAGE_STATUS`（`EXPOSURE=aborted`、`INTERLOCK_TRIP=tripped`…），
+  别让所有阶段都 `status=ok` —— 那会让阶段框反而掩盖故障。
+- selftest 的 `_validate_stage_frames()` 校验阶段框成对 + **同一条流上序号递增**
+  （回退说明剧本把阶段写反了）。
+
+### 11. 机器地址必须是**真实可通信的网络 IP**
+
+模拟环境的机器地址不能是 `sim-upper.localhost` 这类字符串主机名 —— 它是**资源标识**，
+后端会拿去建 SSH/SFTP 连接、拼 ATLog URL、做内网校验。
+
+- 探测在 `fleet.detect_machine_host()`：枚举 `ifconfig` 地址并按 `_address_rank()`
+  **内网段优先**（`192.168.` → `10.` → 其它内网 → 回环 → 非内网）。
+  ⚠️ 别用"UDP 连 8.8.8.8 取本机地址"这种单点探测 —— 挂 VPN 时会拿到 `utun` 的
+  `28.0.0.1`，既不是内网、也连不通，后端 `_is_private_host` 会直接拒。
+- `fleet.MACHINE_HOST` / `UPPER.host` / `LOWER1.host` 都用它；上位机与下位机**同一个 IP，
+  靠端口区分**（2222/2223）。按地址精确定位机器用 `fleet.machine_by_endpoint(host, port)`，
+  别用 `host` 单键查（会同时命中上下位机）。
+- 进程要真的**绑上去**：`sshd.MachineServer(bind_hosts=...)` 每个地址一个 accept 线程；
+  `atlog_site.serve(hosts=...)` 返回 `ReportSiteGroup` 多地址监听集合。
+  默认 `fleet.bind_hosts()` = `(MACHINE_HOST, "127.0.0.1")`。
+- ⚠️ **"端口在监听" ≠ "网络 IP 能连上"**。改造前起的旧进程只绑 `127.0.0.1`，
+  `lsof -iTCP:2222` 照样有输出，`sim.sh status` 如果只打印配置里的地址就会显示一切正常，
+  真正报错要等到后端去连：`Unable to connect to port 2222 on 192.168.1.10`。
+  判据必须是**对具体地址做一次 TCP 连接**（`env.sh` 的 `port_open_on` /
+  `wait_port`），展示用 `listen_addrs`（列出该端口实际绑定的本地地址）。
+  也不要用 `lsof -i@host` 过滤：多个 `-i` 是"或"，实测会把同端口其它地址上的无关进程也列出来。
+- `sim.sh start` 的跳过判据要带上地址：端口开着但网络 IP 连不上 ⇒ 判为陈旧进程，
+  **自动重启**，否则用户每次都要手动 `restart`。
+- 改了 `MACHINE_HOST` 之后要连带处理两处**按主机名命名的目录**：
+  * executor 树 `<elog root>/<lower.host>/<子系统>/`（`loggen.executor_family`）——
+    旧名字的目录不会被新产物覆盖，`prune_tree` 又是 40 个文件/轮的小批量，靠 `init` 重跑要好几轮。
+    目录内容完全一样时，**一次 `os.replace(old_dir, new_dir)` 改名**即可，不用批量删。
+  * `seed._drop_stale_sim_machines()` 负责删掉同名但 host 已过期的旧机器记录
+    （`Environment.upper_machine` 是 `OneToOneField`，留着会撞唯一约束）。
+- 改完按顺序收尾：`init`（重写资产）→ `seed`（刷新目录）→ 重启 `stream`/`backend`
+  （它们把剧本和目录缓存进了进程），最后 `selftest`。
+  只做 `init` 不做 `seed`，症状是自检报「尚未 seed」+「未找到 executor 文件」。
 
 ## 验证顺序
 
 ```bash
 cd backend && .venv/bin/python -m simremote.cli init          # 生成（会同时重建报告站夹具）
 .venv/bin/python -m simremote.cli stream --interval 0.5       # 实时日志源（改动后必须重启）
-.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 85/85）
-# 实时内容相关的断言需要日志源已跑满一整轮（50 行剧本 ≈ 25s），刚重启时会报「跳过」
+.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 96/96）
+# 实时内容相关的断言需要日志源已跑满一整轮（76 行剧本 ≈ 38s），刚重启时会报「跳过」
 # 注意 selftest 只覆盖后端直连路径，还要过一遍真实 HTTP：
 curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
   -H 'Content-Type: application/json' -d '{"url":"..."}'
