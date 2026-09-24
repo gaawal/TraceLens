@@ -9,6 +9,9 @@
 #   scripts/sim.sh stop    [组件...]   停止（默认全部；Redis 非本脚本拉起的会跳过）
 #   scripts/sim.sh restart [组件...]   重启
 #   scripts/sim.sh status             状态总览
+#   scripts/sim.sh deploy [--no-seed] 自动化模拟部署：上下位机互信 + 分步日志
+#   scripts/sim.sh hosts              打印两台机器当前分配的地址
+#   scripts/sim.sh alias              打印/检查「两个独立 IP」的 lo0 别名准备
 #   scripts/sim.sh logs <组件> [-n N] 跟踪某个组件的日志
 #   scripts/sim.sh init   [--fresh]   强制重建模拟资产（日志树 / CPD / ATLog 站）
 #   scripts/sim.sh realign            把模拟日志的时间锚点对齐到当前时刻
@@ -17,22 +20,30 @@
 # 组件名（可任意挑选、顺序无关，脚本内部按依赖顺序执行）：
 #   redis      Redis 7                     127.0.0.1:6379
 #   assets     模拟资产（非守护进程，缺了才生成：日志树 + CPD + ATLog 用例站）
-#   fleet      假 SSH/SFTP 机群            网络IP:2222（上位机）/ :2223（下位机）
+#   fleet      假 SSH/SFTP 机群            上位机与下位机**各自一个地址**（见下）
 #   site       模拟 ATLog/CPD 报告站       网络IP:8901（同时绑 127.0.0.1）
 #   stream     实时日志源（tail -f 效果）  持续追加 <fm>.log，1000 行轮转
 #   backend    Django API                  127.0.0.1:8000
+#   watcher    实时监听/采集 worker         无端口，常驻 claim 监视器并写命中
 #   frontend   Vite 前端                   127.0.0.1:5173
 #   stt        本地语音转文字（可选，不在默认集合里）127.0.0.1:8001
+#
+# 关于"两个 IP"：上位机与下位机是两个不同的地址（互信模拟的前提）。
+# 地址来源按优先级：环境变量 SIM_UPPER_HOST / SIM_LOWER_HOST →
+# lo0 别名（127.0.0.2 / 127.0.0.3，需 sudo ifconfig lo0 alias … up）→
+# 兜底为"局域网 IP + 127.0.0.1"。当前分配用 `scripts/sim.sh hosts` 查看。
 #
 # 选项：
 #   --keep-redis    stop 时保留 Redis
 #   --force-deps    强制重装前端依赖（node_modules 被裁剪/半损坏时用）
 #   --force         stop redis 时忽略"不是本脚本拉起的"保护（慎用）
+#   --no-seed       deploy 时只做互信，不写入环境资源（不动数据库）
 #
 # 例：
 #   scripts/sim.sh start                    # 全栈
 #   scripts/sim.sh start backend frontend   # 只起后端 + 前端
 #   scripts/sim.sh restart stream           # 只重启实时日志源
+#   scripts/sim.sh deploy                   # 跑一遍互信部署并打印每步日志
 #   scripts/sim.sh stop --keep-redis        # 停仿真与前后端，留着 Redis
 #   scripts/sim.sh logs stream
 # =============================================================================
@@ -49,11 +60,11 @@ ok()   { printf '\033[32m[sim]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[sim]\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m[sim]\033[0m %s\n' "$*" >&2; exit 1; }
 
-KNOWN_COMPONENTS="redis assets fleet site stream backend frontend stt"
+KNOWN_COMPONENTS="redis assets fleet site stream backend watcher frontend stt"
 DEFAULT_START="redis assets fleet site stream backend frontend"
 DEFAULT_STOP="frontend backend stream site fleet redis"
 # 启动顺序即依赖顺序：Redis → 资产 → 机群 → 报告站 → 日志源 → 后端 → 前端 → STT
-START_ORDER="redis assets fleet site stream backend frontend stt"
+START_ORDER="redis assets fleet site stream backend watcher frontend stt"
 STOP_ORDER="stt frontend backend stream site fleet redis"
 
 usage() { awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "${BASH_SOURCE[0]}"; }
@@ -81,18 +92,46 @@ ensure_venv() {
 
 cli() { (cd "$BACKEND_DIR" && "$PY" -u -m simremote.cli "$@"); }
 
-# 模拟机的**网络 IP**。机群与报告站绑的是这个地址（外加 127.0.0.1），
+# 按命令行匹配停进程（守护型服务没有端口可用，例如实时监听 worker）。
+stop_by_match() {
+  local label="$1" pattern="$2"
+  local pids
+  pids="$(pgrep -f "$pattern" 2>/dev/null | tr '\n' ' ')"
+  if [ -z "${pids// /}" ]; then
+    info "$label 未在运行（跳过）"
+    return 0
+  fi
+  info "停止 ${label}（pid ${pids// /,}）"
+  for pid in $pids; do kill_tree "$pid"; done
+  sleep 1
+  pgrep -f "$pattern" >/dev/null 2>&1 && warn "$label 仍在运行"
+  return 0
+}
+
+# 模拟机的**网络 IP**（对外服务绑它，用户也会照它访问）。
+# 探测逻辑在 backend/simremote/fleet.public_host()：局域网 IP 优先，回环兜底；
 # 不是 sim-upper.localhost 这类字符串主机名 —— 后端 ATLog 的 _is_private_host
 # 会校验它是不是内网 IP，字符串或公网地址都会被打回。
-# 探测逻辑在 backend/simremote/fleet.detect_machine_host()（枚举 ifconfig，
-# 内网段优先于 VPN/回环），这里只拿来做展示；探不到就退回回环地址。
 machine_ip() {
   local ip=""
   if [ -x "$PY" ]; then
-    ip="$( (cd "$BACKEND_DIR" && "$PY" -c 'from simremote import fleet; print(fleet.MACHINE_HOST)' 2>/dev/null) )"
+    ip="$( (cd "$BACKEND_DIR" && "$PY" -c 'from simremote import fleet; print(fleet.public_host())' 2>/dev/null) )"
   fi
   [ -n "$ip" ] || ip="127.0.0.1"
   printf '%s' "$ip"
+}
+
+# 两台机器各自的「key 地址 端口 名字」，一行一台。
+# 上位机与下位机是**两个不同的 IP**（互信模拟的前提），所以探测、等待、打印
+# 都要按各自的地址来 —— 共用一个 MACHINE_HOST 会让"下位机未就绪"这种误判出现。
+machine_endpoints() {
+  if [ -x "$PY" ]; then
+    (cd "$BACKEND_DIR" && "$PY" -c '
+from simremote import fleet
+for spec in fleet.FLEET:
+    print(spec.key, spec.host, spec.ssh_port, spec.name)
+' 2>/dev/null)
+  fi
 }
 
 # 把长跑进程放进独立会话启动（macOS 无 setsid，nohup 会被调用方进程组回收）。
@@ -167,28 +206,36 @@ c_start_assets() {
 }
 
 c_start_fleet() {
-  local host
-  host="$(machine_ip)"
-  if port_open 2222 && port_open 2223; then
-    if port_open_on "$host" 2222 && port_open_on "$host" 2223; then
-      info "模拟机群已在 ${host} 运行（跳过）"
-      return 0
-    fi
-    # 端口是开的，但网络 IP 连不上 —— 基本是改造前留下的旧进程（只绑了 127.0.0.1）。
-    # 不重启的话，后端 SSH 连接会报 Unable to connect to port 2222 on <ip>。
-    warn "模拟机群只在回环地址上，未监听 ${host}；重启以绑定网络 IP"
-    stop_by_port "模拟机群" 2222
-    local waited=0
-    while [ "$waited" -lt 20 ] && { port_open 2222 || port_open 2223; }; do
-      sleep 0.25
-      waited=$((waited + 1))
-    done
+  local endpoints all_up=1 key host port name
+  endpoints="$(machine_endpoints)"
+  [ -n "$endpoints" ] || fail "取不到机器地址，先确认 backend/.venv 可用"
+
+  # 每台机器都真的能在**自己的地址**上连上，才算已就绪。
+  while read -r key host port name; do
+    [ -n "$key" ] || continue
+    port_open_on "$host" "$port" || all_up=0
+  done <<<"$endpoints"
+  if [ "$all_up" = 1 ]; then
+    info "模拟机群已在运行（跳过）"
+    return 0
   fi
-  info "启动假 SSH/SFTP 机群（${host}:2222 上位机 / :2223 下位机）"
+
+  if port_open 2222 || port_open 2223; then
+    # 端口开着但地址对不上：旧进程只绑了回环，或者两台机器共用了同一个地址。
+    # 不重启的话，后端 SSH 会报 Unable to connect to port 22xx on <ip>。
+    warn "机群在运行但地址不匹配（可能只绑了回环）；重启以绑好两个地址"
+    stop_by_port "模拟机群" 2222
+    stop_by_port "模拟机群" 2223
+    sleep 0.5
+  fi
+
+  info "启动假 SSH/SFTP 机群（上位机与下位机各一个地址）"
   spawn fleet "$RUN_DIR/fleet.out" "$BACKEND_DIR" "$PY" -u -m simremote.cli serve >/dev/null
-  wait_port "$host" 2222 30 || fail "模拟上位机 SSH 未就绪（${host}:2222），见 $RUN_DIR/fleet.out"
-  wait_port "$host" 2223 30 || fail "模拟下位机 SSH 未就绪（${host}:2223），见 $RUN_DIR/fleet.out"
-  ok "机群就绪 ssh tracepilot@${host}:2222（上位机）/ :2223（下位机）  密码 tracelens"
+  while read -r key host port name; do
+    [ -n "$key" ] || continue
+    wait_port "$host" "$port" 30 || fail "$name SSH 未就绪（${host}:${port}），见 $RUN_DIR/fleet.out"
+    ok "$name 就绪 ssh tracepilot@${host}:${port}  密码 tracelens"
+  done <<<"$endpoints"
 }
 
 c_start_site() {
@@ -242,6 +289,23 @@ c_start_backend() {
     --host 127.0.0.1 --port 8000 --no-access-log >/dev/null
   wait_port 127.0.0.1 8000 60 || fail "后端启动超时，见 $RUN_DIR/backend.out"
   ok "后端就绪 http://127.0.0.1:8000/api/"
+}
+
+# 实时监听/采集的执行者：watch_worker 才是真正去 tail 机器日志、写 LogWatchHit 的进程。
+# 少了它，前端「实时监听」看着一切正常（SSE 连着、任务在跑），但服务端一条命中都不会产生
+# —— 采集面板永远是 0 条。它不是 Web 进程的一部分，必须单独常驻。
+c_start_watcher() {
+  if pgrep -f "manage.py watch_worker" >/dev/null 2>&1; then
+    info "实时监听 worker 已在运行（跳过）"
+    return 0
+  fi
+  info "启动实时监听 worker（claim 监视器 → tail 日志 → 写命中）"
+  spawn watcher "$RUN_DIR/watch_worker.out" "$BACKEND_DIR" \
+    "$PY" -u manage.py watch_worker --poll-seconds 1 >/dev/null
+  sleep 2
+  pgrep -f "manage.py watch_worker" >/dev/null 2>&1 \
+    || fail "实时监听 worker 未存活，见 $RUN_DIR/watch_worker.out"
+  ok "实时监听 worker 就绪（scripts/sim.sh logs watcher 可跟踪）"
 }
 
 # 前端依赖完整性：node_modules 有可能被"裁剪"成半成品（只少包、不报错），
@@ -341,6 +405,7 @@ c_stop_fleet()  { cli stop        || warn "机群停止未完成，见上方提�
 c_stop_site()   { cli site-stop   || warn "报告站停止未完成，见上方提示"; }
 c_stop_stream() { cli stream-stop || warn "日志源停止未完成，见上方提示"; }
 c_stop_backend()  { stop_by_port "Django 后端" 8000; }
+c_stop_watcher()  { stop_by_match "实时监听 worker" "manage.py watch_worker"; }
 c_stop_frontend() { stop_by_port "Vite 前端" 5173; }
 c_stop_stt()      { stop_by_port "本地 STT" 8001; }
 
@@ -352,6 +417,7 @@ start_component() {
     site)     c_start_site ;;
     stream)   c_start_stream ;;
     backend)  c_start_backend ;;
+    watcher)  c_start_watcher ;;
     frontend) c_start_frontend ;;
     stt)      c_start_stt ;;
   esac
@@ -372,9 +438,49 @@ stop_component() {
 
 # ---------------------------------------------------------------- 收尾横幅
 
+# 某台机器的「地址:端口」（供横幅与提示使用）。
+machine_addr() {
+  machine_endpoints | awk -v key="$1" '$1 == key { print $2":"$3; exit }'
+}
+
+# lo0 上已有的额外别名地址（没有则输出空）。
+loopback_aliases() {
+  if [ -x "$PY" ]; then
+    (cd "$BACKEND_DIR" && "$PY" -c \
+      'from simremote import fleet; print(" ".join(fleet.loopback_aliases()))' 2>/dev/null)
+  fi
+}
+
+# 两个 IP 的准备提示。本机回环网段默认只有 127.0.0.1，加别名需要管理员权限，
+# 所以这里只**引导**不代劳；加完之后两台机器就会各拿一个独立地址。
+alias_hint() {
+  local aliases
+  aliases="$(loopback_aliases)"
+  if [ -n "$aliases" ]; then
+    ok "lo0 已有别名地址：${aliases}（上下位机各用一个）"
+    return 0
+  fi
+  cat <<EOF
+
+  提示：lo0 目前只有 127.0.0.1，两台模拟机只能**共用网卡地址**（靠端口区分）。
+        想让上位机与下位机各拿一个**独立 IP**（互信更贴近真实机台），执行一次：
+
+            sudo ifconfig lo0 alias 127.0.0.2 up
+            sudo ifconfig lo0 alias 127.0.0.3 up
+
+        然后重启机群：scripts/sim.sh restart fleet
+        （不想加也行，功能不受影响：scripts/sim.sh deploy 照常可跑）
+
+EOF
+}
+
 print_summary() {
-  local host
+  local host upper lower
   host="$(machine_ip)"
+  upper="$(machine_addr upper)"
+  lower="$(machine_addr lower1)"
+  [ -n "$upper" ] || upper="${host}:2222"
+  [ -n "$lower" ] || lower="${host}:2223"
   cat <<EOF
 
 ============================================================
@@ -384,9 +490,9 @@ print_summary() {
  后端 API    http://127.0.0.1:8000/api/
  接口文档    http://127.0.0.1:8000/api/docs/
  模拟报告站  http://${host}:8901/
- 模拟上位机  ssh tracepilot@${host}:2222  密码 tracelens
- 模拟下位机  ssh tracepilot@${host}:2223  密码 tracelens
-             （上位机/下位机同一个网络 IP，靠端口 2222/2223 区分）
+ 模拟上位机  ssh tracepilot@${upper}  密码 tracelens
+ 模拟下位机  ssh tracepilot@${lower}  密码 tracelens
+             （两台机器各有独立 IP；互信部署：scripts/sim.sh deploy）
 
  日志：
    Redis      $RUN_DIR/redis.log
@@ -397,6 +503,12 @@ print_summary() {
    前端       $RUN_DIR/frontend.out
    （跟踪：scripts/sim.sh logs <redis|fleet|site|stream|backend|frontend>）
 EOF
+
+  # 两台机器共用地址时提示一下：这是默认情形（lo0 没加别名），不是故障。
+  if [ "${upper%%:*}" = "${lower%%:*}" ]; then
+    printf '\n 提示：上位机与下位机共用 %s（靠端口区分）。想要两个独立 IP：scripts/sim.sh alias\n' \
+      "${upper%%:*}"
+  fi
 
   "$PY" - "$RUN_DIR/seed.out" <<'PY'
 import re, sys
@@ -532,6 +644,15 @@ print_status() {
   else
     printf '\033[31m○ 未运行\033[0m\n'
   fi
+  # 实时监听/采集 worker：没有它，前端「实时监听」一切正常但服务端一条命中都不产生
+  pad "实时监听worker" "$name_w"; pad "无端口（tail 机群日志）" "$addr_w"
+  local watcher_pid
+  watcher_pid="$(pgrep -f "manage.py watch_worker" 2>/dev/null | head -1)"
+  if [ -n "$watcher_pid" ]; then
+    printf '\033[32m● 运行中\033[0m  pid %s\n' "$watcher_pid"
+  else
+    printf '\033[31m○ 未运行（实时采集会一直 0 条）\033[0m\n'
+  fi
 
   echo
   if [ -x "$PY" ]; then
@@ -548,6 +669,7 @@ log_path_for() {
     site)     echo "$RUN_DIR/site.out" ;;
     stream)   echo "$RUN_DIR/stream.out" ;;
     backend)  echo "$RUN_DIR/backend.out" ;;
+    watcher)  echo "$RUN_DIR/watch_worker.out" ;;
     frontend) echo "$RUN_DIR/frontend.out" ;;
     stt)      echo "$RUN_DIR/stt.out" ;;
     init)     echo "$RUN_DIR/init.out" ;;
@@ -561,7 +683,7 @@ show_logs() {
   local name="$1"; shift
   local target
   target="$(log_path_for "$name")" \
-    || fail "未知日志：${name}（可选：redis fleet site stream backend frontend stt init migrate seed）"
+    || fail "未知日志：${name}（可选：redis fleet site stream backend watcher frontend stt init migrate seed）"
   [ -f "$target" ] || fail "日志还不存在：${target}"
   info "跟踪 ${target}（Ctrl-C 退出）"
   if [ "${#TAIL_ARGS[@]}" -gt 0 ]; then
@@ -579,12 +701,13 @@ FORCE=0
 FORCE_DEPS=0
 KEEP_REDIS=0
 FRESH=0
+NO_SEED=0
 TAIL_ARGS=()
 SEED_ARG=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    start|up|stop|down|restart|status|logs|init|realign|selftest)
+    start|up|stop|down|restart|status|logs|init|realign|selftest|deploy|hosts|alias)
       [ -z "$COMMAND" ] || fail "只接受一个子命令，收到 $COMMAND 和 $1"
       COMMAND="$1"
       ;;
@@ -592,6 +715,7 @@ while [ $# -gt 0 ]; do
     --force-deps) FORCE_DEPS=1 ;;
     --keep-redis) KEEP_REDIS=1 ;;
     --fresh) FRESH=1 ;;
+    --no-seed) NO_SEED=1 ;;
     -h|--help) usage; exit 0 ;;
     -n) shift; TAIL_ARGS=(-n "${1:-40}") ;;
     -*) fail "未知选项：$1（用 -h 看用法）" ;;
@@ -699,6 +823,33 @@ case "$COMMAND" in
   realign)
     [ -x "$PY" ] || fail "后端虚拟环境不存在：$PY"
     exec "$SCRIPTS_DIR/sim_realign.sh"
+    ;;
+
+  hosts)
+    [ -x "$PY" ] || fail "后端虚拟环境不存在：$PY"
+    cli hosts
+    ;;
+
+  alias)
+    [ -x "$PY" ] || fail "后端虚拟环境不存在：$PY"
+    alias_hint
+    ;;
+
+  deploy)
+    [ -x "$PY" ] || fail "后端虚拟环境不存在：$PY"
+    if ! cli_running serve; then
+      fail "模拟机群没在运行，先执行：scripts/sim.sh start fleet"
+    fi
+    echo
+    info "自动化模拟部署（互信 + 分步日志）：上位机 ⇄ 下位机"
+    echo
+    if [ "$NO_SEED" = "1" ]; then
+      cli deploy --no-seed
+    else
+      cli deploy
+    fi
+    echo
+    ok "部署流程结束"
     ;;
 
   selftest)

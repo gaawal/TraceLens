@@ -29,6 +29,7 @@ import {
   Link2,
   LoaderCircle,
   Plus,
+  Radio,
   Search,
   Settings,
   ServerCog,
@@ -51,15 +52,14 @@ import { LogRulesSettingsPage } from './components/LogRulesSettingsPage';
 import { LogAuditPage } from './components/LogAuditPage';
 import { ExtractedDataPage } from './components/ExtractedDataPage';
 import { DataExtractionRunDialog, type DataExtractionCandidate, type DataExtractionResultView } from './components/DataExtractionRunDialog';
-import { AbnormalCaseEditorDialog } from './components/AbnormalCaseEditorDialog';
+import { SmartAnalysisDialog } from './components/SmartAnalysisDialog';
 import type { AbnormalCase, AbnormalCaseEvidence } from './api/resourceApi';
-import { AbnormalCaseAnalysisDialog } from './components/AbnormalCaseAnalysisDialog';
 import { KnowledgeBasePage } from './components/KnowledgeBasePage';
 import { ToolCenterPage } from './components/ToolCenterPage';
 import { createTracePilotActionRegistry } from './assistant/actionRegistry';
 import { afterPaint, type UiReceipt } from './assistant/workstation';
 import { saveTracePilotAgentContext } from './assistant/agentContext';
-import { setLiveMonitoring } from './services/liveMonitoring';
+import { requestCapturePanel, setLiveMonitoring } from './services/liveMonitoring';
 import { EventRestoreDialog } from './components/EventRestoreDialog';
 import { AtLogAnalysisPage } from './components/AtLogAnalysisPage';
 import { APP_VERSION } from './appConfig';
@@ -1562,15 +1562,27 @@ function SwitchControl({
   );
 }
 
-function RawLogView({ task }: { task: LogTask }) {
+function RawLogView({ task, live = false }: { task: LogTask; live?: boolean }) {
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [sourceIndex, setSourceIndex] = useState(0);
   const remoteRequestKey = JSON.stringify(task.remoteRequest ?? null);
   const localSource = task.sources[Math.min(sourceIndex, Math.max(0, task.sources.length - 1))];
+  const preRef = useRef<HTMLPreElement | null>(null);
+  /**
+   * 实时监听中：直接展示已经流进来的原文行。
+   *
+   * RawLogView 原本只会取一次 raw 时间窗，所以「原始日志」和「实时监听」互斥（开一个就停另一个）。
+   * 实时任务里每一行的 `entry.raw` 就是原文，边到边追加即可，不必再拉一次文件。
+   */
+  const streamedText = useMemo(
+    () => task.entries.map((entry) => entry.raw || entry.message || '').filter(Boolean).join('\n'),
+    [task.entries],
+  );
 
   useEffect(() => {
+    if (live) return undefined;   // 实时任务用流进来的原文，不再拉一次性时间窗
     let cancelled = false;
     const controller = new AbortController();
     setLoading(true);
@@ -1601,7 +1613,14 @@ function RawLogView({ task }: { task: LogTask }) {
       cancelled = true;
       controller.abort();
     };
-  }, [task.id, task.remoteEnvironmentId, remoteRequestKey, localSource?.id]);
+  }, [task.id, task.remoteEnvironmentId, remoteRequestKey, localSource?.id, live]);
+
+  // 实时模式下新行到达就贴到底部（和日志列表的跟随行为一致）。
+  useEffect(() => {
+    if (!live) return;
+    const node = preRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [live, streamedText]);
 
   useEffect(() => {
     if (sourceIndex >= task.sources.length) setSourceIndex(0);
@@ -1623,9 +1642,13 @@ function RawLogView({ task }: { task: LogTask }) {
             </select>
           </label>
         )}
-        <span className="raw-log-mode-note">纯文本 · 不解析 · 保留原始顺序</span>
+        <span className="raw-log-mode-note">{live ? '纯文本 · 实时追加 · 不解析' : '纯文本 · 不解析 · 保留原始顺序'}</span>
       </header>
-      {loading ? (
+      {live ? (
+        streamedText
+          ? <pre className="raw-log-pre" tabIndex={0} ref={preRef}>{streamedText}</pre>
+          : <div className="raw-log-loading"><LoaderCircle size={17} className="spin" />实时监听中，等待新增日志…</div>
+      ) : loading ? (
         <div className="raw-log-loading"><LoaderCircle size={17} className="spin" />正在读取日志原文…</div>
       ) : error ? (
         <div className="raw-log-error"><AlertTriangle size={17} />{error}</div>
@@ -3941,6 +3964,10 @@ export default function App() {
   const [liveAddedCount, setLiveAddedCount] = useState(0);
   const [liveMessage, setLiveMessage] = useState('');
   const [remoteLogLocator, setRemoteLogLocator] = useState<RemoteLogLocatorSnapshot>();
+  // The UI-action registry closes over its own render; the ref keeps 开始采集 reading the
+  // locator the user has selected right now instead of the one from when the effect ran.
+  const remoteLogLocatorRef = useRef<RemoteLogLocatorSnapshot>();
+  useEffect(() => { remoteLogLocatorRef.current = remoteLogLocator; }, [remoteLogLocator]);
   const liveBoundTaskIdRef = useRef<string>();
   const liveAbortRef = useRef<AbortController>();
   const liveSessionRef = useRef(0);
@@ -4011,10 +4038,14 @@ export default function App() {
   const pendingAiExtractionRef = useRef<Record<string, unknown>>();
   const [eventRestoreOpen, setEventRestoreOpen] = useState(false);
   const [eventRestorePreset, setEventRestorePreset] = useState<{ environmentId: number; environmentName: string; startTime: string; endTime: string }>();
-  const [abnormalCaseEditorOpen, setAbnormalCaseEditorOpen] = useState(false);
+  // 「案例录入」和「相似案例匹配」是同一条工作流的进出两端，合成一个带标签页的窗口。
+  const [smartAnalysisTab, setSmartAnalysisTab] = useState<'cases' | 'analysis' | undefined>(undefined);
+  const abnormalCaseEditorOpen = smartAnalysisTab === 'cases';
+  const abnormalCaseAnalysisOpen = smartAnalysisTab === 'analysis';
+  const setAbnormalCaseEditorOpen = (next: boolean) => setSmartAnalysisTab(next ? 'cases' : undefined);
+  const setAbnormalCaseAnalysisOpen = (next: boolean) => setSmartAnalysisTab(next ? 'analysis' : undefined);
   /** Case fields drafted by the assistant, awaiting the user's review before saving. */
   const [caseImportDraft, setCaseImportDraft] = useState<{ draft: Partial<AbnormalCase>; evidences: AbnormalCaseEvidence[] }>();
-  const [abnormalCaseAnalysisOpen, setAbnormalCaseAnalysisOpen] = useState(false);
   const [ruleEditorRequest, setRuleEditorRequest] = useState<DisplayRuleEditorRequest>();
   const [inlineRuleSeed, setInlineRuleSeed] = useState<DisplayRuleEditorRequest>();
   const [preferredSettingsTab, setPreferredSettingsTab] = useState<'resource' | 'catalog' | 'rules'>('resource');
@@ -4450,12 +4481,14 @@ export default function App() {
   }, []);
 
   // Real-time monitoring is deliberately ephemeral. Leaving log locator,
-  // switching tasks, or entering raw-log mode always tears down the live
+  // switching tasks, or leaving the log workspace always tears down the live
   // connection so a hidden page can never keep consuming SSH/network resources.
   useEffect(() => {
-    if (workspacePage === 'logs' && !rawLogMode) return;
+    // 只在离开日志工作区时停：原始日志模式现在能显示实时追加的原文，
+    // 过去「开原始日志就停实时监听」把两个功能变成了互斥。
+    if (workspacePage === 'logs') return;
     if (liveListening) setLiveListening(false);
-  }, [workspacePage, rawLogMode, liveListening]);
+  }, [workspacePage, liveListening]);
 
   useEffect(() => {
     if (!liveListening) return;
@@ -4473,8 +4506,10 @@ export default function App() {
       liveBoundTaskIdRef.current = undefined;
       return;
     }
-    if (workspacePage !== 'logs' || rawLogMode || !activeTask?.remoteEnvironmentId || !activeTask.remoteRequest || activeTask.status !== 'ready') {
-      setLiveMessage(rawLogMode ? '原始日志模式不启用实时监听。' : '请选择一个环境和一个组件后开启实时监听。');
+    // 原始日志模式不再排除在外：RawLogView 会直接显示流进来的原文，
+    // 于是「看原文」和「实时监听」可以同时存在（过去开一个就停另一个）。
+    if (workspacePage !== 'logs' || !activeTask?.remoteEnvironmentId || !activeTask.remoteRequest || activeTask.status !== 'ready') {
+      setLiveMessage('请选择一个环境和一个组件后开启实时监听。');
       setLiveListening(false);
       return;
     }
@@ -6109,6 +6144,45 @@ export default function App() {
         setAbnormalCaseEditorOpen(true);
         return { detail: `已打开案例编辑器并预填「${String(draft.name || '诊断结论')}」，核对后保存` };
       },
+      /** 采集面板的勾选写回提取器上的 liveCapture —— 面板与规则页编辑同一个开关。 */
+      set_live_capture_items: (detail) => {
+        const items = Array.isArray(detail.items) ? detail.items as Array<Record<string, unknown>> : [];
+        if (!items.length) throw new Error('没有要更新的采集项');
+        const wanted = new Map(items.map((item) => [String(item.id || ''), item.liveCapture === true]));
+        let changed = 0;
+        setDataExtractionRules((current) => current.map((rule) => {
+          if (!wanted.has(rule.id)) return rule;
+          const next = wanted.get(rule.id)!;
+          if ((rule.liveCapture === true) === next) return rule;
+          changed += 1;
+          return { ...rule, liveCapture: next, updatedAt: Date.now() };
+        }));
+        return { detail: `已更新 ${changed} 个采集项`, changed };
+      },
+      start_live_capture: () => {
+        // Same single implementation as the toolbar 实时监听 switch: the page owns the stream.
+        const locator = remoteLogLocatorRef.current;
+        const targets = locator?.liveTargets ?? [];
+        if (!locator?.environment || targets.length !== 1) {
+          throw new Error(targets.length > 1
+            ? `实时采集仅支持单组件，当前选择了 ${targets.length} 个组件，请只保留一个。`
+            : '实时采集需要先在日志定位里选择一个环境和一个组件。');
+        }
+        return beginLiveMonitoring({
+          environment: locator.environment,
+          target: targets[0],
+          sourceCategories: locator.sourceCategories,
+          startTime: locator.startTime,
+          endTime: locator.endTime,
+        });
+      },
+      stop_live_capture: () => {
+        liveRenderGenerationRef.current += 1;
+        liveBoundTaskIdRef.current = undefined;
+        setLiveMessage('');
+        setLiveListening(false);
+        return { detail: '已停止实时采集' };
+      },
       open_log_rule_settings: (detail) => {
         const tab = String(detail.tab || 'semantic');
         const normalizedTab = tab === 'data' || tab === 'anomaly' ? tab : 'semantic';
@@ -7408,6 +7482,21 @@ export default function App() {
     if (!activeTask || activeTask.status !== 'ready') return;
     if (defaultRangeTaskRef.current === activeTask.id) return;
 
+    /*
+     * 实时任务不做「默认时间范围」过滤。
+     *
+     * 实时监听开的是新 tab，它的 remoteRequest 是开启那一刻的 1 分钟窗口；而日志是**从现在往后长**的，
+     * 一旦把 filters.timeRange 设成那个固定窗口，之后所有新到的行都落在窗外 → 列表永远 0 条
+     * （后端在推、累计计数在涨，界面上却什么都没有）。
+     */
+    if (liveBoundTaskIdRef.current && activeTask.id === liveBoundTaskIdRef.current) {
+      defaultRangeTaskRef.current = activeTask.id;
+      setFilters((current) => (current.timeRange ? { ...current, timeRange: undefined } : current));
+      setCustomStartTime('');
+      setCustomEndTime('');
+      return;
+    }
+
     const remoteLoadedStart = activeTask.loadedStartNs ?? requestTimeRangeNs(activeTask.remoteRequest)?.startNs;
     const remoteLoadedEnd = activeTask.loadedEndNs ?? requestTimeRangeNs(activeTask.remoteRequest)?.endNs;
     if (activeTask.remoteRequest && remoteLoadedStart !== undefined && remoteLoadedEnd !== undefined) {
@@ -7674,8 +7763,10 @@ export default function App() {
    * 「整理成案例」 silently did nothing on the other eight pages even though the action
    * reported success. One definition, included everywhere, keeps that from drifting again.
    */
-  const globalOverlays = abnormalCaseEditorOpen ? (
-    <AbnormalCaseEditorDialog
+  const globalOverlays = smartAnalysisTab ? (
+    <SmartAnalysisDialog
+      tab={smartAnalysisTab}
+      onTabChange={setSmartAnalysisTab}
       initialDraft={caseImportDraft?.draft}
       presetEvidences={caseImportDraft?.evidences}
       entries={navigableErrorEntries}
@@ -7685,9 +7776,12 @@ export default function App() {
       sourceOperationId={activeTask?.remoteOperationId}
       sourceTaskName={activeTask?.name}
       querySnapshot={activeTask?.remoteRequest}
+      analysisEntries={metricEntries}
+      selectedModules={activeTask?.remoteRequest?.fm_targets?.map((item) => item.fm) || activeTask?.remoteRequest?.fms}
+      onLocateEntry={jumpToLogEntry}
       errorRules={errorRules}
-      onClose={() => { setAbnormalCaseEditorOpen(false); setCaseImportDraft(undefined); }}
-      onSaved={() => { setAbnormalCaseEditorOpen(false); setCaseImportDraft(undefined); }}
+      onClose={() => { setSmartAnalysisTab(undefined); setCaseImportDraft(undefined); }}
+      onSaved={() => { setSmartAnalysisTab(undefined); setCaseImportDraft(undefined); }}
     />
   ) : null;
 
@@ -7989,10 +8083,8 @@ export default function App() {
             <SwitchControl
               checked={liveListening}
               label="实时监听"
-              disabled={rawLogMode || !remoteLogLocator?.environment || remoteLogLocator.liveTargets.length !== 1}
-              hint={rawLogMode
-                ? '原始日志模式下关闭实时监听'
-                : liveConnectionStatus === 'connecting'
+              disabled={!remoteLogLocator?.environment || remoteLogLocator.liveTargets.length !== 1}
+              hint={liveConnectionStatus === 'connecting'
                   ? '正在建立后端实时推送通道'
                   : liveListening
                     ? `${liveMessage || 'SSH tail -F 长连接持续推送新增日志'}${liveAddedCount > 0 ? ` · 累计 ${liveAddedCount}` : ''}`
@@ -8028,6 +8120,12 @@ export default function App() {
                 setLiveMessage('');
                 setLiveListening(false);
               }}
+            />
+            <SwitchControl
+              checked={foldingEnabled}
+              label="折叠"
+              hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
+              onChange={(checked) => setFoldingEnabled(checked)}
             />
             <SwitchControl
               checked={rawLogMode}
@@ -8099,17 +8197,29 @@ export default function App() {
             </button>
             {activeTask && activeTask.status === 'ready' && (
               <div className="log-search-action-tools" aria-label="日志操作">
-                <button type="button" className="button ghost compact-button toolbar-icon-button" onClick={() => setFoldingEnabled((current) => !current)} title="函数折叠">
-                  <Layers size={14} /> 折叠
+                {/* 采集面板是「实时采集」的操作台：可以先在这里勾选数据项再开始，
+                    也可以中途打开看每个采集项采到多少。 */}
+                <button
+                  type="button"
+                  className={`button ghost compact-button toolbar-icon-button ${liveListening ? 'active' : ''}`}
+                  onClick={() => requestCapturePanel(!liveListening)}
+                  title={liveListening ? '打开数据采集面板（查看/停止实时采集）' : '打开数据采集面板，勾选要实时采集的数据项'}
+                >
+                  <Radio size={14} /> 采集
                 </button>
                 <button type="button" className="button ghost compact-button toolbar-icon-button" onClick={() => void beginDataExtraction()} title="提取数据">
                   <Database size={14} /> 提取
                 </button>
-                <button type="button" className="button ghost compact-button toolbar-icon-button" disabled={navigableErrorEntries.length === 0} onClick={() => setAbnormalCaseEditorOpen(true)} title="录入案例">
-                  <BookOpen size={14} /> 案例
-                </button>
-                <button type="button" className="button ghost compact-button toolbar-icon-button" disabled={navigableErrorEntries.length === 0} onClick={() => setAbnormalCaseAnalysisOpen(true)} title="智能分析">
-                  <Wand2 size={14} /> 分析
+                {/* 案例录入与相似案例匹配合成一个窗口的两个标签页：同一条工作流的进出两端，
+                    分成两个按钮只会让用户先猜哪个是自己要的。 */}
+                <button
+                  type="button"
+                  className={`button ghost compact-button toolbar-icon-button ${smartAnalysisTab ? 'active' : ''}`}
+                  disabled={navigableErrorEntries.length === 0}
+                  onClick={() => setSmartAnalysisTab(smartAnalysisTab ? undefined : 'analysis')}
+                  title={navigableErrorEntries.length === 0 ? '先查询日志，智能分析会用当前异常日志匹配历史案例' : '智能分析：相似案例匹配 / 案例录入'}
+                >
+                  <Wand2 size={14} /> 智能分析
                 </button>
                 <button type="button" className="button ghost compact-button toolbar-icon-button" disabled={!activeTask.entries.length} onClick={downloadVisibleLogs} title="下载日志">
                   <Download size={14} /> 下载
@@ -8220,7 +8330,7 @@ export default function App() {
                 <p className="empty-log-entry-hint">可以从环境资源进入远程日志定位，也可以导入本地日志文件或粘贴日志文本创建独立分析任务。</p>
               </div>
             ) : rawLogMode ? (
-              <RawLogView task={activeTask} />
+              <RawLogView task={activeTask} live={liveListening} />
             ) : foldingEnabled ? (
               paginatedVisibleTraces.length > 0 ? (
                 timelineGroupingMode === 'merged' && !selectedProcess && !selectedThread && !selectedTrace && !selectedCrossTrace ? (
@@ -8643,14 +8753,6 @@ export default function App() {
           </div>,
           document.body,
         )}
-        {abnormalCaseAnalysisOpen && activeTask && <AbnormalCaseAnalysisDialog
-          entries={metricEntries}
-          selectedModules={activeTask.remoteRequest?.fm_targets?.map((item) => item.fm) || activeTask.remoteRequest?.fms}
-          environmentId={activeTask.remoteEnvironmentId}
-          errorRules={errorRules}
-          onClose={() => setAbnormalCaseAnalysisOpen(false)}
-          onLocateEntry={jumpToLogEntry}
-        />}
         {selectedEntry && createPortal(<EntryInspector entry={selectedEntry} onClose={() => setSelectedEntry(undefined)} />, document.body)}
         {showIssues && createPortal(<IssuePanel issues={parsed.issues} onClose={() => setShowIssues(false)} />, document.body)}
       </div>

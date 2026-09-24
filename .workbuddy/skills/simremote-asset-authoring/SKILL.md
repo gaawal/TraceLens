@@ -224,50 +224,106 @@ agent_created: true
 - selftest 的 `_validate_stage_frames()` 校验阶段框成对 + **同一条流上序号递增**
   （回退说明剧本把阶段写反了）。
 
-### 11. 机器地址必须是**真实可通信的网络 IP**
+### 11. 机器地址必须是**真实可通信的网络 IP**（且上下位机各一个）
 
 模拟环境的机器地址不能是 `sim-upper.localhost` 这类字符串主机名 —— 它是**资源标识**，
 后端会拿去建 SSH/SFTP 连接、拼 ATLog URL、做内网校验。
 
-- 探测在 `fleet.detect_machine_host()`：枚举 `ifconfig` 地址并按 `_address_rank()`
-  **内网段优先**（`192.168.` → `10.` → 其它内网 → 回环 → 非内网）。
-  ⚠️ 别用"UDP 连 8.8.8.8 取本机地址"这种单点探测 —— 挂 VPN 时会拿到 `utun` 的
+- 分配在 `fleet.resolve_machine_hosts()`，优先级就是 `_host_pool()` 的先后顺序：
+  **lo0 别名（`127.0.0.2` / `127.0.0.3`）→ 网卡地址**。`_host_pool()` **刻意不含裸
+  `127.0.0.1`** —— 它作为"宣告地址"写进数据库后跟网卡地址不是一个值，排查链路时会把
+  "服务没起来"和"地址选错"混在一起；只有候选池里真的没有别的地址时才退回它。
+- 于是：**加过别名 → 两台各拿一个独立 IP**；**没加别名 → 两台共用网卡地址、靠端口
+  2222/2223 区分**（默认情形，不是故障）。
+  ⚠️ 别把候选写成"过滤掉所有 `127.*`"—— 那样用户加了别名也用不上，直接违背"支持两个 IP"。
+- ⚠️ macOS 回环网段默认只有 `127.0.0.1`，直接绑 `127.0.0.2` 会 `Errno 49`
+  （`Can't assign requested address`）；加别名要 `sudo ifconfig lo0 alias 127.0.0.2 up`。
+  受控环境里 `sudo` 会被拒（`operation not permitted`），所以只能**引导用户手动做一次**
+  （`scripts/sim.sh alias` 打印命令，`scripts/sim.sh hosts` 看当前分配）。
+- ⚠️ 别用"UDP 连 8.8.8.8 取本机地址"这种单点探测 —— 挂 VPN 时会拿到 `utun` 的
   `28.0.0.1`，既不是内网、也连不通，后端 `_is_private_host` 会直接拒。
-- `fleet.MACHINE_HOST` / `UPPER.host` / `LOWER1.host` 都用它；上位机与下位机**同一个 IP，
-  靠端口区分**（2222/2223）。按地址精确定位机器用 `fleet.machine_by_endpoint(host, port)`，
-  别用 `host` 单键查（会同时命中上下位机）。
-- 进程要真的**绑上去**：`sshd.MachineServer(bind_hosts=...)` 每个地址一个 accept 线程；
-  `atlog_site.serve(hosts=...)` 返回 `ReportSiteGroup` 多地址监听集合。
-  默认 `fleet.bind_hosts()` = `(MACHINE_HOST, "127.0.0.1")`。
-- ⚠️ **"端口在监听" ≠ "网络 IP 能连上"**。改造前起的旧进程只绑 `127.0.0.1`，
-  `lsof -iTCP:2222` 照样有输出，`sim.sh status` 如果只打印配置里的地址就会显示一切正常，
-  真正报错要等到后端去连：`Unable to connect to port 2222 on 192.168.1.10`。
-  判据必须是**对具体地址做一次 TCP 连接**（`env.sh` 的 `port_open_on` /
-  `wait_port`），展示用 `listen_addrs`（列出该端口实际绑定的本地地址）。
+  覆盖用 `SIM_UPPER_HOST` / `SIM_LOWER_HOST`（旧 `SIM_MACHINE_HOST` 仍兼容）；
+  `public_host()`（报告站 URL 用）取局域网 IP 优先。
+- 进程要真的**绑上去**：每台机器只绑**自己的地址 + 回环**（`fleet.bind_hosts_for(spec)`，
+  `sshd.FleetServer` 默认这么做）；`atlog_site.serve(hosts=...)` 那种单端口多地址服务
+  才用 `fleet.bind_hosts()`（两台地址 + 回环）。
+- ⚠️ **"端口在监听" ≠ "网络 IP 能连上"**。旧进程只绑 `127.0.0.1` 时 `lsof -iTCP:2222`
+  照样有输出，`sim.sh status` 若只打印配置里的地址就会显示一切正常，真正报错要等后端去连：
+  `Unable to connect to port 2222 on 192.168.1.10`。判据必须是**对具体地址做一次 TCP 连接**
+  （`env.sh` 的 `port_open_on` / `wait_port`），展示用 `listen_addrs`。
   也不要用 `lsof -i@host` 过滤：多个 `-i` 是"或"，实测会把同端口其它地址上的无关进程也列出来。
-- `sim.sh start` 的跳过判据要带上地址：端口开着但网络 IP 连不上 ⇒ 判为陈旧进程，
-  **自动重启**，否则用户每次都要手动 `restart`。
-- 改了 `MACHINE_HOST` 之后要连带处理两处**按主机名命名的目录**：
+- 探测/等待要**按每台机器各自的地址**做（`sim.sh` 的 `machine_endpoints()`）——
+  共用一个 host 判断会误报「下位机未就绪」。`sim.sh start` 的跳过判据也要带上地址：
+  端口开着但地址连不上 ⇒ 判为陈旧进程，**自动重启**。
+- 改了地址之后要连带处理两处**按主机名命名的目录**：
   * executor 树 `<elog root>/<lower.host>/<子系统>/`（`loggen.executor_family`）——
     旧名字的目录不会被新产物覆盖，`prune_tree` 又是 40 个文件/轮的小批量，靠 `init` 重跑要好几轮。
     目录内容完全一样时，**一次 `os.replace(old_dir, new_dir)` 改名**即可，不用批量删。
-  * `seed._drop_stale_sim_machines()` 负责删掉同名但 host 已过期的旧机器记录
+  * `seed._drop_stale_sim_entities()` 负责删掉同名但 host 已过期的旧机器记录
     （`Environment.upper_machine` 是 `OneToOneField`，留着会撞唯一约束）。
 - 改完按顺序收尾：`init`（重写资产）→ `seed`（刷新目录）→ 重启 `stream`/`backend`
   （它们把剧本和目录缓存进了进程），最后 `selftest`。
   只做 `init` 不做 `seed`，症状是自检报「尚未 seed」+「未找到 executor 文件」。
+
+### 12. 加"自动化部署 / 上下位机互信"型能力（`simremote/deploy.py`）
+
+要做的如果是**让两台模拟机之间能免密 SSH**（而不是造日志），照这套走：
+
+- 步骤表 `STEP_DEFS`（每项 `key` / `english` / `title`）；`DeployRunner.step(key)` 是
+  上下文管理器：捕获 `DeployError` 记为失败、打一行 `✓/✗`、把记录收进 `self.steps`，
+  **失败即中断**后续步骤（后面的都依赖前面）。
+- **互信必须"能被验证"**，别只写个"成功"：
+  * 服务端实现 `SimSSHServer.check_auth_publickey`：读该机台 `~/.ssh/authorized_keys`，
+    按**公钥 blob（第 2 列）**比对（`key.get_base64()`）；`get_allowed_auths` 返回
+    `"publickey,password"`；
+  * **每次认证重读文件**，不要缓存 —— 刚铺完公钥就要能立刻登录；
+  * "校验免密"那一步要**真的用私钥连上去并执行一条命令**（带退出码），例如
+    `ls <对端 debug_root>`，顺便证明只读通道可用；
+  * 自检里必须有**反向断言**：临时生成、未进 `authorized_keys` 的私钥**必须被拒**。
+- **每台机器一份独立 host key**（`run/ssh_host_rsa_key_<key>`）：共用一把的话
+  `known_hosts` 里写谁都是同一串，"交换主机指纹"就成了空动作。
+- 指纹 `SHA256:` + `base64(sha256(key.asbytes()))`（与 `ssh-keygen -lf` 一致）；
+  `known_hosts` 行是 `[host]:port <type> <blob>` —— **非标准端口必须带方括号**。
+- 去重按不同字段：`authorized_keys` 按公钥 blob（`field=1`），`known_hosts` 按主机名
+  （`field=0`）—— 换过 host key 时该**覆盖**同一条，而不是叠加。
+- **日志两层、语言分家**：控制台中文（进度 + 明细 + 耗时，给人看），落盘**全英文**
+  （与设备日志的语言约定一致）。
+  * 落盘 `/log/<user>/deploy/deploy_<ts>.log`（**每台机器一份**）。
+    ⚠️ **绝不放 run 目录**：`file_index._run_log_identity` 会把任何"纯时间戳命名的 `.log`"
+    当成 event 归档，放进去会污染运行日志解析。
+  * 想在前端「运行日志」看到，就把每步作为**运行事件**追加进 `event.log`，严格合
+    `RUN_PATTERN` 十三字段：
+    `[ts] [DEPLOY] [40002] [event] [process] [INFO] [900N] [] [] [] [DP900N] [] [deploy] <english> ok (0.123s)`；
+    追加在**文件末尾**，不影响自检对开头 200 行的抽样。
+  * 中文明细（`record.notes`）**不落盘**，只留 `step n/N <english> ok|failed (秒)` ——
+    从结构上杜绝中文进日志，再配一条「部署日志全英文」自检断言兜底。
+- 部署会 `django.setup()`（要写环境资源），后端 LOGGING 会让 paramiko 每步刷几行
+  `Connected (version 2.0...)`；用 `_quiet_third_party_logs()` 把 `paramiko` / `tracelens`
+  压到 WARNING，否则进度输出全被冲散。
 
 ## 验证顺序
 
 ```bash
 cd backend && .venv/bin/python -m simremote.cli init          # 生成（会同时重建报告站夹具）
 .venv/bin/python -m simremote.cli stream --interval 1         # 实时日志源（改动后必须重启）
-.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 97/97）
+.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 109/109）
 # 实时内容相关的断言需要日志源已跑满一整轮（76 行剧本 ≈ 76s @1s/行），刚重启时会报「跳过」
 # 注意 selftest 只覆盖后端直连路径，还要过一遍真实 HTTP：
 curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
   -H 'Content-Type: application/json' -d '{"url":"..."}'
 ```
+
+与之配套的脚本入口（`scripts/sim.sh`）：
+
+```bash
+scripts/sim.sh hosts                    # 两台机器当前分配的地址
+scripts/sim.sh alias                    # 看/引导「两个独立 IP」的 lo0 别名准备
+scripts/sim.sh deploy [--no-seed]       # 跑一遍部署（互信 + 分步日志），--no-seed 不动数据库
+```
+
+改了部署/互信相关代码后，**机群必须重启**（`sim.sh restart fleet`）：公钥认证回调、
+每台机器自己的 host key、绑定地址都是进程启动时确定的。重启后 host key 会换新
+（`run/ssh_host_rsa_key_<key>`），`known_hosts` 由部署流程自己覆盖，不用手工清。
 
 改了日志正文后，**`init` 与日志源都要重启**：`init` 重写批量日志树，日志源则要重新读剧本
 （它在启动时把剧本编译进进程）。只重启一个会看到新旧格式混在同一份文件里。

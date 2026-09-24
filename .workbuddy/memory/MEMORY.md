@@ -17,17 +17,47 @@
   stream-stop|selftest|stop|site-serve|site-url|site-stop}`。
 - 模拟报告站：`cli site-serve` 绑 **网络 IP + 127.0.0.1**（默认 `fleet.bind_hosts()`）的 8901，
   发布 ATLog 用例目录与 CPD 报告/数据表格（见下方「模拟 CPD 资产与报告站虚拟挂载」）。
-- 拓扑：上位机与下位机是**同一个网络 IP、靠端口区分** —— `192.168.1.10:2222`（SIM-SCH-01/SCH）、
-  `192.168.1.10:2223`（SIM-LCH1-01/LCH1）；账号 `tracepilot` / `tracelens`；
-  环境名 `SIM-EUV-01`；版本 `SPM-V2026.09.23`。
-  - 地址由 `fleet.detect_machine_host()` 探测：枚举 `ifconfig` + `_address_rank()` 内网优先。
-    **绝不要用「UDP 连 8.8.8.8」探地址** —— 挂 VPN 会拿到 utun 的 `28.0.0.1`，
-    非内网且会被后端 `_is_private_host` 拒。可用环境变量 `SIM_MACHINE_HOST` 覆盖。
-  - 按地址精确定位机器用 `fleet.machine_by_endpoint(host, port)`（只用 `host` 会同时命中上下位机）。
+- 拓扑：上位机 `SIM-SCH-01`（SCH）与下位机 `SIM-LCH1-01`（LCH1）；账号 `tracepilot` /
+  `tracelens`；环境名 `SIM-EUV-01`；版本 `SPM-V2026.09.23`。
+  - **两个 IP 的地址分配**：`fleet.resolve_machine_hosts()` 按 `_host_pool()` 的顺序取 ——
+    **lo0 别名（`127.0.0.2` / `127.0.0.3`）优先，其次网卡地址**。`_host_pool()` 刻意
+    **不含裸 `127.0.0.1`**（它作为"宣告地址"进库后与网卡地址不是一个值，排查链路时会把
+    "服务没起来"和"地址选错"混在一起）。没有别名时两台**共用网卡地址、靠端口区分**
+    —— 这是默认情形，不是故障。
+  - 别名需 `sudo ifconfig lo0 alias 127.0.0.2 up`：macOS 回环网段默认只有 `127.0.0.1`，
+    **本机直接绑 `127.0.0.2` 会 `Errno 49`**，而受控环境里 `sudo` 会被拒，所以只能
+    **引导用户手动执行一次**。准备提示 `scripts/sim.sh alias`，当前分配 `scripts/sim.sh hosts`。
+  - 覆盖：`SIM_UPPER_HOST` / `SIM_LOWER_HOST`（旧 `SIM_MACHINE_HOST` 仍兼容，只当上位机地址，
+    下位机自动避让）。每台机器只绑**自己的地址 + 127.0.0.1**（`fleet.bind_hosts_for(spec)`）；
+    报告站那种单端口服务才用 `fleet.bind_hosts()`（两台地址 + 回环）。
+  - 地址探测**绝不要用「UDP 连 8.8.8.8」** —— 挂 VPN 会拿到 utun 的 `28.0.0.1`，
+    非内网且会被后端 `_is_private_host` 拒。`public_host()`（报告站 URL 用）取局域网 IP 优先。
+  - 按地址精确定位机器用 `fleet.machine_by_endpoint(host, port)`；`fleet.peer_of(spec)` 取对端。
   - `seed._drop_stale_sim_entities()`：**先删同名环境、再删旧机器**。`Environment.upper_machine`
     是 PROTECT，旧环境不退绑旧机器就永远删不掉 → 前端出现两条同名 SIM-EUV-01、其一恒 error。
   - executor 树目录名跟随 `lower.host`（`elog/<IP>/<子系统>/`）；改地址后内容一样时
     用一次 `os.replace` **改名**旧目录，别指望 `prune_tree`（40 文件/轮）跑完。
+
+## 自动化模拟部署与上下位机互信（2026-09-25 新增）
+- 入口：`scripts/sim.sh deploy [--no-seed]`（= `cd backend && .venv/bin/python -m simremote.cli deploy`）。
+- 7 步：网络连通性 → 生成密钥对 → 交换主机指纹 → 双向分发公钥 → 校验正向免密 →
+  校验反向免密 → 写环境资源。**失败即中断**（后续步骤依赖前一步的结果）。
+- **互信是可验证的，不是脚本自己写"成功"**：`sshd.SimSSHServer.check_auth_publickey`
+  读该机台 `~/.ssh/authorized_keys`，按**公钥 blob（第 2 列）**比对（每次重读、不缓存 ——
+  刚铺完公钥就要能立刻登录）；`get_allowed_auths` 返回 `publickey,password`。
+  每台机器有**独立 host key**（`run/ssh_host_rsa_key_<key>`）：共用一把的话 known_hosts
+  里写谁都是同一串，"交换主机指纹"就成了空动作。
+- 部署产物落在模拟文件系统：`<机>/home/tracepilot/.ssh/{id_rsa,id_rsa.pub,authorized_keys,known_hosts}`。
+- **部署日志分两层**：控制台（中文进度 + 明细 + 耗时）；落盘**全英文**。
+  落盘 = `/log/<user>/deploy/deploy_<ts>.log`（**每台机器一份**）+ 每步作为运行事件
+  追加进 `event.log`（合 RUN_PATTERN 十三字段，前端「运行日志」可见）。
+  ⚠️ **绝不能把部署日志放 run 目录**：`file_index._run_log_identity` 会把任何"纯时间戳命名的
+  `.log`"当成 event 归档（`parse_archive_timestamp` 兜底分支），放进去会污染运行日志解析。
+- 落盘只写 `step n/N <english> ok|failed (秒)`，中文明细（`record.notes`）**不落盘** —— 从结构上
+  杜绝中文进日志；`selftest` 有「部署日志全英文」断言兜底。
+- 部署会 `django.setup()`（第 7 步写库），后端 LOGGING 会把 paramiko 的
+  `Connected (version 2.0...)` 每步刷几行；`deploy._quiet_third_party_logs()` 把
+  `paramiko` / `tracelens` 压到 WARNING。
 - **不含 DHH**（用户明确要求）。
 - 日志根：`/log/{username}/debug`、`/log/{username}/run/`、`/log/{username}/debug/elog`。
 - **实时日志源 `simremote/livesim.py`**：扮演机台上持续 append 的守护进程，让前端「实时监听」

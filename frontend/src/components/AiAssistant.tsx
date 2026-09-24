@@ -168,6 +168,13 @@ interface ComposerReference {
   fullText: string;
 }
 
+/**
+ * UI actions that open a full dialog. The assistant panel deliberately floats above the modal
+ * layer so it is reachable from every page (环境部署 included), which means it has to stand
+ * down for these — otherwise it would sit on top of the window it just opened.
+ */
+const TAKES_OVER_SCREEN_ACTIONS = new Set(['open_case_editor']);
+
 const CONVERSATIONS_KEY = 'tracelens-ai-cockpit-conversations-v1';
 const ACTIVE_CONVERSATION_KEY = 'tracelens-ai-cockpit-active-v1';
 const LAYOUT_KEY = 'tracelens-ai-cockpit-layout-v2';
@@ -1814,7 +1821,11 @@ export function AiAssistant() {
             : type === 'open_log_rule_settings' ? '正在打开日志规则配置'
               : type === 'open_workspace_page' ? '正在切换到目标功能页'
                 : '正在调控当前页面';
-    const restoreOpen = open;
+    // Actions that put a full dialog on screen take the user's attention with them. The panel
+    // now floats above the modal layer (so it is reachable on every page), so leaving it open
+    // would cover the very window it just opened.
+    const takesOverScreen = actions.some((action) => TAKES_OVER_SCREEN_ACTIONS.has(String(action.type || '')));
+    const restoreOpen = open && !takesOverScreen;
     setOpen(false);
     setFocusTarget(focus);
     setTakeover(label);

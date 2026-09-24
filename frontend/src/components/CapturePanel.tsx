@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronUp, Database, Download, Pause, Play, SlidersHorizontal, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Database, Download, LoaderCircle, Pause, Play, SlidersHorizontal, Square, X } from 'lucide-react';
 import { API_BASE, buildApiHeaders } from '../api/resourceApi';
 import { loadDataExtractionRules, extractDataValues, type DataExtractionRule } from '../rendering/dataExtractionRules';
+import { executeUiAction } from '../assistant/workstation';
 import { subscribeLiveMonitoring } from '../services/liveMonitoring';
 import { primeSeq, subscribeWatchHits, subscribeWatchStatus, type WatchHitEvent } from '../services/watchRealtime';
 
@@ -59,12 +60,31 @@ export function CapturePanel() {
   /** Per-extractor capture target, from the watch's capture_config (0 = continuous). */
   const [targets, setTargets] = useState<Record<string, number>>({});
   const [detailOpen, setDetailOpen] = useState(true);
-  const [liveExtractEnabled, setLiveExtractEnabled] = useState(false);
+  /**
+   * 采集分两个阶段，取代过去「打开实时监听就顺带出面板」的隐式行为：
+   * - prep  ：先勾选这次要采集哪些提取器（以及目标条数），再按「开始采集」；
+   * - running：展示每个采集项已采集多少、进度条，随时可停止。
+   */
+  const [phase, setPhase] = useState<'prep' | 'running'>('prep');
+  /** 全部启用的提取器（prep 阶段要能勾选还没勾上的），不止已勾选的。 */
+  const [allRules, setAllRules] = useState<DataExtractionRule[]>([]);
+  const [busy, setBusy] = useState('');
+  const [actionError, setActionError] = useState('');
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const lastCaptureTokenRef = useRef(0);
 
   useEffect(() => subscribeLiveMonitoring((next) => {
-    setOpen(next.on);
     setEnvironmentId(typeof next.environmentId === 'number' ? next.environmentId : undefined);
+    // 停止监听后面板仍可保留（用来回看刚采到的数据），只把阶段切回准备态。
+    setPhase(next.on ? 'running' : 'prep');
+    if (next.on) setOpen(true);
+    const request = next.captureRequest;
+    if (request && request.token !== lastCaptureTokenRef.current) {
+      lastCaptureTokenRef.current = request.token;
+      setOpen(true);
+      setCollapsed(false);
+      if (request.prep) setPhase('prep');
+    }
   }), []);
 
   useEffect(() => {
@@ -73,10 +93,12 @@ export function CapturePanel() {
       setHits([]);
       return;
     }
+    const enabled = loadDataExtractionRules().filter((rule) => rule.enabled);
+    setAllRules(enabled);
     // Collect exactly what the user opted into on the extraction rule. Auto-selecting the
     // first N enabled rules made 实时监听 silently capture everything.
-    setRules(loadDataExtractionRules().filter((rule) => rule.enabled && rule.liveCapture === true));
-  }, [open]);
+    setRules(enabled.filter((rule) => rule.liveCapture === true));
+  }, [open, phase]);
 
   useEffect(() => {
     if (!open) return;
@@ -193,10 +215,60 @@ export function CapturePanel() {
 
   if (!open) return null;
 
-  const visibleCaptures = liveExtractEnabled ? captures : [];
-  const activeCapture = visibleCaptures.find((item) => item.rule.id === activeRuleId) || visibleCaptures[0];
-  const totalRows = visibleCaptures.reduce((total, item) => total + item.rows.length, 0);
+  const activeCapture = captures.find((item) => item.rule.id === activeRuleId) || captures[0];
+  const totalRows = captures.reduce((total, item) => total + item.rows.length, 0);
   const errors = watches.filter((watch) => watch.last_error);
+  const targetTotal = rules.reduce((total, rule) => total + captureTarget(rule.id), 0);
+  const tooMany = rules.length > MAX_ACTIVE_COLLECTORS ? `（超过建议的 ${MAX_ACTIVE_COLLECTORS} 项，面板会较慢）` : '';
+  const limitNote = phase === 'prep'
+    ? (rules.length === 0
+      ? '勾选这次要采集的数据项，再按「开始采集」。'
+      : `已勾选 ${rules.length} 项${tooMany}，可以开始采集`)
+    : `采集中 · 共 ${totalRows} 条${targetTotal ? ` / 目标 ${targetTotal}` : ''}`;
+
+  /** 勾选写回提取器上的 liveCapture —— 面板是同一个开关的编辑器，不是第二套选择。 */
+  async function toggleRule(rule: DataExtractionRule, next: boolean) {
+    setActionError('');
+    setBusy(rule.id);
+    try {
+      const receipt = await executeUiAction({ type: 'set_live_capture_items', items: [{ id: rule.id, liveCapture: next }] });
+      if (receipt.status !== 'success') throw new Error(receipt.detail);
+      const enabled = loadDataExtractionRules().filter((item) => item.enabled);
+      setAllRules(enabled);
+      setRules(enabled.filter((item) => item.liveCapture === true));
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '更新采集项失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function startCapture() {
+    setActionError('');
+    setBusy('start');
+    try {
+      const receipt = await executeUiAction({ type: 'start_live_capture' });
+      if (receipt.status !== 'success') throw new Error(receipt.detail);
+      setPhase('running');
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '开始采集失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function stopCapture() {
+    setActionError('');
+    setBusy('stop');
+    try {
+      const receipt = await executeUiAction({ type: 'stop_live_capture' });
+      if (receipt.status !== 'success') throw new Error(receipt.detail);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '停止采集失败');
+    } finally {
+      setBusy('');
+    }
+  }
 
   return (
     <aside className={`capture-panel ${collapsed ? 'collapsed' : ''}`} aria-label="数据采集器">
@@ -206,8 +278,8 @@ export function CapturePanel() {
           数据采集
         </span>
         <span className="capture-panel-counts">
-          {visibleCaptures.length} 个采集器 · {totalRows} 条数据
-          {hits.length > 0 && <em> · {hits.length} 次命中</em>}
+          {phase === 'prep' ? `${rules.length} 项已勾选` : `${captures.length} 个采集器 · ${totalRows} 条数据`}
+          {phase === 'running' && hits.length > 0 && <em> · {hits.length} 次命中</em>}
         </span>
         <button type="button" onClick={() => setCollapsed((value) => !value)} title={collapsed ? '展开' : '收起'}>
           {collapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
@@ -229,21 +301,75 @@ export function CapturePanel() {
           )}
 
           <div className="capture-limit-note">
-            <span>
-              {rules.length === 0
-                ? '没有勾选实时采集的提取器。勾选后，实时监听才会采集。'
-                : `已勾选 ${rules.length} 个实时采集提取器${rules.length > MAX_ACTIVE_COLLECTORS ? `（超过建议的 ${MAX_ACTIVE_COLLECTORS} 个，面板会较慢）` : ''}`}
-            </span>
-            <button type="button" className="capture-panel-pick" onClick={openExtractorPicker} title="去「日志规则 → 数据提取」勾选要实时采集的提取器">
-              <SlidersHorizontal size={11} /> 改选提取器
+            <span>{limitNote}</span>
+            <button type="button" className="capture-panel-pick" onClick={openExtractorPicker} title="去「日志规则 → 数据提取」管理提取器本身（字段、Match 等）">
+              <SlidersHorizontal size={11} /> 管理提取器
             </button>
-            <button type="button" className="capture-panel-pick primary" disabled={rules.length === 0} onClick={() => setLiveExtractEnabled(true)} title="勾选提取器后开始展示实时数据">实时提取</button>
+            {phase === 'prep' ? (
+              <button
+                type="button"
+                className="capture-panel-pick primary"
+                disabled={rules.length === 0 || busy !== ''}
+                onClick={() => void startCapture()}
+                title={rules.length === 0 ? '先勾选至少一个数据项' : '按勾选的数据项开始实时采集'}
+              >
+                {busy === 'start' ? <LoaderCircle className="spin" size={11} /> : <Play size={11} />} 开始采集
+              </button>
+            ) : (
+              <button type="button" className="capture-panel-pick danger" disabled={busy !== ''} onClick={() => void stopCapture()} title="停止采集（服务端会一并停掉这些监视器）">
+                {busy === 'stop' ? <LoaderCircle className="spin" size={11} /> : <Square size={11} />} 停止采集
+              </button>
+            )}
           </div>
+          {actionError && <div className="capture-panel-warn">{actionError}</div>}
+
+          {phase === 'running' && rules.length > 0 && (
+            <div className="capture-progress" aria-label="采集进度">
+              {rules.map((rule) => {
+                const rowCount = captures.find((item) => item.rule.id === rule.id)?.rows.length || 0;
+                const target = captureTarget(rule.id);
+                const percent = target ? Math.min(100, Math.round((rowCount / target) * 100)) : 0;
+                return (
+                  <div className="capture-progress-row" key={`progress-${rule.id}`}>
+                    <span className="capture-progress-name" title={rule.name}>{rule.name || rule.matchKeyword || rule.id}</span>
+                    <span className="capture-progress-bar" aria-hidden="true">
+                      <i className={target ? '' : 'is-live'} style={target ? { width: `${percent}%` } : undefined} />
+                    </span>
+                    <span className="capture-progress-count">{rowCount}{target ? ` / ${target}` : ' 条'}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {phase === 'prep' && (
+            <div className="capture-pick-list" aria-label="选择要采集的数据项">
+              {allRules.length === 0 && (
+                <div className="capture-empty">还没有启用的数据提取器。先去「日志规则 → 数据提取」建一个，再回来勾选。</div>
+              )}
+              {allRules.map((rule) => (
+                <label className={`capture-pick-item ${rule.liveCapture ? 'on' : ''}`} key={`pick-${rule.id}`}>
+                  <input
+                    type="checkbox"
+                    checked={rule.liveCapture === true}
+                    disabled={busy !== ''}
+                    onChange={(event) => void toggleRule(rule, event.target.checked)}
+                  />
+                  <span className="capture-pick-body">
+                    <strong>{rule.name || rule.matchKeyword || rule.id}</strong>
+                    <small>{(rule.fields || []).length} 个字段 · {rule.matchKeyword || '未设 Match'}{rule.sourceCategories.length ? ` · ${rule.sourceCategories.join('/')}` : ''}</small>
+                  </span>
+                  {!rule.matchKeyword && <span className="capture-pick-warn" title="没有 Match 关键字，实时采集无法在日志里定位它">缺 Match</span>}
+                </label>
+              ))}
+            </div>
+          )}
+
           <div className="capture-list" ref={scrollerRef}>
-            {visibleCaptures.length === 0 && (
+            {phase === 'running' && captures.length === 0 && (
               <div className="capture-empty">
                 {rules.length === 0
-                  ? '还没有勾选实时采集的提取器。去「日志规则 → 数据提取」勾选后，实时监听才会采集它。'
+                  ? '这次没有勾选任何数据项。停止采集后可以重新勾选。'
                   : hits.length > 0
                     // Hits arriving but nothing extractable is a *different* problem from
                     // "nothing matched", and saying so is the difference between a user
@@ -254,7 +380,7 @@ export function CapturePanel() {
                       : '等待监控通道连接…'}
               </div>
             )}
-            {visibleCaptures.length > 0 && rules.map((rule) => {
+            {phase === 'running' && captures.length > 0 && rules.map((rule) => {
               const rows = captures.find((item) => item.rule.id === rule.id)?.rows || [];
               const isActive = activeCapture?.rule.id === rule.id;
               // A progress bar only means something against a target. Inventing one that

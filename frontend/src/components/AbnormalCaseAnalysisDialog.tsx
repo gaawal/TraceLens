@@ -15,6 +15,8 @@ interface Props {
   onLocateEntry: (entry: LogEntry) => void;
   aiPanel?: ReactNode;
   refreshToken?: string | number;
+  /** 由外层窗口（智能分析）承载标题栏与标签页时，这里只渲染内容本体。 */
+  embedded?: boolean;
 }
 
 function confidenceLabel(result: AbnormalCaseMatchResult): { text: string; cls: string } {
@@ -99,7 +101,7 @@ function KnowledgeMatchCard({
   </article>;
 }
 
-export function AbnormalCaseAnalysisDialog({ entries, selectedModules, environmentId, errorRules, onClose, onLocateEntry, aiPanel, refreshToken }: Props) {
+export function AbnormalCaseAnalysisDialog({ entries, selectedModules, environmentId, errorRules, onClose, onLocateEntry, aiPanel, refreshToken, embedded }: Props) {
   const [cases, setCases] = useState<AbnormalCase[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -132,12 +134,7 @@ export function AbnormalCaseAnalysisDialog({ entries, selectedModules, environme
     });
   }
 
-  return <div className="knowledge-dialog-backdrop" onMouseDown={onClose}>
-    <section className="knowledge-analysis-dialog" onMouseDown={(event) => event.stopPropagation()}>
-      <header className="knowledge-dialog-header">
-        <div><h2>智能分析</h2></div>
-        <button type="button" className="icon-button" onClick={onClose}><X size={18}/></button>
-      </header>
+  const body = <>
       <div className="knowledge-analysis-scroll">
         <div className="knowledge-analysis-summary">
           <div><AlertTriangle size={17}/><strong>{abnormalEntries.length}</strong><span>条当前异常日志</span></div>
@@ -183,6 +180,18 @@ export function AbnormalCaseAnalysisDialog({ entries, selectedModules, environme
       </div>
       </div>
       <footer className="knowledge-dialog-footer"><span>相似度仅用于辅助判断，请结合实际日志确认。</span><button className="button secondary" onClick={onClose}>关闭</button></footer>
+    </>;
+
+  if (embedded) {
+    return <div className="knowledge-embedded-pane" onMouseDown={(event) => event.stopPropagation()}>{body}</div>;
+  }
+  return <div className="knowledge-dialog-backdrop" onMouseDown={onClose}>
+    <section className="knowledge-analysis-dialog" onMouseDown={(event) => event.stopPropagation()}>
+      <header className="knowledge-dialog-header">
+        <div><h2>智能分析</h2></div>
+        <button type="button" className="icon-button" onClick={onClose}><X size={18}/></button>
+      </header>
+      {body}
     </section>
   </div>;
 }

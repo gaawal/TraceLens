@@ -324,6 +324,24 @@ def check_line_formats() -> None:
                 matched += 1
     _record("executor 日志行匹配内置正则", total > 0 and matched == total, f"{matched}/{total}")
 
+    # 部署事件是**追加在 event.log 末尾**的，上面那条只抽样前 200 行覆盖不到 —— 单独全查一遍。
+    # 不合格式的杂行会让后端的运行日志查询整体解析出错，所以这条必须严格。
+    run_log = fleet.remote_to_local(fleet.UPPER, f"{fleet.UPPER.run_root}/event.log")
+    if not run_log.exists():
+        _record("部署事件合运行日志格式", False, "event.log 不存在")
+        return
+    run_pattern = _compile(BUILTIN_RULE_DEFAULTS[("run", "运行事件日志")]["pattern"])
+    with run_log.open(encoding="utf-8") as handle:
+        deploy_lines = [line.rstrip("\n") for line in handle if "[DEPLOY]" in line]
+    malformed = [line for line in deploy_lines if not run_pattern.match(line)]
+    _record(
+        "部署事件合运行日志格式",
+        bool(deploy_lines) and not malformed,
+        f"{len(deploy_lines)} 条部署事件，不合格式 {len(malformed)} 条"
+        if deploy_lines
+        else "没有部署事件（先跑 scripts/sim.sh deploy）",
+    )
+
 
 def _stream_pid() -> int | None:
     pid_file = Path(__file__).resolve().parent / "run" / "stream.pid"
@@ -1209,6 +1227,142 @@ def check_backend_catalog() -> None:
 # --------------------------------------------------------------------------- 入口
 
 
+def _passwordless_probe(spec, key, *, expect_reject: bool = False) -> tuple[bool, str]:
+    """用某把私钥连某台机器，返回 ``(是否符合预期, 说明)``。
+
+    ``expect_reject=True`` 时"被拒绝"才算通过 —— 用来证明公钥认证真的在校验，
+    而不是"谁来都放行"。
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            spec.host,
+            port=spec.ssh_port,
+            username=fleet.SIM_USERNAME,
+            pkey=key,
+            timeout=6,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+    except paramiko.AuthenticationException:
+        return (expect_reject, "被拒绝" if expect_reject else "被拒绝（authorized_keys 里没有这把公钥）")
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"{type(exc).__name__}: {exc}")
+    else:
+        return (not expect_reject, "登录成功" if not expect_reject else "竟然登录成功了")
+    finally:
+        client.close()
+
+
+def check_machine_addresses() -> None:
+    """上下位机的地址解析（两个独立 IP 是理想情况，共用地址也可用）。"""
+    detail = (
+        f"{fleet.UPPER.name}={fleet.UPPER.host}:{fleet.UPPER.ssh_port} / "
+        f"{fleet.LOWER1.name}={fleet.LOWER1.host}:{fleet.LOWER1.ssh_port}"
+    )
+    if fleet.hosts_are_distinct():
+        detail += "（两个独立 IP）"
+    else:
+        aliases = fleet.loopback_aliases()
+        detail += (
+            f"（共用地址，靠端口区分；lo0 别名 {aliases or '无'}，"
+            f"加别名可拿到两个独立 IP）"
+        )
+    _record(
+        "上下位机地址已解析",
+        all(bool(spec.host) for spec in fleet.FLEET),
+        detail,
+    )
+
+
+def check_publickey_auth() -> None:
+    """互信是可验证的：授权私钥放行，未授权私钥必须被拒。"""
+    private = fleet.remote_to_local(fleet.UPPER, f"{fleet.UPPER.ssh_dir}/id_rsa")
+    if not private.exists():
+        _record("公钥免密登录可用", False, "上位机私钥不存在（先跑 scripts/sim.sh deploy）")
+        return
+    try:
+        authorized = paramiko.RSAKey(filename=str(private))
+    except paramiko.SSHException as exc:
+        _record("公钥免密登录可用", False, f"私钥不可用：{exc}")
+        return
+    ok, detail = _passwordless_probe(fleet.LOWER1, authorized)
+    _record("已授权私钥可免密登录", ok, detail)
+    ok, detail = _passwordless_probe(fleet.LOWER1, paramiko.RSAKey.generate(2048), expect_reject=True)
+    _record("未授权私钥被拒绝", ok, detail)
+
+
+def check_auto_deploy() -> None:
+    """自动化部署：整链可跑通、每步都留日志、日志全英文、可重复执行。"""
+    from . import deploy as deploy_module
+
+    first = deploy_module.deploy(seed_after=False, quiet=True, write_logs=True)
+    failed = [step.title for step in first.steps if not step.ok]
+    _record(
+        "自动化部署全部步骤通过",
+        first.ok,
+        f"{len(first.steps)} 步" + (f"，失败：{'、'.join(failed)}" if failed else ""),
+    )
+    _record(
+        "部署步数与声明一致",
+        len(first.steps) == deploy_module.TOTAL_STEPS,
+        f"{len(first.steps)}/{deploy_module.TOTAL_STEPS}",
+    )
+    _record(
+        "部署覆盖互信的两个方向",
+        any(step.key == "verify-forward" for step in first.steps)
+        and any(step.key == "verify-reverse" for step in first.steps),
+        "上位机→下位机 / 下位机→上位机 都校验了",
+    )
+
+    # 幂等：再跑一遍仍成功（密钥复用而不是重新生成）
+    second = deploy_module.deploy(seed_after=False, quiet=True, write_logs=True)
+    _record("部署可重复执行（幂等）", second.ok, "第二次执行仍全部通过" if second.ok else "第二次失败")
+
+    # 每台机器都有一份部署日志，且记录了每一个步骤
+    cjk = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+    per_machine: list[tuple[str, int]] = []
+    missing: list[str] = []
+    chinese: list[str] = []
+    for spec, path in zip(fleet.FLEET, first.log_files):
+        if not path.exists():
+            missing.append(spec.name)
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        per_machine.append((spec.name, len([line for line in lines if " step " in line])))
+        chinese += [line for line in lines if cjk.search(line)]
+
+    summary = "、".join(f"{name}: {count} 步" for name, count in per_machine)
+    _record(
+        "每台机器都有部署日志",
+        not missing and len(per_machine) == len(fleet.FLEET),
+        summary or f"缺失 {missing}",
+    )
+    _record(
+        "部署日志记录每个步骤",
+        bool(per_machine) and all(count >= deploy_module.TOTAL_STEPS for _n, count in per_machine),
+        summary or "没有部署日志可查",
+    )
+    _record("部署日志全英文", not chinese, f"含中日韩字符 {len(chinese)} 行")
+
+    # 部署事件按运行事件格式追加进了 event.log（前端「运行日志」能看到）
+    run_log = fleet.remote_to_local(fleet.UPPER, f"{fleet.UPPER.run_root}/event.log")
+    if run_log.exists():
+        events = [
+            line
+            for line in run_log.read_text(encoding="utf-8").splitlines()
+            if "[DEPLOY]" in line and "[deploy]" in line
+        ]
+        _record(
+            "部署事件写入运行日志",
+            len(events) >= deploy_module.TOTAL_STEPS,
+            f"{len(events)} 条 [DEPLOY] 事件",
+        )
+    else:
+        _record("部署事件写入运行日志", False, "event.log 不存在（先跑 init）")
+
+
 def _bootstrap_django() -> bool:
     """配置 Django。
 
@@ -1255,6 +1409,14 @@ def run_all() -> int:
         check_live_tail()
     finally:
         client.close()
+
+    # 部署与互信（不依赖 Django：只动模拟文件系统与 SSH 通道）
+    try:
+        check_machine_addresses()
+        check_publickey_auth()
+        check_auto_deploy()
+    except Exception as exc:  # noqa: BLE001
+        _record("自动化部署检查", False, f"{type(exc).__name__}: {exc}")
 
     if _bootstrap_django():
         check_line_formats()

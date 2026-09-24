@@ -35,6 +35,10 @@ interface Props {
   errorRules?: readonly ErrorMatchRule[];
   onClose: () => void;
   onSaved: (item: AbnormalCase) => void;
+  /** 由外层窗口（智能分析）承载标题栏与标签页时，这里只渲染表单本体。 */
+  embedded?: boolean;
+  /** 嵌入时把标题改成标签页语义，避免出现第二层「录入异常案例」。 */
+  embeddedTitle?: string;
 }
 
 function featureGroupId(): string {
@@ -188,13 +192,10 @@ export function AbnormalCaseEditorDialog(props: Props) {
     } finally { setSaving(false); }
   }
 
-  return <div className="knowledge-dialog-backdrop" onMouseDown={() => { if (!saving) props.onClose(); }}>
-    <section className="knowledge-editor-dialog" onMouseDown={(event) => event.stopPropagation()}>
-      <header className="knowledge-dialog-header">
-        <div><h2>{props.caseItem ? '编辑异常案例' : '录入异常案例'}</h2></div>
-        <button type="button" className="icon-button" disabled={saving} onClick={props.onClose}><X size={18}/></button>
-      </header>
-
+  const body = <>
+      {props.embedded && props.embeddedTitle && (
+        <div className="knowledge-embedded-title"><strong>{props.embeddedTitle}</strong></div>
+      )}
       <div className="knowledge-editor-body">
         <section className="knowledge-form-grid">
           <label className="span-2"><span>案例名称 *</span><input value={name} onChange={(event) => { setName(event.target.value); setDuplicateCandidates(undefined); }} placeholder="请输入便于识别的异常案例名称"/></label>
@@ -269,6 +270,18 @@ export function AbnormalCaseEditorDialog(props: Props) {
       </div>
 
       <footer className="knowledge-dialog-footer"><button className="button secondary" disabled={saving} onClick={props.onClose}>取消</button><button className="button primary" disabled={saving || (!props.caseItem && !newEvidences.length)} onClick={() => void save()}><Save size={14}/>{saving ? (duplicateCandidates ? '处理中…' : '检查中…') : props.caseItem ? '保存案例' : duplicateCandidates ? '重新检查' : '保存并检查重复'}</button></footer>
+    </>;
+
+  if (props.embedded) {
+    return <div className="knowledge-embedded-pane" onMouseDown={(event) => event.stopPropagation()}>{body}</div>;
+  }
+  return <div className="knowledge-dialog-backdrop" onMouseDown={() => { if (!saving) props.onClose(); }}>
+    <section className="knowledge-editor-dialog" onMouseDown={(event) => event.stopPropagation()}>
+      <header className="knowledge-dialog-header">
+        <div><h2>{props.caseItem ? '编辑异常案例' : '录入异常案例'}</h2></div>
+        <button type="button" className="icon-button" disabled={saving} onClick={props.onClose}><X size={18}/></button>
+      </header>
+      {body}
     </section>
   </div>;
 }

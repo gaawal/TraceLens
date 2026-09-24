@@ -3,6 +3,8 @@
     python -m simremote.cli init [--no-prune] [--fresh]   生成/对齐模拟资产
                                                           （日志 + CPD 测校报告/数据表格 + ATLog 用例报告站）
     python -m simremote.cli serve                          启动假 SSH/SFTP 机群（前台）
+    python -m simremote.cli deploy [--no-seed]             自动化模拟部署：上下位机互信 + 分步日志
+    python -m simremote.cli hosts [--json]                 打印两台机器当前分配的地址
     python -m simremote.cli seed                           写入环境资源并刷新日志索引
     python -m simremote.cli status                         查看机群、报告站与日志时间线状态
     python -m simremote.cli site-serve [--port 8901]       启动模拟 ATLog 用例报告站（前台）
@@ -99,8 +101,13 @@ def cmd_serve(_args: argparse.Namespace) -> int:
         PID_FILE.unlink(missing_ok=True)
         return 1
     print(f"  监听地址：{', '.join(server.bind_hosts)}")
-    for spec in fleet.FLEET:
-        print(f"  {spec.role:5s} {spec.name:12s} ssh {fleet.SIM_USERNAME}@{spec.host}:{spec.ssh_port}")
+    for machine in server.machines:
+        spec = machine.spec
+        print(
+            f"  {spec.role:5s} {spec.name:12s} "
+            f"ssh {fleet.SIM_USERNAME}@{spec.host}:{spec.ssh_port}"
+            f"   绑定 {', '.join(machine.bind_hosts)}"
+        )
     print(f"机群已就绪（pid {os.getpid()}），Ctrl-C 退出")
     sys.stdout.flush()
     try:
@@ -145,8 +152,11 @@ def cmd_stop(_args: argparse.Namespace) -> int:
 def cmd_status(_args: argparse.Namespace) -> int:
     print("模拟机群状态")
     for spec in fleet.FLEET:
-        state = "运行中" if _port_open("127.0.0.1", spec.ssh_port) else "未运行"
-        print(f"  {spec.host}:{spec.ssh_port}  {state}")
+        # 两台机器地址不同，先按它自己的地址探，再退回回环（绑定里本来就含回环）
+        reachable = _port_open(spec.host, spec.ssh_port) or _port_open("127.0.0.1", spec.ssh_port)
+        state = "运行中" if reachable else "未运行"
+        label = "上位机" if spec.role == "upper" else "下位机"
+        print(f"  {label} {spec.host}:{spec.ssh_port}  {state}")
 
     pid = _read_pid()
     print(f"  pidfile：{pid if pid else '（无）'}")
@@ -213,6 +223,58 @@ def cmd_seed(_args: argparse.Namespace) -> int:
         return 1
     print(f"  子系统    : {', '.join(payload['subsystems']) or '（无）'}")
     print(f"  全局目录  : {len(payload['catalog_global'])} 个子系统 / {payload.get('catalog_fm_count', 0)} 个模块")
+    return 0
+
+
+def cmd_deploy(args: argparse.Namespace) -> int:
+    from . import deploy as deploy_module
+
+    seed_after = not args.no_seed
+    if seed_after:
+        _django_setup()
+
+    report = deploy_module.deploy(seed_after=seed_after)
+    done = sum(1 for step in report.steps if step.ok)
+    print()
+    print("=" * 64)
+    verdict = "部署完成" if report.ok else "部署失败"
+    print(f"  {verdict}：{done}/{len(report.steps)} 步通过，耗时 {report.seconds:.2f}s")
+    print(f"  上位机 {report.upper_host}  ⇄  下位机 {report.lower_host}")
+    for step in report.steps:
+        mark = "✓" if step.ok else "✗"
+        print(f"    {mark} [{step.index}/{step.total}] {step.title}  {step.seconds:.3f}s")
+    print("  部署日志：")
+    for path in report.log_files:
+        print(f"    {path}")
+    print("=" * 64)
+    return 0 if report.ok else 1
+
+
+def cmd_hosts(args: argparse.Namespace) -> int:
+    """打印两台机器当前分配到的主机地址（脚本里好取）。"""
+    if args.json:
+        import json
+
+        print(
+            json.dumps(
+                {
+                    spec.key: {
+                        "name": spec.name,
+                        "role": spec.role,
+                        "host": spec.host,
+                        "ssh_port": spec.ssh_port,
+                    }
+                    for spec in fleet.FLEET
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    for spec in fleet.FLEET:
+        label = "上位机" if spec.role == "upper" else "下位机"
+        print(f"{spec.key}\t{spec.host}\t{spec.ssh_port}\t{spec.name}\t{label}")
+    if not fleet.hosts_are_distinct():
+        print(f"# 注意：两台机器地址相同，想要两个独立地址请执行 {fleet.loopback_alias_hint()}")
     return 0
 
 
@@ -373,6 +435,18 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--no-prune", action="store_true", help="不清理非本轮产物")
     init_parser.add_argument("--fresh", action="store_true", help="先清空本地模拟文件系统")
     init_parser.set_defaults(func=cmd_init)
+
+    deploy_parser = sub.add_parser(
+        "deploy", help="自动化模拟部署（上下位机互信 + 分步部署日志）"
+    )
+    deploy_parser.add_argument(
+        "--no-seed", action="store_true", help="只做互信，不写入环境资源（不动数据库）"
+    )
+    deploy_parser.set_defaults(func=cmd_deploy)
+
+    hosts_parser = sub.add_parser("hosts", help="打印两台机器当前分配的主机地址")
+    hosts_parser.add_argument("--json", action="store_true", help="输出 JSON")
+    hosts_parser.set_defaults(func=cmd_hosts)
 
     for name, func, help_text in (
         ("serve", cmd_serve, "启动假 SSH/SFTP 机群（前台）"),

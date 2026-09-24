@@ -337,12 +337,20 @@ def stop_watches(
 
     from django.db.models import Q
 
-    queryset = LogWatch.objects.filter(enabled=True).exclude(extraction_rule_id="").exclude(source_rule_id="")
+    # 「有任一规则列非空」才是受管监视器。链式两次 exclude 是「两列都非空」，
+    # 于是「停止全部」一个也停不掉 —— 必须用 Q 表达「或」。
+    managed = Q()
+    for source in SOURCES.values():
+        managed |= ~Q(**{source.watch_field: ""})
+    queryset = LogWatch.objects.filter(enabled=True).filter(managed)
     if environment_id:
         queryset = queryset.filter(environment_id=environment_id)
     if rule_ids is not None:
         wanted = {str(item).strip() for item in (rule_ids or []) if str(item).strip()}
-        queryset = queryset.filter(Q(extraction_rule_id__in=wanted) | Q(source_rule_id__in=wanted))
+        wanted_q = Q()
+        for source in SOURCES.values():
+            wanted_q |= Q(**{f"{source.watch_field}__in": wanted})
+        queryset = queryset.filter(wanted_q)
     stopped = []
     for watch in queryset:
         watch.enabled = False

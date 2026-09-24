@@ -29,19 +29,23 @@ _STREAM_MARKERS = ("tail -n 0 -F", "tail -F", "tail -f")
 _READ_CHUNK = 65536
 _CLOSE_GRACE_SECONDS = 0.2
 _KEY_DIR = Path(__file__).resolve().parent / "run"
-_HOST_KEY_FILE = _KEY_DIR / "ssh_host_rsa_key"
 
 
-def _load_host_key() -> paramiko.RSAKey:
-    """加载或生成主机密钥（生成一次后复用，避免每次启动都重算）。"""
+def _load_host_key(spec: fleet.MachineSpec) -> paramiko.RSAKey:
+    """加载或生成**该机器自己的**主机密钥。
+
+    每台机器一份：真实机台的 host key 各不相同，"交换主机指纹"才有实际内容 ——
+    两台共用一把钥匙的话，known_hosts 里写谁的都是同一串，那一步就成空动作了。
+    """
     _KEY_DIR.mkdir(parents=True, exist_ok=True)
-    if _HOST_KEY_FILE.exists():
+    path = _KEY_DIR / f"ssh_host_rsa_key_{spec.key}"
+    if path.exists():
         try:
-            return paramiko.RSAKey(filename=str(_HOST_KEY_FILE))
+            return paramiko.RSAKey(filename=str(path))
         except paramiko.SSHException:
             pass
     key = paramiko.RSAKey.generate(2048)
-    key.write_private_key_file(str(_HOST_KEY_FILE))
+    key.write_private_key_file(str(path))
     return key
 
 
@@ -157,6 +161,7 @@ class SimSFTPServer(paramiko.SFTPServerInterface):
 class SimSSHServer(paramiko.ServerInterface):
     def __init__(self, shell: RemoteShell, username: str, password: str) -> None:
         self.shell = shell
+        self.spec = shell.spec
         self.username = username
         self.password = password
         self.exec_event = threading.Event()
@@ -166,8 +171,46 @@ class SimSSHServer(paramiko.ServerInterface):
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
 
+    def check_auth_publickey(self, username: str, key) -> int:  # noqa: ANN001 - paramiko.PKey
+        """公钥认证：比对 ``~/.ssh/authorized_keys``。
+
+        这是"互信"能被**真实验证**的关键 —— 部署流程往下位机写入上位机的公钥后，
+        上位机拿着自己的私钥连过来就会走这条路；公钥没铺好则这里直接拒绝。
+        所以免密登录不是嘴上说说，是这条回调真的放行/拦截。
+        """
+        if username != self.username:
+            return paramiko.AUTH_FAILED
+        try:
+            blob = key.get_base64()
+        except Exception:  # noqa: BLE001 - 非法公钥一律当认证失败
+            return paramiko.AUTH_FAILED
+        if blob and blob in self._authorized_blobs():
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def _authorized_blobs(self) -> set[str]:
+        """本机 ``authorized_keys`` 里的公钥部分（第二列）。
+
+        每次认证都重读文件：部署流程刚写完密钥就要立刻登录验证，
+        缓存住会让"刚铺完还连不上"这种真实故障被掩盖。
+        """
+        path = fleet.remote_to_local(self.spec, f"{self.spec.home}/.ssh/authorized_keys")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        blobs: set[str] = set()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if len(parts) >= 2:
+                blobs.add(parts[1])
+        return blobs
+
     def get_allowed_auths(self, username: str) -> str:
-        return "password"
+        return "publickey,password"
 
     def check_channel_request(self, kind: str, chanid: int) -> int:
         if kind == "session":
@@ -341,19 +384,30 @@ class MachineServer:
 
 
 class FleetServer:
-    """整个机群的监听服务集合。"""
+    """整个机群的监听服务集合。
+
+    默认**每台机器绑自己的地址**（``spec.host`` + 回环）—— 上位机与下位机是两台
+    不同 IP 的机器，让下位机也去绑上位机的地址只会把"谁是谁"搅浑。
+    显式传 ``bind_hosts`` 时所有机器都用它（调试单地址时有用）。
+    """
 
     def __init__(self, bind_hosts: tuple[str, ...] | str | None = None) -> None:
-        self.host_key = _load_host_key()
         if bind_hosts is None:
-            self.bind_hosts = fleet.bind_hosts()
+            self._explicit: tuple[str, ...] | None = None
         elif isinstance(bind_hosts, str):
-            self.bind_hosts = (bind_hosts,)
+            self._explicit = (bind_hosts,)
         else:
-            self.bind_hosts = tuple(dict.fromkeys(bind_hosts))
+            self._explicit = tuple(dict.fromkeys(bind_hosts))
         self.machines = [
-            MachineServer(spec, self.host_key, self.bind_hosts) for spec in fleet.FLEET
+            MachineServer(
+                spec, _load_host_key(spec), self._explicit or fleet.bind_hosts_for(spec)
+            )
+            for spec in fleet.FLEET
         ]
+        # 汇总实际绑定地址（启动横幅 / 健康检查用）
+        self.bind_hosts = tuple(
+            dict.fromkeys(host for machine in self.machines for host in machine.bind_hosts)
+        )
 
     def start(self) -> None:
         started: list[MachineServer] = []

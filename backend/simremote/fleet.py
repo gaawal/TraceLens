@@ -27,17 +27,28 @@ STATION_USER_ID = "1"
 # ---------------------------------------------------------------------------
 # 机器地址
 #
-# 模拟机对外的 host 必须是**真的能连上的地址**，不能是 "sim-upper.localhost"
-# 这种只在字面上像主机的字符串 —— 后端是拿这个值直接开 SSH 的，用户也会照着它
-# 手工 ssh 上去复核。所以这里取本机的局域网出口 IP（就是真实网卡地址），
-# 并且监听时同时绑这个地址和回环：
+# 上位机与下位机是**两台机器**，所以各要一个**互不相同、且真的能连上**的地址：
 #
-#   网络 IP:2222   给"另一台机器/另一台设备"访问，路径与真实机台一致
-#   127.0.0.1:2222 本机探测（sim.sh 健康检查、selftest）走这条，不依赖网卡状态
+#   真实部署里两台机器本来就是两个 IP，「互信」（SSH 免密）说的正是 A ⇄ B 这
+#   两个地址之间的事。如果两台模拟机共用一个 IP、只靠端口区分，语义上就变成
+#   "自己跟自己互信"，既不像真机台，也验证不了公钥分发是否真的跨主机生效。
 #
-# 需要固定成某个地址（例如要跟真实机台对齐）时用环境变量覆盖：
-#   SIM_MACHINE_HOST=10.20.30.40 scripts/sim.sh restart fleet
+# 地址来源按优先级：
+#   1. 环境变量 ``SIM_UPPER_HOST`` / ``SIM_LOWER_HOST``（要对齐真实机台时用）
+#   2. lo0 上已存在的别名地址（``127.0.0.2`` / ``127.0.0.3``）
+#      一次性准备（需要管理员权限，本机回环网段只预置了 127.0.0.1）：
+#          sudo ifconfig lo0 alias 127.0.0.2 up
+#          sudo ifconfig lo0 alias 127.0.0.3 up
+#   3. 兜底：局域网 IP 与回环各占一个 —— 这两个地址本机一定有，无需任何准备
+#
+# 每台机器都额外绑 ``127.0.0.1``，这样网卡状态变化不会把本机健康检查一起搞挂。
 # ---------------------------------------------------------------------------
+
+#: 环境变量名（可强制指定某一台机器的地址）
+UPPER_HOST_ENV = "SIM_UPPER_HOST"
+LOWER_HOST_ENV = "SIM_LOWER_HOST"
+#: 旧名兼容：单机地址时代只有一个 MACHINE_HOST，现在它等价于上位机地址
+LEGACY_HOST_ENV = "SIM_MACHINE_HOST"
 
 
 def _local_ipv4_addresses() -> list[str]:
@@ -87,30 +98,121 @@ def _address_rank(ip: str) -> tuple[int, str]:
     return (2, ip)
 
 
-def detect_machine_host() -> str:
-    """本机局域网 IP；优先级 192.168 → 10 → 其它内网 → 回环。"""
-    override = os.environ.get("SIM_MACHINE_HOST", "").strip()
-    if override:
-        return override
-    candidates = _local_ipv4_addresses()
-    if not candidates:
-        return "127.0.0.1"
-    return min(candidates, key=_address_rank)
+def _host_pool() -> list[str]:
+    """按优先级排好的候选地址池（去重）。
+
+    lo0 别名排最前 —— 它们是"干净"的模拟机地址，不掺 VPN / 无线网段，
+    也不会跟真实设备抢地址；其次是内网网卡地址。
+
+    **刻意不含裸 ``127.0.0.1``**：它作为"宣告地址"写进数据库后，跟网卡地址
+    不是一个值，排查链路时会把"服务没起来"和"地址选错了"混在一起。
+    只有本机一个可用地址都没有时（网卡全关、也没加别名）才退回它。
+    """
+    addresses = _local_ipv4_addresses()
+    aliases = [ip for ip in addresses if ip.startswith("127.") and ip != "127.0.0.1"]
+    others = [
+        ip for ip in addresses if not ip.startswith("127.") and _address_rank(ip)[0] <= 2
+    ]
+    ordered = sorted(aliases) + sorted(others, key=_address_rank)
+    if not ordered:
+        ordered = ["127.0.0.1"]
+    return list(dict.fromkeys(ordered))
 
 
-#: 模拟机对外宣告的地址（两台机器共用本机 IP，靠端口区分）。
-MACHINE_HOST = detect_machine_host()
+def resolve_machine_hosts() -> tuple[str, str]:
+    """给上下位机各挑一个地址，返回 ``(上位机, 下位机)``。
+
+    显式给了环境变量就照用；没给的按 :func:`_host_pool()` 的顺序补，
+    并且**跳过已经被另一个占用的地址** —— 两台机器拿到同一个地址会让
+    "两个 IP 的互信"退化回自连自，失去意义。
+    """
+    picks = [
+        os.environ.get(UPPER_HOST_ENV, "").strip(),
+        os.environ.get(LOWER_HOST_ENV, "").strip(),
+    ]
+    legacy = os.environ.get(LEGACY_HOST_ENV, "").strip()
+    if legacy and not picks[0]:
+        # 老写法只给一个地址：上位机用它，下位机自动挑一个不同的
+        picks[0] = legacy
+
+    pool = _host_pool()
+    taken = {item for item in picks if item}
+    # 候选顺序 = 候选池顺序：**回环别名在最前**（见 _host_pool），其次是网卡地址。
+    #
+    # 于是两种情形都对：
+    #   * 加过别名（127.0.0.2 / 127.0.0.3）→ 两台各拿一个别名，真正是两个 IP；
+    #   * 没加别名 → 候选池只有网卡地址，两台共用它、靠端口 2222/2223 区分。
+    #
+    # 不回退到 127.0.0.1：它作为"宣告地址"写进数据库后，后端按它拼出的地址与
+    # 网卡地址不是同一个，链路排查时极易被误判成服务没起来。宁可用端口区分。
+    spare = [ip for ip in pool if ip not in taken]
+    for index, item in enumerate(picks):
+        if item:
+            continue
+        if spare:
+            picks[index] = spare.pop(0)
+        else:
+            # 只有一个可用地址时，两台机器共用它（靠端口区分）
+            picks[index] = picks[0] or "127.0.0.1"
+    return picks[0], picks[1]
+
+
+def loopback_aliases() -> list[str]:
+    """lo0 上已有的额外别名地址（用户执行过 ``ifconfig lo0 alias …`` 才有）。"""
+    return [
+        ip
+        for ip in _local_ipv4_addresses()
+        if ip.startswith("127.") and ip != "127.0.0.1"
+    ]
+
+
+#: 上位机 / 下位机各自宣告的地址（两个不同的 IP）。
+UPPER_HOST, LOWER_HOST = resolve_machine_hosts()
+
+#: 兼容旧名：单机地址时代两台机器共用本机 IP，``MACHINE_HOST`` 就是它。
+MACHINE_HOST = UPPER_HOST
 
 
 def bind_hosts() -> tuple[str, ...]:
-    """机群/报告站实际绑定的地址：网络 IP 优先，回环兜底（去重）。"""
-    hosts = [MACHINE_HOST, "127.0.0.1"]
-    return tuple(dict.fromkeys(host for host in hosts if host))
+    """**一个服务监听多个地址**时用的集合（报告站这种单端口服务）。
+
+    机群不走这里：每台机器只该绑自己的地址，见 :func:`bind_hosts_for` ——
+    否则下位机也会去绑上位机的地址，地址一多就分不清谁是谁。
+    """
+    hosts = [UPPER_HOST, LOWER_HOST, "127.0.0.1"]
+    return tuple(dict.fromkeys(item for item in hosts if item))
+
+
+def bind_hosts_for(spec: MachineSpec) -> tuple[str, ...]:
+    """一台模拟机自己的绑定地址：宣告地址 + 回环兜底。"""
+    return tuple(dict.fromkeys([spec.host, "127.0.0.1"]))
 
 
 def public_host() -> str:
-    """对外展示用的地址（与 MACHINE_HOST 一致；回环时也照实显示）。"""
-    return MACHINE_HOST
+    """对外展示的地址（用户会照着它 ssh、粘贴报告站 URL）。
+
+    局域网 IP 优先：回环地址给不了别的设备，只用在本机自测时有意义。
+    """
+    addresses = _local_ipv4_addresses()
+    lan = [
+        ip for ip in addresses if not ip.startswith("127.") and _address_rank(ip)[0] <= 2
+    ]
+    if lan:
+        return min(lan, key=_address_rank)
+    return UPPER_HOST
+
+
+def detect_machine_host() -> str:
+    """兼容旧调用：返回上位机地址。新代码请直接用 ``UPPER.host`` / ``LOWER1.host``。"""
+    return UPPER_HOST
+
+
+def loopback_alias_hint() -> str:
+    """两台机器没能拿到两个不同地址时，给用户的一条可选增强命令。"""
+    return (
+        "sudo ifconfig lo0 alias 127.0.0.2 up && "
+        "sudo ifconfig lo0 alias 127.0.0.3 up"
+    )
 
 
 # 远端日志根模板。后端 ResourceSettings 默认模板是 "/log/{username}/debug"。
@@ -193,8 +295,21 @@ class MachineSpec:
     description: str = ""
 
     @property
+    def log_root(self) -> str:
+        return LOG_ROOT.format(username=SIM_USERNAME)
+
+    @property
     def debug_root(self) -> str:
         return DEBUG_ROOT.format(username=SIM_USERNAME)
+
+    @property
+    def deploy_root(self) -> str:
+        """部署日志目录（与 device 日志分开，避免被 run 目录的归档规则误认）。"""
+        return f"{self.log_root}/deploy"
+
+    @property
+    def ssh_dir(self) -> str:
+        return f"{self.home}/.ssh"
 
     @property
     def elog_root(self) -> str:
@@ -220,7 +335,7 @@ class MachineSpec:
 UPPER = MachineSpec(
     key="upper",
     name="SIM-SCH-01",
-    host=MACHINE_HOST,
+    host=UPPER_HOST,
     ssh_port=2222,
     role="upper",
     station_id="1",
@@ -232,7 +347,7 @@ UPPER = MachineSpec(
 LOWER1 = MachineSpec(
     key="lower1",
     name="SIM-LCH1-01",
-    host=MACHINE_HOST,
+    host=LOWER_HOST,
     ssh_port=2223,
     role="lower",
     station_id="2",
@@ -254,14 +369,27 @@ def machine_by_key(key: str) -> MachineSpec:
 def machine_by_host(host: str) -> MachineSpec | None:
     """按 host 或机器名找机器。
 
-    两台机器现在共用本机 IP（靠端口区分），所以只给 host 时返回第一台；
-    要精确匹配请用 :func:`machine_by_endpoint`。
+    两台机器各有独立地址，所以 host 是唯一的；要按 ``host:port`` 精确定位
+    请用 :func:`machine_by_endpoint`。
     """
     text = str(host or "").strip().lower()
     for item in FLEET:
         if item.host.lower() == text or item.name.lower() == text:
             return item
     return None
+
+
+def peer_of(spec: MachineSpec) -> MachineSpec:
+    """另一台机器 —— 部署互信时它就是对端。"""
+    for item in FLEET:
+        if item.key != spec.key:
+            return item
+    raise KeyError(f"机群里只有一台机器，找不到 {spec.key} 的对端")
+
+
+def hosts_are_distinct() -> bool:
+    """两台机器是否拿到了**两个不同的地址**（互信模拟的前提）。"""
+    return len({spec.host for spec in FLEET}) == len(FLEET)
 
 
 def machine_by_endpoint(host: str, port: int | str | None = None) -> MachineSpec | None:
