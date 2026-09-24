@@ -13505,7 +13505,9 @@ html[data-ai-focus="settings"] .settings-page {
   color: #64748b;
   cursor: pointer;
 }
-.floating-timeline-dragbar button:hover { background: #eef2f7; color: #dc2626; }
+/* 红色只留给「关闭」；固定按钮悬停变红会读成危险操作。 */
+.floating-timeline-dragbar button:hover { background: #eef2f7; color: #334155; }
+.floating-timeline-dragbar button.close:hover { color: #dc2626; }
 .floating-timeline-body { flex: 1 1 auto; min-height: 0; overflow: hidden; }
 .floating-timeline-body > .process-gantt {
   height: 100%;
@@ -16746,3 +16748,76 @@ html.workstation-docked {
   overflow-wrap: anywhere;
 }
 .resource-process-result p { margin: 8px 0 0; font-size: 11.5px; color: #8793a6; }
+
+/* ---- 时间线：固定（嵌入日志区上方）模式 ---- */
+.floating-timeline-dragbar-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.floating-timeline-dragbar-actions button.active { color: #1d4ed8; background: #e8effc; }
+.floating-timeline-dragbar-actions button.active:hover { color: #1d4ed8; background: #dde8fa; }
+
+/* 固定后时间线不再浮在日志上，而是作为日志区的一部分占位排版：
+   上面是固定栏 + 时间线，下面日志区自适应剩下的高度。 */
+.docked-timeline-window {
+  flex: none;
+  min-height: 0;
+  max-height: min(54vh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+}
+.docked-timeline-bar {
+  flex: none;
+  height: 32px;
+  padding: 0 7px 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid #eef1f5;
+  background: #f8fafc;
+}
+.docked-timeline-bar > span { min-width: 0; display: flex; align-items: center; gap: 6px; color: #475569; }
+.docked-timeline-bar strong { color: #1e293b; font-size: 11px; }
+.docked-timeline-bar small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-size: 9.5px; }
+.docked-timeline-bar-actions { flex: none; display: flex; align-items: center; gap: 2px; }
+.docked-timeline-bar-actions button {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+}
+.docked-timeline-bar-actions button:hover { background: #eef2f7; color: #334155; }
+.docked-timeline-bar-actions button.active { color: #1d4ed8; background: #e8effc; }
+.docked-timeline-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.docked-timeline-body > .process-gantt {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  display: flex;
+  flex-direction: column;
+}
+.docked-timeline-body > .process-gantt > .process-gantt-header { flex: none; }
+.docked-timeline-body > .process-gantt > .process-gantt-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.docked-timeline-body .process-gantt-scroll-shell { flex: 1 1 auto; min-height: 0; }
+.docked-timeline-body .process-gantt-scroll { height: 100%; max-height: none; }
+.docked-timeline-body > .live-ribbon { flex: none; }

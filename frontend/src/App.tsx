@@ -28,6 +28,8 @@ import {
   BookOpen,
   Link2,
   LoaderCircle,
+  Pin,
+  PinOff,
   Plus,
   Radio,
   Search,
@@ -164,6 +166,8 @@ interface SharedLogScene {
   filters: SharedLogSceneFilters;
   view: {
     showTimeline: boolean;
+    /** true = 时间线嵌在日志区上方（不悬浮）；false = 悬浮窗口。 */
+    timelineDocked: boolean;
     timelineGroupingMode: TimelineGroupingMode;
     semanticLabelsEnabled: boolean;
     rawLogMode: boolean;
@@ -317,6 +321,7 @@ function sharedLogSceneFromUrl(): SharedLogScene | undefined {
     },
     view: {
       showTimeline: params.get('tl') === '1',
+      timelineDocked: params.get('tld') === '1',
       timelineGroupingMode: params.get('grp') === 'p' ? 'process' : 'merged',
       semanticLabelsEnabled: params.get('sem') !== '0',
       rawLogMode: params.has('raw') ? params.get('raw') === '1' : loadRawLogModePreference(),
@@ -386,6 +391,7 @@ function writeSharedLogSceneUrl(scene: SharedLogScene): void {
   // 即使当前值恰好等于默认值，也不会依赖另一个浏览器/后续版本的默认配置。
   params.set('err', scene.filters.errorsOnly ? '1' : '0');
   params.set('tl', scene.view.showTimeline ? '1' : '0');
+  params.set('tld', scene.view.timelineDocked ? '1' : '0');
   params.set('grp', scene.view.timelineGroupingMode === 'merged' ? 'm' : 'p');
   params.set('sem', scene.view.semanticLabelsEnabled ? '1' : '0');
   params.set('raw', scene.view.rawLogMode ? '1' : '0');
@@ -3933,6 +3939,8 @@ export default function App() {
   const [callFlowDialogOpen, setCallFlowDialogOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [showTimeline, setShowTimeline] = useState(false);
+  // 悬浮 / 固定二选一。固定时时间线嵌回日志区上方（占位排版），不再盖在日志上。
+  const [timelineDocked, setTimelineDocked] = useState(false);
   const [timelineWindowPosition, setTimelineWindowPosition] = useState(() => ({
     left: 8,
     top: 86,
@@ -5393,7 +5401,8 @@ export default function App() {
    * therefore gives the height the window needs without a feedback loop.
    */
   useLayoutEffect(() => {
-    if (!showTimeline) return undefined;
+    // 固定模式没有悬浮窗，高度由日志区排版决定，不需要再算自然高度。
+    if (!showTimeline || timelineDocked) return undefined;
     const node = timelineWindowRef.current;
     if (!node) return undefined;
     const rows = () => node.querySelector('.process-gantt-rows') as HTMLElement | null;
@@ -5449,7 +5458,7 @@ export default function App() {
       observer.disconnect();
       mutations.disconnect();
     };
-  }, [showTimeline, liveListening, ganttProcesses, selectedProcessId]);
+  }, [showTimeline, timelineDocked, liveListening, ganttProcesses, selectedProcessId]);
 
   function beginTimelineWindowDrag(event: React.PointerEvent<HTMLDivElement>) {
     if ((event.target as HTMLElement).closest('button, input, select, a')) return;
@@ -6931,6 +6940,7 @@ export default function App() {
       },
       view: {
         showTimeline,
+        timelineDocked,
         timelineGroupingMode,
         semanticLabelsEnabled,
         rawLogMode,
@@ -6966,6 +6976,7 @@ export default function App() {
     });
     // 先恢复显示开关；日志结果若命中最终结果缓存，后端会在文件计划前直接返回。
     setShowTimeline(scene.view.showTimeline !== false);
+    setTimelineDocked(Boolean(scene.view.timelineDocked));
     setTimelineGroupingMode(scene.view.timelineGroupingMode === 'process' ? 'process' : 'merged');
     setSemanticLabelsEnabled(scene.view.semanticLabelsEnabled !== false);
     setRawLogMode(Boolean(scene.view.rawLogMode));
@@ -6994,6 +7005,7 @@ export default function App() {
 
     setFilters(sharedSceneFilters(scene));
     setShowTimeline(scene.view.showTimeline !== false);
+    setTimelineDocked(Boolean(scene.view.timelineDocked));
     setTimelineGroupingMode(scene.view.timelineGroupingMode === 'process' ? 'process' : 'merged');
     setSemanticLabelsEnabled(scene.view.semanticLabelsEnabled !== false);
     setRawLogMode(Boolean(scene.view.rawLogMode));
@@ -7057,6 +7069,7 @@ export default function App() {
     activeTask?.name,
     filters,
     showTimeline,
+    timelineDocked,
     timelineGroupingMode,
     semanticLabelsEnabled,
     rawLogMode,
@@ -7940,6 +7953,42 @@ export default function App() {
     );
   }
 
+  /**
+   * 时间线内容只有一份：悬浮窗口和「固定到日志区」共用同一个节点，
+   * 差别只在 expanded / onToggle —— 固定后标题栏重新变成可折叠的（对应 URL 里的 pex）。
+   */
+  const timelineOverviewNode = (
+    <>
+      {/* 实时监听色带属于时间线的信息，固定后不能被藏起来。 */}
+      <LiveRibbon environmentId={preferredRemoteEnvironmentId} />
+      <ProcessTimelineOverview
+        processes={ganttProcesses}
+        selectedProcessId={selectedProcessId}
+        selectedThreadId={selectedThreadId}
+        selectedTraceId={optimisticTraceId ?? selectedTraceId ?? selectedCrossTraceId}
+        selectedTimeRange={filters.timeRange}
+        loadedTimeRange={activeTaskLoadedRange}
+        timeSelectionDisabled={liveListening}
+        incrementalLoading={activeTask?.incrementalLoading}
+        incrementalMessage={activeTask?.incrementalMessage}
+        expanded={timelineDocked ? processTimelineExpanded : true}
+        navigationPending={navigationPending}
+        onToggle={timelineDocked ? () => setProcessTimelineExpanded((value) => !value) : () => undefined}
+        onSelectProcess={selectProcess}
+        onSelectTrace={selectTrace}
+        onSelectTimeRange={selectTimeRange}
+        onClearTimeRange={clearTimeRange}
+        onNavigateTime={navigateToTimelineTime}
+        onNavigateComponentTime={navigateToTimelineComponentTime}
+        onNavigateEntry={jumpToLogEntry}
+        onTimeCursorInteractionChange={setTimeCursorScrollLocked}
+        onHiddenComponentsChange={setTimelineHiddenComponents}
+        restoredHiddenComponents={timelineHiddenComponents}
+        filterScopeKey={activeTask?.id ?? 'logs'}
+      />
+    </>
+  );
+
   return (
     <FoldingRuleContext.Provider value={effectiveFoldingRules}>
     <ErrorRuleContext.Provider value={errorRules}>
@@ -8317,6 +8366,18 @@ export default function App() {
 
         <main className="main-panel">
           <div className={classNames('log-viewer-shell', !activeTask && 'empty-log-viewer')}>
+            {showTimeline && activeTask?.status === 'ready' && !rawLogMode && timelineDocked && (
+              <section className="docked-timeline-window" aria-label="时间线（已固定到日志区）">
+                <div className="docked-timeline-bar">
+                  <span><Clock size={14}/><strong>时间线</strong><small>已固定 · 在日志区上方占位排版，不遮挡日志</small></span>
+                  <div className="docked-timeline-bar-actions">
+                    <button type="button" className="active" onClick={() => setTimelineDocked(false)} aria-pressed={true} title="取消固定，恢复为可拖动的悬浮窗口" aria-label="取消固定时间线"><PinOff size={14}/></button>
+                    <button type="button" onClick={() => setShowTimeline(false)} title="关闭时间线" aria-label="关闭时间线"><X size={15}/></button>
+                  </div>
+                </div>
+                <div className="docked-timeline-body">{timelineOverviewNode}</div>
+              </section>
+            )}
             <div
               className="log-scroll-region"
               ref={logScrollRef}
@@ -8393,7 +8454,7 @@ export default function App() {
           </div>
         </main>
 
-        {showTimeline && activeTask?.status === 'ready' && !rawLogMode && (
+        {showTimeline && activeTask?.status === 'ready' && !rawLogMode && !timelineDocked && (
           <section
             className="floating-timeline-window"
             ref={timelineWindowRef}
@@ -8412,36 +8473,12 @@ export default function App() {
               onPointerCancel={endTimelineWindowDrag}
             >
               <span><Clock size={14}/><strong>时间线</strong><small>拖动窗口 · 日志区独立滚动</small></span>
-              <button type="button" onClick={() => setShowTimeline(false)} aria-label="关闭时间线" title="关闭时间线"><X size={15}/></button>
+              <div className="floating-timeline-dragbar-actions">
+                <button type="button" className={timelineDocked ? 'active' : ''} onClick={() => setTimelineDocked(!timelineDocked)} aria-pressed={timelineDocked} aria-label="固定时间线到日志区" title="固定到日志区上方（不再悬浮，日志区让出位置）"><Pin size={14}/></button>
+                <button type="button" className="close" onClick={() => setShowTimeline(false)} aria-label="关闭时间线" title="关闭时间线"><X size={15}/></button>
+              </div>
             </div>
-            <div className="floating-timeline-body">
-              <LiveRibbon environmentId={preferredRemoteEnvironmentId} />
-              <ProcessTimelineOverview
-                processes={ganttProcesses}
-                selectedProcessId={selectedProcessId}
-                selectedThreadId={selectedThreadId}
-                selectedTraceId={optimisticTraceId ?? selectedTraceId ?? selectedCrossTraceId}
-                selectedTimeRange={filters.timeRange}
-                loadedTimeRange={activeTaskLoadedRange}
-                timeSelectionDisabled={liveListening}
-                incrementalLoading={activeTask.incrementalLoading}
-                incrementalMessage={activeTask.incrementalMessage}
-                expanded={true}
-                navigationPending={navigationPending}
-                onToggle={() => undefined}
-                onSelectProcess={selectProcess}
-                onSelectTrace={selectTrace}
-                onSelectTimeRange={selectTimeRange}
-                onClearTimeRange={clearTimeRange}
-                onNavigateTime={navigateToTimelineTime}
-                onNavigateComponentTime={navigateToTimelineComponentTime}
-                onNavigateEntry={jumpToLogEntry}
-                onTimeCursorInteractionChange={setTimeCursorScrollLocked}
-                onHiddenComponentsChange={setTimelineHiddenComponents}
-                restoredHiddenComponents={timelineHiddenComponents}
-                filterScopeKey={activeTask.id}
-              />
-            </div>
+            <div className="floating-timeline-body">{timelineOverviewNode}</div>
           </section>
         )}
 
