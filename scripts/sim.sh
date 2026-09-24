@@ -214,9 +214,9 @@ c_start_stream() {
     info "实时日志源已在运行（跳过）"
     return 0
   fi
-  info "启动实时日志源（spwsp/mecore/cpfr/sil，0.5s 一行，1000 行轮转）"
+  info "启动实时日志源（spwsp/mecore/cpfr/sil，1s 一行，1000 行轮转）"
   spawn stream "$RUN_DIR/stream.out" "$BACKEND_DIR" \
-    "$PY" -u -m simremote.cli stream --interval 0.5 >/dev/null
+    "$PY" -u -m simremote.cli stream --interval 1 >/dev/null
   sleep 2
   cli_running stream || fail "日志源未存活，见 $RUN_DIR/stream.out"
   ok "实时日志源就绪（scripts/sim.sh logs stream 可跟踪）"
@@ -412,7 +412,8 @@ print("""
  怎么找日志：
    前端 → 环境资源 → 远程日志查询，时间窗口选「最近 3 小时」即可命中
    实时日志：选 spwsp / mecore / cpfr / sil 任一模块后打开「实时监听」，
-             日志会一行行滚出来（0.5s 一行，约 8 分钟写满 1000 行后自动轮转）
+             日志会一行行滚出来（总体 1s 一行；4 条流轮转，单条流约 4s 一行，
+             约 17 分钟写满 1000 行后自动轮转）
    CPD 测校：环境资源 → CPD 测校报告，选子系统 / 模块
    用例分析：ATLog 用例分析页粘贴下面的用例 URL""")
 PY

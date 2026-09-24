@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="SN_SPM_WPOS_ALIGN_Drift_002" tests="2" failures="1" errors="0" skipped="0" starttime="2026-09-25 03:19:58" endtime="2026-09-25 03:25:58">
+<testsuite name="SN_SPM_WPOS_ALIGN_Drift_002" tests="2" failures="1" errors="0" skipped="0" starttime="2026-09-25 03:50:15" endtime="2026-09-25 03:56:15">
     <testcase classname="SN_SPM_WPOS_ALIGN_Drift_002" name="test_sn_spm_wpos_align_drift_002" time="742.310" result="failed">
       <failure message="AssertionError: expect AlignStatus.LOCKED, real AlignStatus.DRIFT">/data/atlog/align_case.py:88: in run_align
 /data/atlog/align_check.py:203: in verify_lock

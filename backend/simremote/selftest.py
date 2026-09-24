@@ -387,7 +387,8 @@ def check_live_tail() -> None:
         # 是管道而不是 tty，stdio 走全缓冲，一行约 150B，要攒满 ~4KB（≈27 行）才会
         # flush 一次。日志源 0.5s/行时第一行要等 ~14s 才冒出来，窗口开太短会隔几次
         # 就假失败一次 —— 真实机台也是这个行为，不是模拟器的问题。
-        deadline = time.time() + (28 if running else 5)
+        # 现在默认 1s/行（间隔翻倍），窗口跟着翻倍，否则又回到隔几次假失败的老毛病。
+        deadline = time.time() + (60 if running else 5)
         while time.time() < deadline:
             if channel.recv_ready():
                 received += channel.recv(65536)
@@ -631,9 +632,9 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
     pairs = 0
     boundary_levels: set[str] = set()
     # 入口/出口行必须带**固定关键字模板**：
-    #   ``[ScanWafer] >() enter 晶圆扫片 开始 ...``  /  ``... 晶圆扫片 end ...``
+    #   ``[ScanWafer] >() enter wafer scan start ...``  /  ``... wafer scan end ...``
     # 关键字让人一眼看出这一步在做什么；出口复用同一个关键字，不用回头翻入口
-    # 就能配对上。缺失就说明 PHASE_KEYWORDS 漏登记（会退回英文函数名）。
+    # 就能配对上。缺失就说明 PHASE_KEYWORDS 漏登记（会退回函数名当关键字）。
     template_problems: list[str] = []
 
     for item in steps:
@@ -650,7 +651,7 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
             else:
                 boundary_levels.add(level)
                 stack.append(function)
-                if f"enter {keyword} 开始" not in rendered:
+                if f"enter {keyword} start" not in rendered:
                     template_problems.append(function)
         elif phase == PHASE_LEAVE:
             match = EXIT_MARKER_REGEX.search(rendered)
@@ -689,12 +690,12 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
         f"{label} 边界行带关键字模板",
         not template_problems,
         f"缺关键字 {sorted(set(template_problems))}" if template_problems
-        else f"{pairs} 组「关键字 开始 / 关键字 end」",
+        else f"{pairs} 组「keyword start / keyword end」",
     )
 
 
 def _validate_stage_frames(label: str, steps, codes) -> None:  # noqa: ANN001 - 迭代器即可
-    """阶段框：``[Stage_XXX] >() enter <阶段名> 开始 step=n/N ...`` 成对且序号递增。
+    """阶段框：``[Stage_XXX] >() enter <阶段名> start step=n/N ...`` 成对且序号递增。
 
     这是"日志体现不同流程阶段"的落点：每到一个新阶段就开一个框，阶段内所有
     子调用都嵌在框里。两条硬约束：
@@ -774,8 +775,8 @@ def check_log_call_chain() -> None:
         )
 
     # 关键字模板必须**全覆盖**：任何边界行函数没登记在 PHASE_KEYWORDS 里，就会
-    # 退回英文函数名当关键字，用户看到的就不是「晶圆扫片 开始」而是「ScanWafer 开始」。
-    from .loggen import PHASE_BODY
+    # 退回函数名当关键字，用户看到的就不是「wafer scan start」而是「ScanWafer start」。
+    from .loggen import PHASE_BODY, log_message
 
     boundary_functions = {
         function
@@ -792,6 +793,26 @@ def check_log_call_chain() -> None:
         not unregistered,
         f"未登记 {unregistered}" if unregistered
         else f"{len(boundary_functions)} 个函数全部登记在 PHASE_KEYWORDS",
+    )
+
+    # 日志正文必须**全英文**：真实机台的调试日志/执行器日志/运行事件日志都是英文，
+    # 模拟器里混中文会一眼看穿是假数据。这条把"渲染出来的每一行"都过一遍，
+    # 新增剧本时写错语言（或关键字表被改回中文）会立刻失败。
+    cjk_pattern = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+    offenders: list[str] = []
+    for function, phase, _level, body in loggen._DEBUG_PROGRAM:
+        rendered = log_message(function, phase, body)
+        if cjk_pattern.search(rendered):
+            offenders.append(f"批量/{function}")
+    for _key, _level, function, phase, body in livesim._SCRIPT:
+        rendered = log_message(function, phase, body)
+        if cjk_pattern.search(rendered):
+            offenders.append(f"实时/{function}")
+    _record(
+        "日志正文全英文",
+        not offenders,
+        f"含中文的行 {sorted(set(offenders))}" if offenders
+        else f"{len(loggen._DEBUG_PROGRAM) + len(livesim._SCRIPT)} 行正文无中日韩字符",
     )
 
     # 落盘抽查：活动文件里真的能看到方向符（剧本对不代表写出来的对）

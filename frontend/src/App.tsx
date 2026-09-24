@@ -2845,11 +2845,6 @@ function LogPaginationBar({
   total,
   onPageChange,
   onPageSizeChange,
-  showResultActions,
-  onToggleCallFlow,
-  callFlowOpen,
-  onToggleSemantic,
-  semanticEnabled,
   statistics,
 }: {
   page: number;
@@ -2857,11 +2852,6 @@ function LogPaginationBar({
   total: number;
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
-  showResultActions?: boolean;
-  onToggleCallFlow?: () => void;
-  callFlowOpen?: boolean;
-  onToggleSemantic?: () => void;
-  semanticEnabled?: boolean;
   statistics?: { source: number; modules: number; processes: number; threads: number; functions: number; errorTraces: number; errors: number };
 }) {
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -2871,34 +2861,9 @@ function LogPaginationBar({
 
   return (
     <div className="log-pagination-bar" aria-label="日志工具与分页">
-      <div className="log-enhancement-tools" aria-label="日志显示开关与统计">
-        {/* 这三个开关原本就在这里。之前把「折叠/提取/案例/分析/下载」搬到上方 metric-strip 时，
-            连它们的渲染一起删掉了 —— props 还在传，按钮却没了，于是：
-            · 源码语义（每行右侧的语义/标签文本 + 时间线泳道上的彩色标签格子）只能靠默认值常开；
-            · 调用导航（函数名 + 折叠后的树形窗口）没有任何入口能打开。
-            开关放回底部左侧增强工具区，和统计并列。 */}
-        {showResultActions && <>
-          <button
-            type="button"
-            className={`button ghost compact-button ${semanticEnabled ? 'active-tool' : ''}`}
-            aria-pressed={Boolean(semanticEnabled)}
-            onClick={onToggleSemantic}
-            title={semanticEnabled
-              ? '当前显示语义说明与自定义标签（每行右侧），并把标签颜色画到时间线泳道上；点击关闭'
-              : '显示语义说明与自定义标签（每行右侧），并把标签颜色画到时间线泳道上'}
-          >
-            <Sparkles size={14} /> 源码语义
-          </button>
-          <button
-            type="button"
-            className={`button ghost compact-button ${callFlowOpen ? 'active-tool' : ''}`}
-            aria-pressed={Boolean(callFlowOpen)}
-            onClick={onToggleCallFlow}
-            title={callFlowOpen ? '关闭调用导航窗口' : '打开调用导航：函数名与折叠后的调用树'}
-          >
-            <GitBranch size={14} /> 调用导航
-          </button>
-        </>}
+      {/* 底部只留统计与翻页；「源码语义 / 调用导航」等显示开关都在上方操作工具栏，
+          与同类的开关和窗口按钮放在一起。 */}
+      <div className="log-enhancement-tools" aria-label="日志统计">
         {statistics && <>
           <MetricItem icon={<FileCode2 size={15} />} label="日志源" value={statistics.source} />
           <MetricItem icon={<Boxes size={15} />} label="模块" value={statistics.modules} />
@@ -8011,6 +7976,16 @@ export default function App() {
               hint={filters.errorsOnly ? '仅展示命中异常规则的日志' : '默认展示完整上下文'}
               onChange={(checked) => { setFilters((current) => ({ ...current, errorsOnly: checked })); setLogPage(1); }}
             />
+            {/* 源码语义 与「只看报错 / 原始日志」同类：都决定这一屏日志长什么样，
+                所以放在这组开关里，而不是跟右侧的动作按钮混在一起。 */}
+            <SwitchControl
+              checked={semanticLabelsEnabled}
+              label="源码语义"
+              hint={semanticLabelsEnabled
+                ? '每行右侧显示语义说明与自定义标签，标签颜色同时画到时间线泳道'
+                : '关闭语义说明与自定义标签'}
+              onChange={(checked) => setSemanticLabelsEnabled(checked)}
+            />
             <SwitchControl
               checked={liveListening}
               label="实时监听"
@@ -8060,6 +8035,22 @@ export default function App() {
               hint={rawLogMode ? '直接展示日志原文，不做解析' : '使用结构化日志视图'}
               onChange={setRawLogMode}
             />
+            {/* 三个窗口按「定位 → 定性 → 定时」排：先看是哪个进程/函数/调用链（调用导航），
+                再看为什么失败（根因树），最后看发生的时间分布（时间线）。 */}
+            <button
+              type="button"
+              className={`button ghost metric-action-button ${callFlowDialogOpen ? 'active' : ''}`}
+              disabled={!activeTask || activeTask.status !== 'ready' || rawLogMode}
+              aria-pressed={callFlowDialogOpen}
+              onClick={() => { if (callFlowDialogOpen) setCallFlowDialogOpen(false); else openCallFlowDialog(); }}
+              title={
+                rawLogMode ? '原始日志模式不显示调用导航'
+                : !activeTask || activeTask.status !== 'ready' ? '先查询日志，调用导航会按进程 / 函数 / 调用链展开'
+                : callFlowDialogOpen ? '关闭调用导航' : '打开调用导航（进程 / 函数 / 调用链树）'
+              }
+            >
+              <GitBranch size={14} /> 调用导航
+            </button>
             <button
               type="button"
               className="button ghost metric-action-button"
@@ -8279,11 +8270,6 @@ export default function App() {
                 total={scopedFilteredEntries.length}
                 onPageChange={setLogPage}
                 onPageSizeChange={(size) => { setLogPageSize(Math.max(100, Math.min(MAX_LOG_PAGE_SIZE, size))); setLogPage(1); }}
-                showResultActions={activeTask.entries.length > 0}
-                onToggleCallFlow={() => { if (callFlowDialogOpen) setCallFlowDialogOpen(false); else openCallFlowDialog(); }}
-                callFlowOpen={callFlowDialogOpen}
-                onToggleSemantic={() => setSemanticLabelsEnabled((current) => !current)}
-                semanticEnabled={semanticLabelsEnabled}
                 statistics={{
                   source: currentSourceCount,
                   modules: currentComponentCount,

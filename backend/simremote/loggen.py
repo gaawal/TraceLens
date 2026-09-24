@@ -53,9 +53,9 @@ PURGE_BUDGET_PER_RUN = 40
 #
 # 日志正文不是随手写的句子，而是遵守固定规则：
 #
-#     [函数名] >() enter <关键字> 开始 <入参>     <- 函数入口
-#     [函数名] <某个正文>                         <- 函数体内的普通日志
-#     [函数名] <() leave <关键字> end <耗时/状态>  <- 函数出口
+#     [函数名] >() enter <关键字> start <入参>     <- 函数入口
+#     [函数名] <某个正文>                          <- 函数体内的普通日志
+#     [函数名] <() leave <关键字> end <耗时/状态>   <- 函数出口
 #
 # 方向符 ``>()`` / ``<()`` 是这套规则的核心。TraceLens 的内置折叠规则
 # ``builtin-explicit-boundary``（``frontend/src/rendering/foldingRules.ts``，
@@ -64,12 +64,16 @@ PURGE_BUDGET_PER_RUN = 40
 # 入口/出口之间的日志收成一张可折叠的函数卡片。
 #
 # **关键字模板**：入口行在方向符之后先打一个**固定关键字**（见 PHASE_KEYWORDS），
-# 说明这一步在流程里干什么（``批次扫片`` / ``启动曝光`` / ``获取冷却流量``……），
+# 说明这一步在流程里干什么（``lot scan`` / ``exposure scan`` / ``coolant flow read``……），
 # 出口行打同一个关键字 + ``end``。这样：
 #
 # * 扫一眼就知道日志处在流程的哪一段，不用反推函数名；
 # * 入口/出口靠"同一个关键字"就能肉眼配对，也方便按关键字全局检索；
 # * 关键字是**固定模板**（一个函数永远同一句），所以可以当稳定的检索锚点。
+#
+# **正文一律英文**：真实机台的调试日志、执行器日志、运行事件日志都是英文的，
+# 模拟器必须一致 —— 出现中文会让人一眼看出是假数据，也会让"按关键字检索"的
+# 习惯无法迁移到真机。关键字表里只放英文短语，别再改回中文。
 #
 # 三个必须守住的约束：
 #
@@ -99,43 +103,43 @@ STAGE_FUNCTION_PREFIX = "Stage_"
 #: 否则会退回成拿函数名当关键字（selftest 会直接报出来）。
 PHASE_KEYWORDS: dict[str, str] = {
     # ---- 扫片主流程 ----
-    "ScanLot": "批次扫片",
-    "ScanWafer": "晶圆扫片",
-    "LoadWafer": "晶圆装载",
-    "UnloadWafer": "晶圆卸载",
-    "MoveWaferStage": "工件台移动",
-    "AlignWafer": "对准测量",
-    "ExposeWafer": "曝光扫描",
-    "StabiliseSource": "光源稳定",
-    "MeasureOverlay": "套刻测量",
-    "RetryExposure": "曝光重试",
-    "HaltScan": "扫片停线",
-    "RecoverStage": "工件台恢复",
-    "ResumeExposure": "曝光续跑",
+    "ScanLot": "lot scan",
+    "ScanWafer": "wafer scan",
+    "LoadWafer": "wafer load",
+    "UnloadWafer": "wafer unload",
+    "MoveWaferStage": "wafer stage move",
+    "AlignWafer": "wafer alignment",
+    "ExposeWafer": "exposure scan",
+    "StabiliseSource": "source stabilisation",
+    "MeasureOverlay": "overlay measurement",
+    "RetryExposure": "exposure retry",
+    "HaltScan": "scan halt",
+    "RecoverStage": "stage recovery",
+    "ResumeExposure": "exposure resume",
     # ---- 编码器 / 冷却 / 互锁子系统 ----
-    "ServoLoop": "伺服循环",
-    "CheckEncoderFeedback": "获取编码器数据",
-    "CompensateJitter": "抖动补偿",
-    "CoolantLoop": "冷却循环",
-    "CheckFlow": "获取冷却流量",
-    "UpdateThermalBudget": "热预算核算",
-    "SourceInterlock": "光源互锁检查",
-    "TripInterlock": "互锁跳闸",
+    "ServoLoop": "servo loop",
+    "CheckEncoderFeedback": "encoder data read",
+    "CompensateJitter": "jitter compensation",
+    "CoolantLoop": "coolant loop",
+    "CheckFlow": "coolant flow read",
+    "UpdateThermalBudget": "thermal budget update",
+    "SourceInterlock": "source interlock check",
+    "TripInterlock": "interlock trip",
     # ---- 流程阶段框 ----
-    "Stage_WAFER_LOAD": "上片阶段",
-    "Stage_ALIGNMENT": "对准阶段",
-    "Stage_EXPOSURE": "曝光阶段",
-    "Stage_SERVO_SAMPLE": "伺服采样阶段",
-    "Stage_COOLANT_FLOW": "冷却流量阶段",
-    "Stage_INTERLOCK_ARM": "互锁布防阶段",
-    "Stage_SERVO_COMPENSATE": "伺服补偿阶段",
-    "Stage_THERMAL_BUDGET": "热预算阶段",
-    "Stage_INTERLOCK_TRIP": "互锁跳闸阶段",
-    "Stage_INTERLOCK_RECOVER": "互锁恢复阶段",
-    "Stage_SCAN_HALT": "扫片停线阶段",
-    "Stage_SCAN_RECOVER": "扫片恢复阶段",
-    "Stage_MEASUREMENT": "测量阶段",
-    "Stage_UNLOAD": "卸片阶段",
+    "Stage_WAFER_LOAD": "wafer load stage",
+    "Stage_ALIGNMENT": "alignment stage",
+    "Stage_EXPOSURE": "exposure stage",
+    "Stage_SERVO_SAMPLE": "servo sample stage",
+    "Stage_COOLANT_FLOW": "coolant flow stage",
+    "Stage_INTERLOCK_ARM": "interlock arm stage",
+    "Stage_SERVO_COMPENSATE": "servo compensate stage",
+    "Stage_THERMAL_BUDGET": "thermal budget stage",
+    "Stage_INTERLOCK_TRIP": "interlock trip stage",
+    "Stage_INTERLOCK_RECOVER": "interlock recover stage",
+    "Stage_SCAN_HALT": "scan halt stage",
+    "Stage_SCAN_RECOVER": "scan recover stage",
+    "Stage_MEASUREMENT": "measurement stage",
+    "Stage_UNLOAD": "wafer unload stage",
 }
 
 
@@ -153,7 +157,7 @@ def log_message(function: str, phase: str, body: str) -> str:
     """按调用链规则拼一行日志正文。"""
     keyword = keyword_of(function)
     if phase == PHASE_ENTER:
-        return f"[{function}] {ENTRY_MARKER} enter {keyword} 开始 {body}"
+        return f"[{function}] {ENTRY_MARKER} enter {keyword} start {body}"
     if phase == PHASE_LEAVE:
         return f"[{function}] {EXIT_MARKER} leave {keyword} end {body}"
     return f"[{function}] {body}"
@@ -181,7 +185,8 @@ def expand_stage_groups(rows) -> tuple:  # noqa: ANN001 - 迭代即可
     开在曝光前、合在互锁恢复之后，中间夹着编码器 / 冷却 / 互锁各自的阶段）。
 
     阶段框本身也吃 ``PHASE_KEYWORDS`` 里的关键字模板，所以入口是
-    ``[Stage_EXPOSURE] >() enter 曝光阶段 开始 ...``、出口是 ``... 曝光阶段 end ...``。
+    ``[Stage_EXPOSURE] >() enter exposure stage start ...``、出口是
+    ``... exposure stage end ...``。
     """
     stream_order: list[str] = []
     rows_by_stream: dict[str, list[tuple[str | None, tuple]]] = {}

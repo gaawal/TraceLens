@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import fleet, loggen
+from . import fleet, livesim, loggen
 
 RUN_DIR = Path(__file__).resolve().parent / "run"
 PID_FILE = RUN_DIR / "fleet.pid"
@@ -388,7 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
         item.set_defaults(func=func)
 
     stream_parser = sub.add_parser("stream", help="实时日志源（前台，持续追加 <fm>.log）")
-    stream_parser.add_argument("--interval", type=float, default=0.5, help="每行间隔秒数（默认 0.5）")
+    stream_parser.add_argument(
+        "--interval",
+        type=float,
+        default=livesim.DEFAULT_INTERVAL_SECONDS,
+        help=(
+            f"每行间隔秒数（默认 {livesim.DEFAULT_INTERVAL_SECONDS:g}）。"
+            "剧本是 4 条流交错，每 tick 只落一行，所以单条流约 4 倍间隔走一行；"
+            "要单条流 1 秒一行就给 0.25"
+        ),
+    )
     stream_parser.add_argument("--lines", type=int, default=None, help="产够 N 行后退出（默认一直跑）")
     stream_parser.set_defaults(func=cmd_stream)
 

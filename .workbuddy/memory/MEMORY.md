@@ -65,10 +65,16 @@
   先 `print(loggen.ENTRY_MARKER)` 核对再写。
 - 用户口述的「入口》出口《」= 半角 `>` / `<` 加圆括号，不是全角书名号。
 - 拼装统一走 `loggen.log_message(function, phase, body)`；`loggen.PHASE_ENTER/BODY/LEAVE` 是相位常量。
-- **关键字模板**：`loggen.PHASE_KEYWORDS`（函数名 → 中文短语，如 `ScanLot: 批次扫片`、
-  `CheckFlow: 获取冷却流量`）由 `log_message()` 自动插在方向符**之后**：
-  `... enter 批次扫片 开始 ...` / `... 批次扫片 end ...`。**新增调用链函数必须同步登记**，
-  否则静默退回英文函数名（看到「ScanWafer 开始」就是漏登记）。selftest 有全覆盖断言。
+- **🔴 正文一律英文（硬约束，别改回中文）**：真实机台的调试 / 执行器 / 运行事件日志
+  **没有中文**。模拟器混中文会被一眼看穿是假数据，也让人「按关键字检索」的习惯无法迁移到真机。
+  selftest 现在有「日志正文全英文」断言，把渲染出来的每一行过一遍（CJK 字符直接失败）。
+  用户明确纠正过一次：第一版关键字表全写成了中文（`批次扫片` 之类），被要求全部改英文。
+- **关键字模板**：`loggen.PHASE_KEYWORDS`（函数名 → **英文**短语，如 `ScanLot: lot scan`、
+  `CheckFlow: coolant flow read`）由 `log_message()` 自动插在方向符**之后**：
+  `... enter lot scan start ...` / `... lot scan end ...`。**新增调用链函数必须同步登记**，
+  否则静默退回函数名当关键字（看到「ScanWafer start」而不是「wafer scan start」就是漏登记）。
+  selftest 有全覆盖断言。短语要能自然接 `start`/`end`（用 `wafer load` 而非 `load wafer`，
+  避开 `start measurement` 这种自带动词的，否则出口变 `start measurement end`）。
 - **流程阶段框**：`loggen.expand_stage_groups(rows)` 给「每条流上连续的同阶段」套
   `[Stage_<码>]` 框，入参 `(流标识, 阶段码或 None, 级别, 函数, 相位, 正文)`，
   返回**固定五元组** `(流标识, 级别, 函数, 相位, 正文)`（形状与 `_ROUND_ROWS` 扁平化一致）。

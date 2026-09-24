@@ -143,10 +143,14 @@ agent_created: true
 真实日志不是散句，规则是：
 
 ```
-[函数名] >() enter <关键字> 开始 <入参>    <- 入口
-[函数名] <普通正文>                        <- 函数体内日志
-[函数名] <() leave <关键字> end <耗时/状态> <- 出口
+[函数名] >() enter <关键字> start <入参>     <- 入口
+[函数名] <普通正文>                          <- 函数体内日志
+[函数名] <() leave <关键字> end <耗时/状态>   <- 出口
 ```
+
+⚠️ **正文一律英文（硬约束）**：真实机台的调试日志 / 执行器日志 / 运行事件日志**没有中文**。
+模拟器里混进中文会一眼看穿是假数据，而且会让用户"按关键字检索"的习惯无法迁移到真机 ——
+`selftest` 的「日志正文全英文」会把渲染出来的每一行过一遍，出现中日韩字符直接失败。
 
 - 权威定义：`frontend/src/rendering/foldingRules.ts` 的内置规则 `builtin-explicit-boundary`
   （`startKeyword: '> ()'` / `endKeyword: '< ()'`）；`App.tsx` 显示成「函数开始 >()」「函数结束 <()」。
@@ -178,24 +182,26 @@ agent_created: true
 函数名和裸参数：
 
 ```
-[ScanWafer] >() enter 晶圆扫片 开始 wafer=W07 recipe=SPM-V2026.09.21
-[ScanWafer] <() leave 晶圆扫片 end wafer=W07 elapsed=86.4ms status=ok
-                   ^^^^^^^^ 关键字来自 loggen.PHASE_KEYWORDS，出入口同一份
+[ScanWafer] >() enter wafer scan start wafer=W07 recipe=SPM-V2026.09.21
+[ScanWafer] <() leave wafer scan end wafer=W07 elapsed=86.4ms status=ok
+                   ^^^^^^^^^^ 关键字来自 loggen.PHASE_KEYWORDS，出入口同一份
 
-[Stage_EXPOSURE] >() enter 曝光阶段 开始 step=3/12 wafer=W07 lot=LOT-...
-  [ExposeWafer] >() enter 曝光扫描 开始 ...
-  [ExposeWafer] <() leave 曝光扫描 end ...
-[Stage_EXPOSURE] <() leave 曝光阶段 end step=3/12 status=aborted elapsed=...
+[Stage_EXPOSURE] >() enter exposure stage start step=3/12 wafer=W07 lot=LOT-...
+  [ExposeWafer] >() enter exposure scan start ...
+  [ExposeWafer] <() leave exposure scan end ...
+[Stage_EXPOSURE] <() leave exposure stage end step=3/12 status=aborted elapsed=...
 ```
 
 **关键字模板**
 
-- 表在 `loggen.PHASE_KEYWORDS`（函数名 → 中文短语，如 `ScanLot: 批次扫片`、
-  `CheckFlow: 获取冷却流量`、`ExposeWafer: 曝光扫描`）。`log_message()` 自动插入：
-  入口 `... enter <关键字> 开始 <正文>`，出口 `... <关键字> end <正文>`。
-- **新增调用链函数必须同步登记**，否则会**静默**退回英文函数名当关键字
-  （看到「ScanWafer 开始」而不是「晶圆扫片 开始」就是漏登记）。
+- 表在 `loggen.PHASE_KEYWORDS`（函数名 → **英文**短语，如 `ScanLot: lot scan`、
+  `CheckFlow: coolant flow read`、`ExposeWafer: exposure scan`）。`log_message()` 自动插入：
+  入口 `... enter <关键字> start <正文>`，出口 `... <关键字> end <正文>`。
+- **新增调用链函数必须同步登记**，否则会**静默**退回函数名当关键字
+  （看到「ScanWafer start」而不是「wafer scan start」就是漏登记）。
   selftest 的「调用链函数都有关键字模板」就是查这个全覆盖。
+- 关键字短语要能自然接 `start` / `end`（用 `wafer load` 而不是 `load wafer`，
+  别选 `start measurement` 这种自带动词的，否则出口会变成 `start measurement end`）。
 - 关键字放在方向符**之后**；函数名必须在方向符**之前**且是英文标识符
   （`BOUNDARY_NAME_REGEX` 不接受中文，也不能紧邻另一个 `[]`）。
 
@@ -255,9 +261,9 @@ agent_created: true
 
 ```bash
 cd backend && .venv/bin/python -m simremote.cli init          # 生成（会同时重建报告站夹具）
-.venv/bin/python -m simremote.cli stream --interval 0.5       # 实时日志源（改动后必须重启）
-.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 96/96）
-# 实时内容相关的断言需要日志源已跑满一整轮（76 行剧本 ≈ 38s），刚重启时会报「跳过」
+.venv/bin/python -m simremote.cli stream --interval 1         # 实时日志源（改动后必须重启）
+.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 97/97）
+# 实时内容相关的断言需要日志源已跑满一整轮（76 行剧本 ≈ 76s @1s/行），刚重启时会报「跳过」
 # 注意 selftest 只覆盖后端直连路径，还要过一遍真实 HTTP：
 curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
   -H 'Content-Type: application/json' -d '{"url":"..."}'
@@ -265,6 +271,15 @@ curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
 
 改了日志正文后，**`init` 与日志源都要重启**：`init` 重写批量日志树，日志源则要重新读剧本
 （它在启动时把剧本编译进进程）。只重启一个会看到新旧格式混在同一份文件里。
+
+⚠️ 顺序必须是 **停 `stream` → `init` → `seed` → 起 `stream`**：不停流的话，旧进程会在
+`init` 重建文件之后**继续往新文件里追加旧格式的行**（实测残留 10~12 行旧语言）。
+
+⚠️ **`--interval` 是「每行间隔」，而剧本是 4 条流交错的一条扁平序列**，
+每 tick 只落一行 ⇒ 被观察的那条流实际 `4 × interval` 才走一行。
+`--interval 1` = 4 条流合计 1 行/秒、单条流约 4s 一行；
+要让自己盯的那条流 1 秒一行就给 `--interval 0.25`。改这个值记得同步
+`sim.sh` 的 `c_start_stream` 与 `selftest` 里那条 tail 等待窗口。
 
 前端用 agent-browser 走一遍（`type` 会吞点号，用 `eval` + 原生 setter 写受控输入）。
 整页 reload 会静默复位页内开关（例如「实时监听」），现象像"开关自己关了"，别误判成 bug。
@@ -275,13 +290,18 @@ curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
 ## 踩坑速查
 
 - **长跑进程要用独立会话启动，光靠 `nohup` 会被回收**：沙箱会把**工具调用的进程组**一起收走
-  （现象是日志文件 0 字节 = 被 SIGKILL），工具自带的后台任务能力也一样在下个 turn 被回收。
+  （现象是日志文件 0 字节 = 被 SIGKILL）。
   macOS 没有 `setsid`，用 `subprocess.Popen(..., start_new_session=True)`；判据是
   进程的 `pgid == sid == pid`（用 `os.getpgid/os.getsid` 读，沙箱里 `ps` 不可用）。
   停止逻辑以**端口/pidfile** 为准，别只信存活标志。
+- **起服务必须用「前台」工具调用（实测，`start_new_session=True` 也救不了后台）**：
+  把 `sim.sh start stream` 放进后台任务里，**后台任务一结束子进程就被收走** ——
+  症状是 spawn 日志只留启动横幅、没有「已停止」，进程消失而 pidfile 残留。
+  后台调用只用来跑**有始有终**的任务（`selftest` / `init` / `curl` 探测）。
+  诊断先看进程：`pgrep -f "simremote[.]cli stream"`；`ps` 被沙箱拦不代表进程不在。
 - **`tail -F` 走管道是全缓冲的**：一行 ~150B，要攒满 ~4KB（≈27 行）才 flush 一次，
   所以 SSE 里"订阅后第一行"要等 `27 × 间隔` 秒。自检的等待窗口按**产出速率**算
-  （0.5s/行 → ≥28s），按 tail 的响应速度算会隔几次假失败一次。真实机台同样如此。
+  （1s/行 → ≥60s），按 tail 的响应速度算会隔几次假失败一次。真实机台同样如此。
 - **跨模块关联的采样窗口要取整段活动文件**（≤1000 行）+ 整段归档；只取尾部 200 行会卡在
   两轮剧本之间。再加一条"实时内容不足一轮就跳过"的就绪判据，避免刚 `init` / 刚重启时假失败。
   窗口类断言（"最近 30 分钟命中 ≥N 行"）同样要**连归档一起读**，否则轮转刚发生过就假失败。
@@ -290,6 +310,14 @@ curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
 - **一次性删 >50 个文件会被受控环境的安全保护拦下**：脚本里是"转成人工确认、静默挂住"，
   长跑进程里是**静默失败**（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）。所以清理一律小批量
   （`PURGE_BUDGET_PER_RUN`）并按 mtime 排序；长跑进程的周期清理更要用**改名搬走**代替删除。
+- **配额是按「一个 assistant turn」计的 —— 同一轮跑两次 `init` 必炸**：
+  第一次 `init` 清理 ~49 个就把 50 的额度用光，第二次直接 `资产生成失败`。
+  后果很隐蔽：`cpdgen` 按**当前锚点**给批次命名，所以第二次 init 造出来的是一套**新文件名**，
+  旧的一套删不掉就留着了 → 每个模块目录 **8 个文件而不是 4 个**。
+  症状是 `selftest` 的「后端按报告窗口筛出数据表格」命中两张表（期望 1 张）。
+  修法（**不删除**，改名绕开配额）：`os.replace` 把旧批次搬进
+  `backend/simremote/run/recycle/cpd_stale/<镜像路径>`，按 mtime 分组
+  （新旧相差几十秒，取 `newest - 5s` 为界最稳；报告树和数据树必须**同样处理**，否则不同构）。
 - **`hash()` 有随机化**：用 `hash(module) % N` 算 pid/tid 时同一进程内稳定、跨进程会变；
   需要跨进程稳定的派生值（如 livesim 的 pid/tid/rpc 行号）用 `zlib.crc32`。
 - **日志时间锚点会漂**：造完数据隔久了前端查"最近 1 小时"就是空的，

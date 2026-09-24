@@ -241,7 +241,7 @@ def _test_html(spec: CaseSpec, line: CaseTimeline) -> bytes:
         "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
         f"<title>pytest report - {html.escape(spec.case_id)}</title></head><body>\n"
         "<h1>Test Report</h1>\n"
-        f'<p>开始 {line.start:%Y-%m-%d %H:%M:%S} · 结束 {line.stop:%Y-%m-%d %H:%M:%S}</p>\n'
+        f'<p>Started {line.start:%Y-%m-%d %H:%M:%S} · Finished {line.stop:%Y-%m-%d %H:%M:%S}</p>\n'
         '<table id="results-table">\n'
         "<thead><tr><th>Result</th><th>Test</th><th>Duration</th></tr></thead>\n"
         "<tbody>\n"

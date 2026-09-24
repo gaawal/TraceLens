@@ -51,8 +51,11 @@ from .loggen import (
 #: 活动文件行数上限。写满就轮转，保证前端「日志不超过 1000 行」的观感。
 MAX_LIVE_LINES = 1000
 
-#: 默认每秒产出节奏。0.5s 一行 ≈ 1000 行 / 8 分钟一轮。
-DEFAULT_INTERVAL_SECONDS = 0.5
+#: 每行间隔（秒）。1s 一行 ≈ 1000 行 / 17 分钟写满一轮活动文件。
+#: 注意剧本是**4 条流交错**的一条扁平序列，每 tick 只落一行，
+#: 所以被观察的那一条流实际是 ``4 × DEFAULT_INTERVAL_SECONDS`` 才走一行。
+#: 想让自己盯的那条流 1 秒一行，用 ``--interval 0.25``。
+DEFAULT_INTERVAL_SECONDS = 1.0
 
 #: 轮转后留给远端 ``tail -F`` 的检测窗口：BSD/GNU tail 都是每秒 stat 一次文件名，
 #: 太急着往新文件写，切换瞬间的那几行会被漏掉。
