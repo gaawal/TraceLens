@@ -8123,7 +8123,7 @@ export default function App() {
             />
             <SwitchControl
               checked={foldingEnabled}
-              label="折叠"
+              label="函数折叠"
               hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
               onChange={(checked) => setFoldingEnabled(checked)}
             />
