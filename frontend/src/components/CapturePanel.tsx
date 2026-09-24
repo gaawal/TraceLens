@@ -59,6 +59,7 @@ export function CapturePanel() {
   /** Per-extractor capture target, from the watch's capture_config (0 = continuous). */
   const [targets, setTargets] = useState<Record<string, number>>({});
   const [detailOpen, setDetailOpen] = useState(true);
+  const [liveExtractEnabled, setLiveExtractEnabled] = useState(false);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => subscribeLiveMonitoring((next) => {
@@ -192,8 +193,9 @@ export function CapturePanel() {
 
   if (!open) return null;
 
-  const activeCapture = captures.find((item) => item.rule.id === activeRuleId) || captures[0];
-  const totalRows = captures.reduce((total, item) => total + item.rows.length, 0);
+  const visibleCaptures = liveExtractEnabled ? captures : [];
+  const activeCapture = visibleCaptures.find((item) => item.rule.id === activeRuleId) || visibleCaptures[0];
+  const totalRows = visibleCaptures.reduce((total, item) => total + item.rows.length, 0);
   const errors = watches.filter((watch) => watch.last_error);
 
   return (
@@ -204,7 +206,7 @@ export function CapturePanel() {
           数据采集
         </span>
         <span className="capture-panel-counts">
-          {captures.length} 个采集器 · {totalRows} 条数据
+          {visibleCaptures.length} 个采集器 · {totalRows} 条数据
           {hits.length > 0 && <em> · {hits.length} 次命中</em>}
         </span>
         <button type="button" onClick={() => setCollapsed((value) => !value)} title={collapsed ? '展开' : '收起'}>
@@ -235,9 +237,10 @@ export function CapturePanel() {
             <button type="button" className="capture-panel-pick" onClick={openExtractorPicker} title="去「日志规则 → 数据提取」勾选要实时采集的提取器">
               <SlidersHorizontal size={11} /> 改选提取器
             </button>
+            <button type="button" className="capture-panel-pick primary" disabled={rules.length === 0} onClick={() => setLiveExtractEnabled(true)} title="勾选提取器后开始展示实时数据">实时提取</button>
           </div>
           <div className="capture-list" ref={scrollerRef}>
-            {captures.length === 0 && (
+            {visibleCaptures.length === 0 && (
               <div className="capture-empty">
                 {rules.length === 0
                   ? '还没有勾选实时采集的提取器。去「日志规则 → 数据提取」勾选后，实时监听才会采集它。'
@@ -251,7 +254,7 @@ export function CapturePanel() {
                       : '等待监控通道连接…'}
               </div>
             )}
-            {rules.map((rule) => {
+            {visibleCaptures.length > 0 && rules.map((rule) => {
               const rows = captures.find((item) => item.rule.id === rule.id)?.rows || [];
               const isActive = activeCapture?.rule.id === rule.id;
               // A progress bar only means something against a target. Inventing one that

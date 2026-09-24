@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="SN_SPM_RSPMCPD_DSPRSAR_MalFunc_001" tests="2" failures="1" errors="0" skipped="0" starttime="2026-09-24 06:54:26" endtime="2026-09-24 07:00:26">
+<testsuite name="SN_SPM_RSPMCPD_DSPRSAR_MalFunc_001" tests="2" failures="1" errors="0" skipped="0" starttime="2026-09-25 03:19:58" endtime="2026-09-25 03:25:58">
     <testcase classname="SN_SPM_RSPMCPD_DSPRSAR_MalFunc_001" name="test_sn_spm_rspmcpd_dsprsar_malfunc_001" time="742.310" result="failed">
       <failure message="AssertionError: expect ResultStatus.OK, real ResultStatus.FAILED">/data/atlog/run_case.py:121: in run_cpd
 /data/atlog/cpd_runner.py:444: in result_check

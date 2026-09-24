@@ -624,17 +624,23 @@ def check_live_rotation_cycle() -> None:
 
 def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器即可
     """校验一串 (函数, 相位, 正文) 是合法的调用栈轨迹，并回报结果。"""
-    from .loggen import PHASE_BODY, PHASE_ENTER, PHASE_LEAVE, log_message
+    from .loggen import PHASE_BODY, PHASE_ENTER, PHASE_LEAVE, keyword_of, log_message
 
     stack: list[str] = []
     problems: list[str] = []
     pairs = 0
     boundary_levels: set[str] = set()
+    # 入口/出口行必须带**固定关键字模板**：
+    #   ``[ScanWafer] >() enter 晶圆扫片 开始 ...``  /  ``... 晶圆扫片 end ...``
+    # 关键字让人一眼看出这一步在做什么；出口复用同一个关键字，不用回头翻入口
+    # 就能配对上。缺失就说明 PHASE_KEYWORDS 漏登记（会退回英文函数名）。
+    template_problems: list[str] = []
 
     for item in steps:
         function, phase, body = item[0], item[1], item[2]
         level = item[3] if len(item) > 3 else "INFO"
         rendered = log_message(function, phase, body)
+        keyword = keyword_of(function)
         if phase == PHASE_ENTER:
             match = ENTRY_MARKER_REGEX.search(rendered)
             if not match:
@@ -644,6 +650,8 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
             else:
                 boundary_levels.add(level)
                 stack.append(function)
+                if f"enter {keyword} 开始" not in rendered:
+                    template_problems.append(function)
         elif phase == PHASE_LEAVE:
             match = EXIT_MARKER_REGEX.search(rendered)
             if not match:
@@ -656,6 +664,8 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
                 boundary_levels.add(level)
                 stack.pop()
                 pairs += 1
+                if f"leave {keyword} end" not in rendered:
+                    template_problems.append(function)
         else:
             if ENTRY_MARKER_REGEX.search(rendered) or EXIT_MARKER_REGEX.search(rendered):
                 problems.append(f"{function} 正文行带了方向符")
@@ -675,6 +685,58 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
         boundary_levels <= {"INFO"},
         f"边界行级别 {sorted(boundary_levels) or '无'}",
     )
+    _record(
+        f"{label} 边界行带关键字模板",
+        not template_problems,
+        f"缺关键字 {sorted(set(template_problems))}" if template_problems
+        else f"{pairs} 组「关键字 开始 / 关键字 end」",
+    )
+
+
+def _validate_stage_frames(label: str, steps, codes) -> None:  # noqa: ANN001 - 迭代器即可
+    """阶段框：``[Stage_XXX] >() enter <阶段名> 开始 step=n/N ...`` 成对且序号递增。
+
+    这是"日志体现不同流程阶段"的落点：每到一个新阶段就开一个框，阶段内所有
+    子调用都嵌在框里。两条硬约束：
+
+    * **成对且 LIFO** —— 阶段框也是调用链，出口名字要逐字对上；
+    * **序号递增** —— 同一条流上的阶段顺序就是流程顺序，回退说明剧本写反了。
+    """
+    from .loggen import PHASE_ENTER, PHASE_LEAVE, STAGE_FUNCTION_PREFIX
+
+    order = {code: index for index, code in enumerate(codes)}
+    opened: list[str] = []
+    sequence: list[int] = []
+    problems: list[str] = []
+
+    for item in steps:
+        function, phase = item[0], item[1]
+        if not function.startswith(STAGE_FUNCTION_PREFIX):
+            continue
+        code = function[len(STAGE_FUNCTION_PREFIX):]
+        if code not in order:
+            problems.append(f"{function} 不在阶段序里")
+            continue
+        if phase == PHASE_ENTER:
+            opened.append(function)
+            sequence.append(order[code])
+        elif phase == PHASE_LEAVE:
+            if not opened or opened[-1] != function:
+                problems.append(f"{function} 阶段出口对不上（栈顶 {opened[-1] if opened else '空'}）")
+            else:
+                opened.pop()
+
+    if opened:
+        problems.append("阶段框未闭合：" + "、".join(opened))
+    if any(sequence[index] >= sequence[index + 1] for index in range(len(sequence) - 1)):
+        problems.append(f"阶段序号非递增 {sequence}")
+
+    _record(
+        f"{label} 阶段框成对且顺序递增",
+        not problems and len(sequence) > 1,
+        "；".join(problems) if problems
+        else f"{len(sequence)} 个阶段，序号 {[item + 1 for item in sequence]}",
+    )
 
 
 def check_log_call_chain() -> None:
@@ -693,6 +755,11 @@ def check_log_call_chain() -> None:
         "批量日志",
         [(fn, phase, body, level) for fn, phase, level, body in loggen._DEBUG_PROGRAM],
     )
+    _validate_stage_frames(
+        "批量日志",
+        [(fn, phase) for fn, phase, _level, _body in loggen._DEBUG_PROGRAM],
+        loggen.DEBUG_STAGE_CODES,
+    )
     for target in livesim.TARGETS:
         steps = [
             (function, phase, body, level)
@@ -700,6 +767,32 @@ def check_log_call_chain() -> None:
             if key == target.key
         ]
         _validate_call_chain(f"实时日志 {target.module}", steps)
+        _validate_stage_frames(
+            f"实时日志 {target.module}",
+            [(function, phase) for function, phase, _body, _level in steps],
+            livesim.STAGE_CODES,
+        )
+
+    # 关键字模板必须**全覆盖**：任何边界行函数没登记在 PHASE_KEYWORDS 里，就会
+    # 退回英文函数名当关键字，用户看到的就不是「晶圆扫片 开始」而是「ScanWafer 开始」。
+    from .loggen import PHASE_BODY
+
+    boundary_functions = {
+        function
+        for function, phase, _level, _body in loggen._DEBUG_PROGRAM
+        if phase != PHASE_BODY
+    } | {
+        function
+        for _key, _level, function, phase, _body in livesim._SCRIPT
+        if phase != PHASE_BODY
+    }
+    unregistered = sorted(boundary_functions - set(loggen.PHASE_KEYWORDS))
+    _record(
+        "调用链函数都有关键字模板",
+        not unregistered,
+        f"未登记 {unregistered}" if unregistered
+        else f"{len(boundary_functions)} 个函数全部登记在 PHASE_KEYWORDS",
+    )
 
     # 落盘抽查：活动文件里真的能看到方向符（剧本对不代表写出来的对）
     sample = Path(fleet.remote_to_local(fleet.UPPER, f"{fleet.UPPER.debug_root}/spwsp/spwsp.log"))

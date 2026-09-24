@@ -2674,7 +2674,7 @@ export function AiAssistant() {
                 {conversations.map((conversation) => (
                   <div key={conversation.id} className={`ai-cockpit-history-item ${conversation.id === activeConversation.id ? 'active' : ''} ${conversation.id === sendingConversationId ? 'is-running' : ''}`}>
                     <button type="button" onClick={() => { setActiveConversationId(conversation.id); setMobileHistoryOpen(false); }}>
-                      <strong>{conversation.title}</strong><small>{String(conversation.scopeContext?.page_label || conversation.scopeContext?.page || '页面快照')}{conversation.scopeContext?.environment_name ? ` · ${conversation.scopeContext.environment_name}` : ''}</small>
+                      <strong>{conversation.title}</strong><small>{String(conversation.scopeContext?.question || conversation.messages?.find((message) => message.role === 'user')?.content || conversation.scopeContext?.page_label || conversation.scopeContext?.page || '新会话').slice(0, 28)}{conversation.scopeContext?.environment_name ? ` · ${conversation.scopeContext.environment_name}` : ''}</small>
                       {conversation.id === sendingConversationId && (() => {
                         // The running conversation must be identifiable from the history list
                         // alone — you can switch away, let it work, and still see it is alive.

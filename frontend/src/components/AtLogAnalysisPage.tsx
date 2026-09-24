@@ -1659,6 +1659,15 @@ function buildAtLogAssistantCaseContext(
     event_evidence: eventEvidence,
     runtime_evidence: runtimeEvidence,
     loaded_evidence: runtimeEvidence,
+    selected_log_context: {
+      rows: compactAtLogDiagnosisMessages(collectedMessages, 120).map((row) => ({
+        level: row.level,
+        source: row.source_path || row.source,
+        line: row.line_number,
+        message: row.raw || row.message,
+      })),
+      description: '用户当前选择/加载的日志上下文，优先用于AI分析',
+    },
     loaded_log_rows: collectedMessages.length,
     parsed_log_entries: parsedLogEntries,
     persisted_ai_summary: aiResult ? {

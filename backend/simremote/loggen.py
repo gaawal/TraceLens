@@ -53,9 +53,9 @@ PURGE_BUDGET_PER_RUN = 40
 #
 # 日志正文不是随手写的句子，而是遵守固定规则：
 #
-#     [函数名] >() enter <入参>        <- 函数入口
-#     [函数名] <某个正文>              <- 函数体内的普通日志
-#     [函数名] <() leave <耗时/状态>    <- 函数出口
+#     [函数名] >() enter <关键字> 开始 <入参>     <- 函数入口
+#     [函数名] <某个正文>                         <- 函数体内的普通日志
+#     [函数名] <() leave <关键字> end <耗时/状态>  <- 函数出口
 #
 # 方向符 ``>()`` / ``<()`` 是这套规则的核心。TraceLens 的内置折叠规则
 # ``builtin-explicit-boundary``（``frontend/src/rendering/foldingRules.ts``，
@@ -63,12 +63,25 @@ PURGE_BUDGET_PER_RUN = 40
 # 「函数开始 >()」「函数结束 <()」）会把 ``[函数名]`` **按名字 LIFO 配对**，把一对
 # 入口/出口之间的日志收成一张可折叠的函数卡片。
 #
-# 两个必须守住的约束：
+# **关键字模板**：入口行在方向符之后先打一个**固定关键字**（见 PHASE_KEYWORDS），
+# 说明这一步在流程里干什么（``批次扫片`` / ``启动曝光`` / ``获取冷却流量``……），
+# 出口行打同一个关键字 + ``end``。这样：
+#
+# * 扫一眼就知道日志处在流程的哪一段，不用反推函数名；
+# * 入口/出口靠"同一个关键字"就能肉眼配对，也方便按关键字全局检索；
+# * 关键字是**固定模板**（一个函数永远同一句），所以可以当稳定的检索锚点。
+#
+# 三个必须守住的约束：
 #
 # * **同名**：出口的 ``[函数名]`` 要和入口逐字相同 —— 配对键就是这个字符串，
 #   差一个字母就变成一条永远合不上的调用；
 # * **LIFO**：入口压栈、出口出栈，子函数必须先于父函数闭合，否则前端会画出
-#   错乱嵌套，或者把父函数标成「未闭合」。
+#   错乱嵌套，或者把父函数标成「未闭合」；
+# * **关键字固定**：同一函数的入口/出口关键字必须一致，且不能随手改
+#   （改了等于把用户的检索习惯作废）。
+#
+# 另外用 ``[Stage_<阶段码>]`` 形式的框把一串调用包成**流程阶段**
+# （``Stage_EXPOSURE`` = 曝光阶段），这样日志既能看阶段、又能看阶段内部的调用链。
 
 ENTRY_MARKER = ">()"
 EXIT_MARKER = "<()"
@@ -77,14 +90,166 @@ PHASE_ENTER = "enter"
 PHASE_BODY = "body"
 PHASE_LEAVE = "leave"
 
+#: 阶段框的函数名前缀：``[Stage_WAFER_LOAD] >() ...``。
+STAGE_FUNCTION_PREFIX = "Stage_"
+
+#: 函数 -> 入口/出口行的**固定关键字模板**。
+#:
+#: 只覆盖调用链上的函数（正文行不带关键字）。新增函数时**必须**在这里登记，
+#: 否则会退回成拿函数名当关键字（selftest 会直接报出来）。
+PHASE_KEYWORDS: dict[str, str] = {
+    # ---- 扫片主流程 ----
+    "ScanLot": "批次扫片",
+    "ScanWafer": "晶圆扫片",
+    "LoadWafer": "晶圆装载",
+    "UnloadWafer": "晶圆卸载",
+    "MoveWaferStage": "工件台移动",
+    "AlignWafer": "对准测量",
+    "ExposeWafer": "曝光扫描",
+    "StabiliseSource": "光源稳定",
+    "MeasureOverlay": "套刻测量",
+    "RetryExposure": "曝光重试",
+    "HaltScan": "扫片停线",
+    "RecoverStage": "工件台恢复",
+    "ResumeExposure": "曝光续跑",
+    # ---- 编码器 / 冷却 / 互锁子系统 ----
+    "ServoLoop": "伺服循环",
+    "CheckEncoderFeedback": "获取编码器数据",
+    "CompensateJitter": "抖动补偿",
+    "CoolantLoop": "冷却循环",
+    "CheckFlow": "获取冷却流量",
+    "UpdateThermalBudget": "热预算核算",
+    "SourceInterlock": "光源互锁检查",
+    "TripInterlock": "互锁跳闸",
+    # ---- 流程阶段框 ----
+    "Stage_WAFER_LOAD": "上片阶段",
+    "Stage_ALIGNMENT": "对准阶段",
+    "Stage_EXPOSURE": "曝光阶段",
+    "Stage_SERVO_SAMPLE": "伺服采样阶段",
+    "Stage_COOLANT_FLOW": "冷却流量阶段",
+    "Stage_INTERLOCK_ARM": "互锁布防阶段",
+    "Stage_SERVO_COMPENSATE": "伺服补偿阶段",
+    "Stage_THERMAL_BUDGET": "热预算阶段",
+    "Stage_INTERLOCK_TRIP": "互锁跳闸阶段",
+    "Stage_INTERLOCK_RECOVER": "互锁恢复阶段",
+    "Stage_SCAN_HALT": "扫片停线阶段",
+    "Stage_SCAN_RECOVER": "扫片恢复阶段",
+    "Stage_MEASUREMENT": "测量阶段",
+    "Stage_UNLOAD": "卸片阶段",
+}
+
+
+def stage_function(code: str) -> str:
+    """阶段码 -> 阶段框的函数名。"""
+    return f"{STAGE_FUNCTION_PREFIX}{code}"
+
+
+def keyword_of(function: str) -> str:
+    """入口/出口行的固定关键字。没登记的函数退回函数名（selftest 会报未登记）。"""
+    return PHASE_KEYWORDS.get(function, function)
+
 
 def log_message(function: str, phase: str, body: str) -> str:
     """按调用链规则拼一行日志正文。"""
+    keyword = keyword_of(function)
     if phase == PHASE_ENTER:
-        return f"[{function}] {ENTRY_MARKER} enter {body}"
+        return f"[{function}] {ENTRY_MARKER} enter {keyword} 开始 {body}"
     if phase == PHASE_LEAVE:
-        return f"[{function}] {EXIT_MARKER} leave {body}"
+        return f"[{function}] {EXIT_MARKER} leave {keyword} end {body}"
     return f"[{function}] {body}"
+
+
+def stage_codes_of(rows) -> tuple[str, ...]:  # noqa: ANN001 - 迭代即可
+    """阶段码按**首次出现的顺序**排 —— 就是流程的阶段序号。"""
+    return tuple(dict.fromkeys(row[1] for row in rows if row[1]))
+
+
+def expand_stage_groups(rows) -> tuple:  # noqa: ANN001 - 迭代即可
+    """把带阶段码的行展开成扁平剧本，给**每条流上连续的同阶段**套一个阶段框。
+
+    入参每项 = ``(流标识, 阶段码或 None, 级别, 函数, 相位, 正文)``，
+    返回每项 = **固定五元组** ``(流标识, 级别, 函数, 相位, 正文)``。
+
+    ⚠️ 出口形状只有这一种：普通行与阶段框的**头/尾行**都走同一个 7 元组内部布局
+    ``(位置, 流, 阶段码, 级别, 函数, 相位, 正文)``。以前头/尾行按
+    ``(..., 函数, 相位, 级别, ...)`` 另建元组，结果同一个返回值里两种行的字段
+    含义不一样 —— 调用方按一种顺序解包，另一种就必然错位（实测会把
+    ``Stage_EXPOSURE`` 解到「级别」槽里、函数名变成 ``enter``）。
+
+    "连续"是按**该流自己**的步序判断的 —— 跨流的交错不算打断。所以一条流上的
+    同一阶段可以横跨别的流的若干阶段而仍然是同一个框（曝光阶段就是这样：spwsp
+    开在曝光前、合在互锁恢复之后，中间夹着编码器 / 冷却 / 互锁各自的阶段）。
+
+    阶段框本身也吃 ``PHASE_KEYWORDS`` 里的关键字模板，所以入口是
+    ``[Stage_EXPOSURE] >() enter 曝光阶段 开始 ...``、出口是 ``... 曝光阶段 end ...``。
+    """
+    stream_order: list[str] = []
+    rows_by_stream: dict[str, list[tuple[str | None, tuple]]] = {}
+    for position, row in enumerate(rows):
+        key = row[0]
+        if key not in rows_by_stream:
+            rows_by_stream[key] = []
+            stream_order.append(key)
+        # 内部行统一成 7 元组：位置 + 流 + 阶段码 + 级别 + 函数 + 相位 + 正文
+        rows_by_stream[key].append((row[1], (position, key, row[1], row[2], row[3], row[4], row[5])))
+
+    codes = stage_codes_of(rows)
+    total = len(codes)
+    ordinal_of = {code: index + 1 for index, code in enumerate(codes)}
+    items: list[tuple[int, list[tuple]]] = []
+
+    for key in stream_order:
+        stream_rows = rows_by_stream[key]
+        index = 0
+        while index < len(stream_rows):
+            code, row = stream_rows[index]
+            if code is None:
+                items.append((row[0], [row]))
+                index += 1
+                continue
+            end = index
+            while end + 1 < len(stream_rows) and stream_rows[end + 1][0] == code:
+                end += 1
+            group = [stream_rows[position][1] for position in range(index, end + 1)]
+            step = f"step={ordinal_of[code]}/{total}"
+            function = stage_function(code)
+            head = (
+                group[0][0], key, code, "INFO", function, PHASE_ENTER,
+                f"{step} wafer={{wafer}} lot={{lot}}",
+            )
+            tail = (
+                group[-1][0], key, code, "INFO", function, PHASE_LEAVE,
+                f"{step} status={_STAGE_STATUS.get(code, 'ok')} elapsed={{elapsed}}",
+            )
+            items.append((group[0][0], [head, *group, tail]))
+            index = end + 1
+
+    items.sort(key=lambda item: item[0])
+    return tuple(
+        (line[1], line[3], line[4], line[5], line[6])
+        for _position, lines in items
+        for line in lines
+    )
+
+
+#: 阶段框收尾时的状态。让阶段出口行也带真实结果（曝光是被互锁中止的、互锁是跳闸的……），
+#: 而不是清一色 ``status=ok`` —— 否则阶段框反而会掩盖故障。
+_STAGE_STATUS: dict[str, str] = {
+    "WAFER_LOAD": "ok",
+    "ALIGNMENT": "ok",
+    "EXPOSURE": "aborted",
+    "MEASUREMENT": "ok",
+    "UNLOAD": "ok",
+    "SERVO_SAMPLE": "degraded",
+    "COOLANT_FLOW": "low",
+    "INTERLOCK_ARM": "armed",
+    "SERVO_COMPENSATE": "degraded",
+    "THERMAL_BUDGET": "degraded",
+    "INTERLOCK_TRIP": "tripped",
+    "INTERLOCK_RECOVER": "recovered",
+    "SCAN_HALT": "halted",
+    "SCAN_RECOVER": "ok",
+}
 
 
 def source_line(function: str) -> int:
@@ -101,42 +266,76 @@ def call_mode(function: str) -> str:
     return "trace" if zlib.crc32(function.encode("utf-8")) % 3 == 0 else "normal"
 
 
-#: 调试日志的调用链程序：每项 = (函数名, 相位, 级别, 正文模板)。
+#: 调试日志的调用链程序：每项 = (阶段码或 None, 函数名, 相位, 级别, 正文模板)。
 #:
 #: 相位序列必须是一条合法的调用栈轨迹（入口/出口同名配对、LIFO 闭合）：
 #:
-#:     ScanLot >()  ScanWafer >()  LoadWafer >()  ...  <() LoadWafer  ...  <() ScanWafer  <() ScanLot
+#:     ScanLot >()  ScanWafer >()  [Stage_WAFER_LOAD] >()  MoveWaferStage >() ... <()
+#:
+#: 阶段码为 ``None`` 表示**不套阶段框**：最外层的 ``ScanLot``/``ScanWafer`` 要跨
+#: 整轮，套进阶段框就会让子阶段先闭合、父帧被迫跨框（LIFO 直接破掉）。
+#: 同一阶段里可以放多个函数（``EXPOSURE`` 里就有 ``ExposeWafer`` 和
+#: ``StabiliseSource``），也可以让同一个函数跨两条相邻的同阶段记录。
 #:
 #: 模板变量：{wafer} 晶圆号、{lot} 批次号、{elapsed} 本次调用耗时、{software} 软件版本。
 #:
 #: 级别约定：**入口/出口行固定 INFO，异常级别只落在正文行** —— 边界行只负责记
 #: 进出，正文才是产生告警的地方。
-_DEBUG_PROGRAM: tuple[tuple[str, str, str, str], ...] = (
-    ("ScanLot", PHASE_ENTER, "INFO", "lot={lot} wafers=25 recipe={software}"),
-    ("ScanWafer", PHASE_ENTER, "INFO", "wafer={wafer} recipe={software}"),
-    ("LoadWafer", PHASE_ENTER, "INFO", "wafer={wafer} source=loadport"),
-    ("MoveWaferStage", PHASE_ENTER, "INFO", "axis=XY target=chuck"),
-    ("MoveWaferStage", PHASE_BODY, "INFO", "wafer stage settled, position error within tolerance"),
-    ("MoveWaferStage", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
-    ("LoadWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("AlignWafer", PHASE_ENTER, "INFO", "wafer={wafer} marks=8"),
-    ("AlignWafer", PHASE_BODY, "INFO", "alignment mark detected, offset compensation applied"),
-    ("AlignWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("ExposeWafer", PHASE_ENTER, "INFO", "wafer={wafer} dose=30mJ/cm2"),
-    ("StabiliseSource", PHASE_ENTER, "INFO", "setpoint=250W"),
-    ("StabiliseSource", PHASE_BODY, "INFO", "illumination source power stabilised at setpoint"),
-    ("StabiliseSource", PHASE_LEAVE, "INFO", "setpoint=250W elapsed={elapsed} status=ok"),
-    ("ExposeWafer", PHASE_BODY, "INFO", "scan trajectory buffered and verified"),
-    ("ExposeWafer", PHASE_BODY, "WARN", "dose control loop reported within specification, margin=1.4%"),
-    ("ExposeWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("MeasureOverlay", PHASE_ENTER, "INFO", "wafer={wafer} sensor=interferometer"),
-    ("MeasureOverlay", PHASE_BODY, "DEBUG", "interferometer reading refreshed for wafer stage"),
-    ("MeasureOverlay", PHASE_BODY, "ERROR", "fringe contrast below limit, measurement retried"),
-    ("MeasureOverlay", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("UnloadWafer", PHASE_ENTER, "INFO", "wafer={wafer} destination=loadport"),
-    ("UnloadWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("ScanWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("ScanLot", PHASE_LEAVE, "INFO", "lot={lot} elapsed={elapsed} status=ok"),
+_DEBUG_GROUPS: tuple[tuple[str | None, tuple[tuple[str, str, str, str], ...]], ...] = (
+    (None, (
+        ("ScanLot", PHASE_ENTER, "INFO", "lot={lot} wafers=25 recipe={software}"),
+        ("ScanWafer", PHASE_ENTER, "INFO", "wafer={wafer} recipe={software}"),
+    )),
+    ("WAFER_LOAD", (
+        ("LoadWafer", PHASE_ENTER, "INFO", "wafer={wafer} source=loadport"),
+        ("MoveWaferStage", PHASE_ENTER, "INFO", "axis=XY target=chuck"),
+        ("MoveWaferStage", PHASE_BODY, "INFO", "wafer stage settled, position error within tolerance"),
+        ("MoveWaferStage", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+        ("LoadWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+    )),
+    ("ALIGNMENT", (
+        ("AlignWafer", PHASE_ENTER, "INFO", "wafer={wafer} marks=8"),
+        ("AlignWafer", PHASE_BODY, "INFO", "alignment mark detected, offset compensation applied"),
+        ("AlignWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+    )),
+    ("EXPOSURE", (
+        ("ExposeWafer", PHASE_ENTER, "INFO", "wafer={wafer} dose=30mJ/cm2"),
+        ("StabiliseSource", PHASE_ENTER, "INFO", "setpoint=250W"),
+        ("StabiliseSource", PHASE_BODY, "INFO", "illumination source power stabilised at setpoint"),
+        ("StabiliseSource", PHASE_LEAVE, "INFO", "setpoint=250W elapsed={elapsed} status=ok"),
+        ("ExposeWafer", PHASE_BODY, "INFO", "scan trajectory buffered and verified"),
+        ("ExposeWafer", PHASE_BODY, "WARN", "dose control loop reported within specification, margin=1.4%"),
+        ("ExposeWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+    )),
+    ("MEASUREMENT", (
+        ("MeasureOverlay", PHASE_ENTER, "INFO", "wafer={wafer} sensor=interferometer"),
+        ("MeasureOverlay", PHASE_BODY, "DEBUG", "interferometer reading refreshed for wafer stage"),
+        ("MeasureOverlay", PHASE_BODY, "ERROR", "fringe contrast below limit, measurement retried"),
+        ("MeasureOverlay", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+    )),
+    ("UNLOAD", (
+        ("UnloadWafer", PHASE_ENTER, "INFO", "wafer={wafer} destination=loadport"),
+        ("UnloadWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+    )),
+    (None, (
+        ("ScanWafer", PHASE_LEAVE, "INFO", "wafer={wafer} elapsed={elapsed} status=ok"),
+        ("ScanLot", PHASE_LEAVE, "INFO", "lot={lot} elapsed={elapsed} status=ok"),
+    )),
+)
+
+#: 批量日志的阶段序（按首次出现）。
+DEBUG_STAGE_CODES: tuple[str, ...] = tuple(code for code, _steps in _DEBUG_GROUPS if code)
+
+_DEBUG_PROGRAM: tuple[tuple[str, str, str, str], ...] = tuple(
+    (function, phase, level, body)
+    for _key, level, function, phase, body in expand_stage_groups(
+        [
+            # 入参布局与 expand_stage_groups 的文档一致：(流, 阶段码, 级别, 函数, 相位, 正文)
+            (None, code, level, function, phase, body)
+            for code, steps in _DEBUG_GROUPS
+            for function, phase, level, body in steps
+        ]
+    )
 )
 
 #: 程序里第一条 ERROR 正文的位置。失败用例的日志夹具要把错误行**钉在故障时刻**，

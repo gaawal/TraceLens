@@ -1079,7 +1079,7 @@ export function EnvironmentDeploymentDialog({ environment, initialTask, onClose,
             <h3>{task.target_version}</h3>
             <p>{task.task_name}</p>
             {task.message && <div className={`deployment-task-message ${task.status}`}>{task.message}</div>}
-            <dl>{task.scheduled_at && <div><dt>计划</dt><dd>{formatDateTime(task.scheduled_at)}</dd></div>}<div><dt>触发者</dt><dd>{task.trigger_operator || '—'}</dd></div><div><dt>来源 IP</dt><dd>{task.trigger_client_ip || '—'}</dd></div><div><dt>入口</dt><dd>{deploymentSourceLabel(task.trigger_source)}</dd></div><div><dt>开始</dt><dd>{formatDateTime(task.started_at)}</dd></div><div><dt>耗时</dt><dd>{durationText(task)}</dd></div></dl>
+            <dl>{task.scheduled_at && <div><dt>计划</dt><dd>{formatDateTime(task.scheduled_at)}</dd></div>}<div><dt>开始</dt><dd>{formatDateTime(task.started_at)}</dd></div><div><dt>耗时</dt><dd>{durationText(task)}</dd></div></dl>
           </div>
           <div className="deployment-step-timeline">
             <details className={`deployment-parallel-stage ${parallelStageStatus}`} open={parallelStageOpen} onToggle={(event) => setParallelStageOpen(event.currentTarget.open)}>
@@ -1119,11 +1119,6 @@ export function EnvironmentDeploymentDialog({ environment, initialTask, onClose,
         <section className="deployment-log-panel deployment-execution-detail-panel">
           {selectedStep ? <>
             <header><div><span className={`deployment-log-step-status ${selectedStep.status}`}>{statusIcon(selectedStep.status)} {STATUS_TEXT[selectedStep.status] || selectedStep.status}</span><h3>{selectedStep.name}</h3><p>{selectedStep.message || '等待步骤执行。'}</p></div><div className="deployment-log-metadata"><span>当前阶段：{selectedStep.name}</span><span>退出码：{selectedStep.exit_status ?? '—'}</span></div></header>
-            <div className="deployment-trigger-strip"><span>触发者 <strong>{task.trigger_operator || '—'}</strong></span><span>来源 IP <strong>{task.trigger_client_ip || '—'}</strong></span><span>入口 <strong>{deploymentSourceLabel(task.trigger_source)}</strong></span></div>
-            <div className="deployment-step-parameter-panel">
-              <h4>本步骤参数</h4>
-              {Object.entries(selectedStep.parameters || {}).length ? <dl>{Object.entries(selectedStep.parameters || {}).map(([key, value]) => <div key={key}><dt>{key}</dt><dd title={displayDeploymentParameter(value)}>{displayDeploymentParameter(value)}</dd></div>)}</dl> : <div className="deployment-parameter-empty">当前步骤没有额外参数。</div>}
-            </div>
             <div className="deployment-log-command"><span>执行命令</span><code>{selectedStep.command || '当前模式跳过此步骤'}</code></div>
             <DeploymentLogView key={`${task.id}:${selectedStep.key}`} text={selectedStep.process_log || `${selectedStep.stdout || ''}${selectedStep.stderr || ''}`} taskId={task.id} stepKey={selectedStep.key} />
           </> : <div className="deployment-log-empty">暂无部署步骤。</div>}

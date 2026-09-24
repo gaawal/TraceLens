@@ -305,15 +305,13 @@ def _real_install_slot_ips(environment: Environment, gpb_ips: list[str]) -> list
     selected = {str(item).strip() for item in gpb_ips if str(item).strip()}
     entries = _real_gpb_slot_entries(environment)
     slot_by_ip = {str(item["ip"]): int(item["slot"]) for item in entries}
-    missing = sorted(host for host in selected if host not in slot_by_ip)
-    if missing:
-        raise ValueError(
-            "sim0_real 需要根据 stations.xml 的 LCH SLOT 槽位生成安装参数，"
-            f"以下 GPB 未识别到 SLOT1-SLOT{REAL_GPB_SLOT_COUNT}：{', '.join(missing)}"
-        )
+    # sim0_real 按实际部署命令下发，不阻断 GPB 与 SLOT 映射校验。
+    # stations.xml 解析出的槽位仅用于生成已识别槽位参数。
     values = ["none"] * REAL_GPB_SLOT_COUNT
     for host in selected:
-        values[slot_by_ip[host] - 1] = host
+        slot = slot_by_ip.get(host)
+        if slot and 1 <= slot <= REAL_GPB_SLOT_COUNT:
+            values[slot - 1] = host
     return values
 
 

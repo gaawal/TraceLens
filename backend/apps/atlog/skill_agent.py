@@ -88,6 +88,26 @@ def _page_report_rows(case_context: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _context_evidence_rows(case_context: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    # 用户当前日志工作台选择的内容优先进入 AI 证据上下文。
+    # 这里不能只传模块/时间范围等元数据，必须把用户实际看到的日志行作为分析输入。
+    selected_context = case_context.get("selected_log_context")
+    if isinstance(selected_context, dict):
+        for item in list(selected_context.get("rows") or [])[:240]:
+            if not isinstance(item, dict):
+                continue
+            message = _safe_text(item.get("message") or item.get("raw"), 2200)
+            if not message:
+                continue
+            rows.append({
+                "time": _safe_text(item.get("time"), 80),
+                "level": _safe_text(item.get("level"), 32),
+                "component": _safe_text(item.get("component") or item.get("module"), 120),
+                "source_path": _safe_text(item.get("source_path") or item.get("source"), 320),
+                "source_kind": "selected_user_log",
+                "line_number": item.get("line_number") if item.get("line_number") is not None else item.get("line"),
+                "message": message,
+                "raw": message,
+            })
     for bucket, source_kind in (("event_evidence", "event"), ("runtime_evidence", "runtime"), ("loaded_evidence", "runtime")):
         for item in list(case_context.get(bucket) or [])[:48]:
             if not isinstance(item, dict):

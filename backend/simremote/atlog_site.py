@@ -6,7 +6,8 @@
 
 硬约束，逐条对应 ``apps/atlog/services.py``：
 
-* ``normalize_base_url`` 要求 host 是内网/回环地址 → 绑 ``127.0.0.1``；
+* ``normalize_base_url`` 要求 host 是内网/回环地址 → 监听**局域网 IP + 127.0.0.1**
+  （公网/VPN 地址会被拒，所以对外一律用内网地址）；
 * 目录链接必须带尾斜杠（``endswith("/")`` 判定 is_dir），``../`` 与 ``?`` 开头的会被忽略；
 * ``case_id`` = 用例目录名；summary XML 里 testcase 的 ``classname``/``name`` 必须
   **包含**它（大小写不敏感的子串匹配），否则分析会落到别的用例上；
@@ -29,6 +30,7 @@ import html
 import posixpath
 import socketserver
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -424,8 +426,12 @@ def generate(*, now: datetime | None = None, report: loggen.GenerationReport | N
 
 
 def case_urls(host: str | None = None, port: int | None = None) -> list[dict]:
-    """用例 URL 列表（含本地文件路径，便于核对生成结果）。"""
-    host = host or fleet.ATLOG_SITE_HOST
+    """用例 URL 列表（含本地文件路径，便于核对生成结果）。
+
+    默认 host 用**局域网 IP**（``fleet.public_host()``），因为这份 URL 是要
+    展示给用户、粘进「用例 URL 分析」的；本机探测仍走 127.0.0.1。
+    """
+    host = host or fleet.public_host()
     port = port or fleet.ATLOG_SITE_PORT
     values: list[dict] = []
     for spec in CASES:
@@ -664,6 +670,51 @@ class ReportSiteServer(ThreadingHTTPServer):
         super().__init__(address, handler)
 
 
+class ReportSiteGroup:
+    """报告站在多个地址上的监听集合（网络 IP + 回环）。
+
+    给用户粘贴的 URL 用的是局域网 IP，本机探测用 127.0.0.1，两个都要通，
+    所以同一端口起多个 server，各自在独立线程里 serve_forever。
+    """
+
+    def __init__(self, servers: list[ReportSiteServer]) -> None:
+        self.servers = servers
+        self._threads: list[threading.Thread] = []
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        self._threads = [
+            threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": poll_interval},
+                daemon=True,
+                name=f"site-{server.server_address[0]}",
+            )
+            for server in self.servers
+        ]
+        for thread in self._threads:
+            thread.start()
+        try:
+            while any(thread.is_alive() for thread in self._threads):
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            self.shutdown()
+            raise
+
+    def shutdown(self) -> None:
+        for server in self.servers:
+            try:
+                server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def server_close(self) -> None:
+        for server in self.servers:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def cpd_mounts() -> dict[str, Path]:
     """CPD 报告 / 测校数据在报告站上的虚拟挂载。
 
@@ -679,7 +730,7 @@ def cpd_mounts() -> dict[str, Path]:
 
 def cpd_urls(host: str | None = None, port: int | None = None) -> list[dict]:
     """每个 CPD 模块挑一份报告 + 一份测校数据表格，给出可直接粘贴的 URL。"""
-    host = host or fleet.ATLOG_SITE_HOST
+    host = host or fleet.public_host()
     port = port or fleet.ATLOG_SITE_PORT
     report_root = fleet.remote_to_local(fleet.UPPER, fleet.UPPER.cpd_report_root)
     data_root = fleet.remote_to_local(fleet.UPPER, fleet.UPPER.cpd_data_root)
@@ -707,13 +758,40 @@ def cpd_urls(host: str | None = None, port: int | None = None) -> list[dict]:
     return values
 
 
-def serve(host: str | None = None, port: int | None = None) -> ReportSiteServer:
-    """启动报告站（调用方负责 serve_forever / 关闭）。"""
-    host = host or fleet.ATLOG_SITE_HOST
+def serve(
+    host: str | None = None,
+    port: int | None = None,
+    hosts: tuple[str, ...] | None = None,
+) -> ReportSiteGroup:
+    """启动报告站（调用方负责 serve_forever / 关闭）。
+
+    默认同时绑 ``fleet.bind_hosts()``（局域网 IP + 回环）。传 ``host`` 则只绑那一个。
+    """
     port = int(port or fleet.ATLOG_SITE_PORT)
     if not SITE_ROOT.exists():
         raise RuntimeError(f"报告站尚未生成：{SITE_ROOT}，先跑 `python -m simremote.cli init`")
-    return ReportSiteServer((host, port), _ReportSiteHandler, SITE_ROOT, cpd_mounts())
+    if hosts is None:
+        hosts = (host,) if host else fleet.bind_hosts()
+    servers: list[ReportSiteServer] = []
+    try:
+        for bind_host in hosts:
+            servers.append(
+                ReportSiteServer((bind_host, port), _ReportSiteHandler, SITE_ROOT, cpd_mounts())
+            )
+    except OSError:
+        for server in servers:
+            server.server_close()
+        raise
+    return ReportSiteGroup(servers)
+
+
+def serve_forever(
+    host: str | None = None,
+    port: int | None = None,
+    hosts: tuple[str, ...] | None = None,
+) -> None:
+    group = serve(host, port, hosts)
+    group.serve_forever()
 
 
 def serve_forever(host: str | None = None, port: int | None = None) -> None:

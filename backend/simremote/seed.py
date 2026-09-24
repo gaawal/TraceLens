@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from django.db.models import ProtectedError
+
 from apps.environments.models import (
     Environment,
     EnvironmentStatus,
@@ -52,7 +54,9 @@ def _upsert_machine(spec: fleet.MachineSpec) -> Machine:
 def _ensure_environment(upper: Machine) -> Environment:
     environment = Environment.objects.filter(upper_machine=upper).first()
     if environment is None:
-        environment = Environment.objects.filter(name=fleet.ENVIRONMENT_NAME).first()
+        # 显式排序：不加 order_by 时 .first() 的顺序由数据库决定，同名的多个残留
+        # 环境会让每次 seed 认领到不同的那一个，清理逻辑也就跟着飘。
+        environment = Environment.objects.filter(name=fleet.ENVIRONMENT_NAME).order_by("id").first()
     if environment is None:
         environment = Environment(name=fleet.ENVIRONMENT_NAME, upper_machine=upper)
     environment.name = fleet.ENVIRONMENT_NAME
@@ -97,6 +101,46 @@ def _enable_run_profile() -> None:
     LogPathProfile.objects.filter(category=LogPathCategory.RUN).update(enabled=True)
 
 
+def _drop_stale_sim_entities(keep: Environment) -> dict[str, int]:
+    """清掉上一轮地址留下的残留：旧机器 **以及**还指着旧机器的同名环境。
+
+    模拟机的 host 会随网卡 / IP 变化（早期是 ``sim-upper.localhost``，现在换成
+    局域网 IP）。按 host 做 get_or_create 会攒下一堆连不上的旧机器；而
+    ``Environment.upper_machine`` 是 **PROTECT**，旧环境只要还不退绑，旧机器就
+    永远删不掉 —— 只清机器的话会卡在 ``ProtectedError`` 上，前端「环境资源」里
+    就会看到**两条同名的 SIM-EUV-01**，其中一条恒为 error（它的上位机早就连不上了）。
+
+    所以必须**先删环境、再删机器**。判定残留只看名字：机器名与环境名都是这套模拟
+    机独有的，因此「同名但 host 不是当前地址」的机器、「同名但不是当前环境」的环境
+    一律视为残留。必须在环境已经改绑到新机器之后调用。
+    """
+    removed = {"environments": 0, "machines": 0}
+
+    # 1) 先退绑并删掉同名的其它环境 —— 它正是旧机器被 PROTECT 住的原因
+    for environment in Environment.objects.filter(name=fleet.ENVIRONMENT_NAME).exclude(pk=keep.pk):
+        try:
+            MachineRelation.objects.filter(environment=environment).delete()
+            environment.delete()
+        except ProtectedError:
+            # 还有部署 / 监听之类指着它 —— 留着比删掉安全，下次再来
+            continue
+        removed["environments"] += 1
+
+    # 2) 此时旧机器不再被环境引用，可以删了
+    expected = {spec.name: spec.host for spec in fleet.FLEET}
+    for machine in Machine.objects.filter(name__in=list(expected)):
+        if machine.host == expected[machine.name]:
+            continue
+        MachineRelation.objects.filter(source_machine=machine).delete()
+        MachineRelation.objects.filter(target_machine=machine).delete()
+        try:
+            machine.delete()
+        except ProtectedError:
+            continue
+        removed["machines"] += 1
+    return removed
+
+
 def seed(*, refresh: bool = True) -> dict:
     settings_obj = ResourceSettings.get_solo()
     upper = _upsert_machine(fleet.UPPER)
@@ -104,6 +148,7 @@ def seed(*, refresh: bool = True) -> dict:
     lowers = _wire_topology(environment, upper)
     _configure_lower_credentials(lowers)
     _enable_run_profile()
+    cleaned = _drop_stale_sim_entities(environment)
 
     payload: dict = {
         "environment": environment.name,
@@ -112,6 +157,7 @@ def seed(*, refresh: bool = True) -> dict:
         "software_version": environment.software_version,
         "upper": f"{upper.name} ({upper.host}:{upper.ssh_port})",
         "lowers": [f"{item.name} ({item.host}:{item.ssh_port})" for item in lowers],
+        "cleaned": cleaned,
         "profiles": [
             f"{item.display_name}{'（启用）' if item.enabled else '（关闭）'}"
             for item in settings_obj.log_path_profiles.order_by("sort_order", "id")

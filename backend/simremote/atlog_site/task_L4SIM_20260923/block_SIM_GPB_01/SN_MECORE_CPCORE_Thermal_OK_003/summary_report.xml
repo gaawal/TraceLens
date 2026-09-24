@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="SN_MECORE_CPCORE_Thermal_OK_003" tests="2" failures="0" errors="0" skipped="0" starttime="2026-09-24 06:54:26" endtime="2026-09-24 07:00:26">
+<testsuite name="SN_MECORE_CPCORE_Thermal_OK_003" tests="2" failures="0" errors="0" skipped="0" starttime="2026-09-25 03:19:58" endtime="2026-09-25 03:25:58">
     <testcase classname="SN_MECORE_CPCORE_Thermal_OK_003" name="test_sn_mecore_cpcore_thermal_ok_003" time="318.420" result="passed"/>
     <testcase classname="SN_OTHER_case" name="test_sn_other_case" time="12.500" result="failed"/>
 </testsuite>

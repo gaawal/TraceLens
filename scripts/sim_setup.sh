@@ -34,4 +34,4 @@ NPM="$(resolve_npm)"
 info "安装前端依赖"
 (cd "$FRONTEND_DIR" && "$NPM" install --no-audit --no-fund)
 
-info "完成，接下来运行 scripts/sim_up.sh"
+info "完成，接下来运行 scripts/sim.sh start"

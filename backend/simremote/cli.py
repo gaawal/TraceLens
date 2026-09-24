@@ -98,6 +98,7 @@ def cmd_serve(_args: argparse.Namespace) -> int:
         print(f"机群启动失败：{exc}", file=sys.stderr)
         PID_FILE.unlink(missing_ok=True)
         return 1
+    print(f"  监听地址：{', '.join(server.bind_hosts)}")
     for spec in fleet.FLEET:
         print(f"  {spec.role:5s} {spec.name:12s} ssh {fleet.SIM_USERNAME}@{spec.host}:{spec.ssh_port}")
     print(f"机群已就绪（pid {os.getpid()}），Ctrl-C 退出")
@@ -152,9 +153,10 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
     from . import atlog_site
 
+    site_host = fleet.public_host()
     site_state = "运行中" if _port_open(fleet.ATLOG_SITE_HOST, fleet.ATLOG_SITE_PORT) else "未运行"
     site_pid = _read_pid(SITE_PID_FILE)
-    print(f"  ATLog 报告站 {fleet.ATLOG_SITE_HOST}:{fleet.ATLOG_SITE_PORT}  {site_state}"
+    print(f"  ATLog 报告站 http://{site_host}:{fleet.ATLOG_SITE_PORT}/  {site_state}"
           + (f"（pid {site_pid}）" if site_pid else ""))
     for item in atlog_site.case_urls():
         print(f"    [{item['status']:6s}] {item['url']}")
@@ -221,16 +223,19 @@ def cmd_site_serve(args: argparse.Namespace) -> int:
         print("报告站尚未生成，先跑 `python -m simremote.cli init`", file=sys.stderr)
         return 1
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    port = int(args.port)
+    hosts = (args.host,) if args.host else fleet.bind_hosts()
     try:
-        server = atlog_site.serve(args.host, args.port)
+        group = atlog_site.serve(port=port, hosts=hosts)
     except OSError as exc:
         print(f"报告站启动失败：{exc}", file=sys.stderr)
         return 1
     SITE_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
-    print(f"ATLog 用例报告站 http://{args.host}:{args.port}/")
-    for item in atlog_site.case_urls(args.host, args.port):
+    print(f"ATLog 用例报告站 监听 {', '.join(hosts)}:{port}")
+    print(f"  访问地址 http://{fleet.public_host()}:{port}/")
+    for item in atlog_site.case_urls(port=port):
         print(f"  [{item['status']:6s}] {item['url']}")
-    cpd = atlog_site.cpd_urls(args.host, args.port)
+    cpd = atlog_site.cpd_urls(port=port)
     if cpd:
         print("  CPD 测校报告 / 数据表格：")
         for item in cpd:
@@ -239,12 +244,12 @@ def cmd_site_serve(args: argparse.Namespace) -> int:
     print(f"报告站已就绪（pid {os.getpid()}），Ctrl-C 退出")
     sys.stdout.flush()
     try:
-        server.serve_forever(poll_interval=0.5)
+        group.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\n停止报告站")
     finally:
-        server.shutdown()
-        server.server_close()
+        group.shutdown()
+        group.server_close()
         SITE_PID_FILE.unlink(missing_ok=True)
     return 0
 
@@ -292,7 +297,7 @@ def cmd_site_stop(_args: argparse.Namespace) -> int:
 
 
 def cmd_stream(args: argparse.Namespace) -> int:
-    """前台运行实时日志源；由 scripts/sim_up.sh 用 nohup 放到后台。"""
+    """前台运行实时日志源；由 scripts/sim.sh 用独立会话放到后台。"""
     from . import livesim
 
     STREAM_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -392,7 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("site-url", cmd_site_url, "打印用例 URL"),
     ):
         item = sub.add_parser(name, help=help_text)
-        item.add_argument("--host", default=fleet.ATLOG_SITE_HOST, help="监听地址（默认 127.0.0.1）")
+        item.add_argument("--host", default=None, help="只绑这个地址（默认同时绑网络 IP 与 127.0.0.1）")
         item.add_argument("--port", type=int, default=fleet.ATLOG_SITE_PORT, help="监听端口（默认 8901）")
         item.set_defaults(func=func)
     return parser

@@ -1,6 +1,11 @@
 /** Semantic context providers; snapshots are immutable and belong to a chat. */
 type PageContext = Record<string, unknown>;
 const providers = new Map<symbol, {page: string; priority?: number; getContext: (base?: PageContext) => PageContext}>();
+let runtimeContextPatch: PageContext = {};
+export function updateAssistantRuntimeContext(patch: PageContext) {
+  runtimeContextPatch = { ...runtimeContextPatch, ...patch };
+}
+
 const SECRET = /password|passwd|secret|authorization|access.?token|api.?key|private.?key/i;
 export function cloneContext(value: PageContext): PageContext {
   const scrub = (item: unknown, depth = 0): unknown => {
@@ -26,13 +31,26 @@ export function collectPageContext(): PageContext {
     client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone};
   // Compatibility for existing pages. Registered providers override their legacy adapter.
   window.dispatchEvent(new CustomEvent('tracelens:assistant-context-request', {detail:{context}}));
+  Object.assign(context, runtimeContextPatch);
   for (const provider of [...providers.values()].sort((a,b) => (a.priority || 0)-(b.priority || 0))) {
     if (provider.page === '*' || provider.page === context.page || provider.page === url.searchParams.get('page')) Object.assign(context, provider.getContext(context));
   }
   return cloneContext(context);
 }
+function generateUUID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export function captureContextSnapshot(context = collectPageContext()): PageContext {
-  return {...cloneContext(context), snapshot_id: crypto.randomUUID(), captured_at: new Date().toISOString()};
+  return {...cloneContext(context), snapshot_id: generateUUID(), captured_at: new Date().toISOString()};
 }
 
 /** Migration adapter: pages keep their semantic reader while sharing one registry. */

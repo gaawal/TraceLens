@@ -3135,7 +3135,8 @@ function FunctionItem({
   );
   const autoSemanticCandidate = semanticDisplay.autoSemantics?.[semanticSourceKey(node.source.fileName, node.name)];
   const semanticMatch = semanticDisplay.enabled ? configuredSemanticMatch : undefined;
-  const autoSemantic = semanticDisplay.enabled ? autoSemanticCandidate : undefined;
+  // 源码自动语义属于解析结果，不受用户自定义标签开关影响。仅控制自定义规则显示。
+  const autoSemantic = autoSemanticCandidate;
   const semanticText = semanticMatch?.text ?? autoSemantic?.description;
   const semanticOrigin = semanticText
     ? semanticMatch
@@ -3889,6 +3890,37 @@ export default function App() {
   const [tasks, setTasks] = useState<LogTask[]>([]);
   const [activeTaskId, setActiveTaskId] = useState('');
   const taskSequenceRef = useRef(1);
+
+  // 刷新恢复仅保存任务入口，不保存日志/分析内容，避免浏览器存储爆满。
+  const CASE_URL_STATE_KEY = 'tracelens-case-url-state-v1';
+  useEffect(() => {
+    try {
+      const compact = tasks.map((task) => ({
+        id: task.id,
+        name: task.name,
+        createdAt: task.createdAt,
+        remoteEnvironmentId: task.remoteEnvironmentId,
+        urls: task.sources
+          .map((source) => source.sourcePath)
+          .filter((item): item is string => Boolean(item)),
+      })).filter((item) => item.urls.length > 0);
+
+      window.localStorage.setItem(CASE_URL_STATE_KEY, JSON.stringify({
+        activeTaskId,
+        tasks: compact,
+      }));
+
+      // 清理旧版本完整快照，避免历史版本残留继续占用空间。
+      [
+        'case_workspace_state',
+        'tracelens-case-workspace-state',
+        'tracelens-ai-context-snapshot',
+        'tracelens-context-snapshot-v1',
+      ].forEach((key) => window.localStorage.removeItem(key));
+    } catch {
+      // 存储空间不足时不影响当前日志分析。
+    }
+  }, [tasks, activeTaskId]);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [selectedProcessId, setSelectedProcessId] = useState<string>();
   const [selectedThreadId, setSelectedThreadId] = useState<string>();
@@ -4598,7 +4630,7 @@ export default function App() {
     for (const entry of task.entries) {
       const sourceFile = entry.source.fileName;
       const functionName = entry.boundaryFunctionName || entry.functionName;
-      if (!sourceFile?.toLowerCase().endsWith('.py') || !functionName) continue;
+      if (!sourceFile || !functionName) continue;
       const key = semanticSourceKey(sourceFile, functionName);
       if (!key || unique.has(key)) continue;
       unique.set(key, { key, source_file: sourceFile, source_line: entry.source.lineNumber, function_name: functionName });
@@ -4606,11 +4638,11 @@ export default function App() {
     }
 
     if (!targets.length || unique.size === 0) {
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'ready', autoSemantics: {}, semanticAutoMessage: '当前任务没有可自动识别的 Python 函数' } : item));
+      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'ready', autoSemantics: {}, semanticAutoMessage: '当前任务没有可自动识别的源码函数或日志未关联源码位置' } : item));
       return;
     }
 
-    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'loading', semanticAutoMessage: `正在识别 ${unique.size} 个 Python 函数语义` } : item));
+    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'loading', semanticAutoMessage: `正在识别 ${unique.size} 个源码函数语义` } : item));
     void recognizeSemanticSourcesBatch(task.remoteEnvironmentId, { items: [...unique.values()], fm_targets: targets })
       .then((payload) => {
         const autoSemantics = Object.fromEntries(payload.results.map((result) => [result.key, result]));
@@ -8418,6 +8450,8 @@ export default function App() {
           error={dataExtractionDialog.error}
           recordSaved={dataExtractionDialog.recordSaved}
           datasetName={activeTask?.name || '当前提取数据'}
+          liveListening={liveListening}
+          onStartLiveExtraction={() => { void startSelectedDataExtraction(); }}
           onToggle={(id) => setDataExtractionDialog((current) => { const next = new Set(current.selectedIds); next.has(id) ? next.delete(id) : next.add(id); return { ...current, selectedIds: next }; })}
           onStart={() => void startSelectedDataExtraction()}
           onCancel={() => dataExtractionAbortRef.current?.abort()}

@@ -18,7 +18,7 @@
 #       (KeepAlive=true)，且 `brew services` 在当前 macOS 上已报错不可用，
 #       所以停止动作直接走 launchctl bootout/unload。
 #
-# 启动参数与 scripts/sim_up.sh、docker-compose 保持一致：
+# 启动参数与 scripts/sim.sh、docker-compose 保持一致：
 #       无持久化 + allkeys-lru + 2gb 上限；pidfile / 日志落在 scripts/run/。
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
@@ -328,5 +328,5 @@ esac
 echo "------------------------------------------------------------"
 show_health || true
 echo "------------------------------------------------------------"
-echo " 重启整个模拟环境：scripts/sim_up.sh"
+echo " 重启整个模拟环境：scripts/sim.sh restart"
 echo "============================================================"

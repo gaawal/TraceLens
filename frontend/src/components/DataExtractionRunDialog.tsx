@@ -32,6 +32,8 @@ interface Props {
   onDownloadMerged: (results: DataExtractionResultView[]) => void;
   onOpenData: () => void;
   datasetName?: string;
+  liveListening?: boolean;
+  onStartLiveExtraction?: () => void;
 }
 
 export function DataExtractionRunDialog(props: Props) {
@@ -136,7 +138,7 @@ export function DataExtractionRunDialog(props: Props) {
       </div>
 
       <footer>
-        {props.phase === 'select' && <><button className="button ghost" onClick={props.onClose}>取消</button><button className="button primary" disabled={!props.candidates.length || props.selectedIds.size === 0} onClick={props.onStart}>开始提取</button></>}
+        {props.phase === 'select' && <><button className="button ghost" onClick={props.onClose}>取消</button>{props.liveListening && <button className="button secondary" disabled={props.selectedIds.size === 0} onClick={props.onStartLiveExtraction}>实时提取</button>}<button className="button primary" disabled={!props.candidates.length || props.selectedIds.size === 0} onClick={props.onStart}>开始提取</button></>}
         {props.phase === 'running' && <button className="button danger" onClick={props.onCancel}><Square size={14}/> 停止提取</button>}
         {(props.phase === 'done' || props.phase === 'error') && <><button className="button secondary" onClick={props.onClose}>关闭</button>{props.recordSaved && <button className="button primary" onClick={props.onOpenData}>进入数据</button>}</>}
       </footer>

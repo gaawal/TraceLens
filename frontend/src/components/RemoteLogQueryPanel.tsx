@@ -1,4 +1,4 @@
-import { registerPageContextReader } from '../assistant/contextRegistry';
+import { registerPageContextReader, updateAssistantRuntimeContext } from '../assistant/contextRegistry';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
@@ -713,6 +713,18 @@ export function RemoteLogQueryPanel({
       keyword: taskQuery.trim(),
     });
   }, [onLocatorStateChange, selectedEnvironment, selectedSources, selectedTargets, startTime, endTime, taskQuery]);
+
+  useEffect(() => {
+    updateAssistantRuntimeContext({
+      current_log_selection: {
+        environment_id: selectedEnvironment?.id ?? null,
+        source_categories: Array.from(selectedSources),
+        targets: selectedLiveTargets(),
+        time_range: { start: startTime.trim(), end: endTime.trim() },
+        keyword: taskQuery.trim(),
+      }
+    });
+  }, [selectedEnvironment, selectedSources, selectedTargets, startTime, endTime, taskQuery]);
 
   // Feed the exact live log-locator selection into TracePilot. The parent App
   // contributes task/result metadata, while this panel owns the current form state.

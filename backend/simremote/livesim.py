@@ -40,8 +40,10 @@ from .loggen import (
     PHASE_BODY,
     PHASE_ENTER,
     PHASE_LEAVE,
+    expand_stage_groups,
     log_message,
     source_line,
+    stage_codes_of,
 )
 
 # --------------------------------------------------------------------------- 常量
@@ -105,86 +107,119 @@ _TARGET_BY_KEY = {item.key: item for item in TARGETS}
 
 # --------------------------------------------------------------------------- 剧本
 #
-# 每项 = (目标流, 级别, 函数名, 相位, 正文模板)。模板变量：
+# 一轮剧本 = 一段**流程阶段**推进：上片 → 对准 → 曝光（期间下位机各子系统在跑
+# 自己的阶段）→ 互锁跳闸 → 扫片停线 → 恢复，然后回到新的批次 / 晶圆。
+#
+# 每项 = (目标流, 阶段码, 级别, 函数名, 相位, 正文模板)。模板变量：
 #   {trace} 本轮故障追踪号   {lot} 批次号   {wafer} 晶圆号
 #   {rms} {rms2} 编码器抖动读数   {flow} 冷却流量   {elapsed} 本次调用耗时
 #
 # 相位决定正文长什么样（见 ``loggen.log_message``）：
-#   enter -> ``[ScanWafer] >() enter wafer=W07 ...``
+#   enter -> ``[ScanWafer] >() enter 晶圆扫片 开始 wafer=W07 ...``
 #   body  -> ``[ScanWafer] 普通正文``
-#   leave -> ``[ScanWafer] <() leave wafer=W07 elapsed=86.4ms status=ok``
+#   leave -> ``[ScanWafer] <() leave 晶圆扫片 end wafer=W07 elapsed=86.4ms status=ok``
+# 入口/出口那句**固定关键字**（「晶圆扫片」「曝光扫描」「获取冷却流量」……）来自
+# ``loggen.PHASE_KEYWORDS``；出口复用同一个关键字 + ``end``，肉眼就能配对。
 #
-# 两条必须守住的约束：
+# 阶段码把一串调用包成 ``[Stage_<阶段码>]`` 阶段框（展开逻辑在
+# ``loggen.expand_stage_groups``）。码为 ``None`` 表示不套框 —— ``ScanLot`` /
+# ``ScanWafer`` 要跨整轮，套进阶段框就会让子阶段先闭合、父帧被迫跨框。
+#
+# 三条必须守住的约束：
 #
 # * **每条流内部按 LIFO 闭合**：同一条文件里的入口/出口要能压栈配对，
 #   子函数先于父函数闭合。跨流交错是允许的（不同文件本来就不同进程），
 #   但同一条流内的出现顺序就是它的调用栈轨迹。
+#   ⚠️ 推论：一个函数**不能跨两个阶段框**（例如把服务循环的开头放阶段 A、
+#   收尾放阶段 B）—— 阶段框比它晚开却要比它先合，栈立刻乱。
 # * **边界行只记进出**：入口/出口固定 INFO，异常级别只落在正文行 ——
 #   否则会出现 ``[X] <() leave status=ok`` 却标着 FATAL 这种自相矛盾的行。
+# * **阶段框的顺序就是流程顺序**：同一条流上阶段序号必须递增（selftest 会查）。
 #
 # ``cause=`` 里写的是**上游故障码**，这样三条异常在文本层面就能串成一条链，
 # 前端按关键字搜索任意一环都能找到整条因果链。
 
-_SCRIPT: tuple[tuple[str, str, str, str, str], ...] = (
-    # ---- 正常节拍：扫片主流程（spwsp），唯一一类"正常日志" ----
-    ("spwsp", "INFO", "ScanLot", PHASE_ENTER, "lot={lot} wafers=25"),
-    ("spwsp", "INFO", "ScanWafer", PHASE_ENTER, "wafer={wafer} recipe=SPM-V2026.09.21"),
-    ("spwsp", "INFO", "MoveWaferStage", PHASE_ENTER, "axis=XY target=chuck"),
-    ("spwsp", "INFO", "MoveWaferStage", PHASE_BODY, "wafer stage settled, position error within tolerance"),
-    ("spwsp", "INFO", "MoveWaferStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
-    ("spwsp", "INFO", "AlignWafer", PHASE_ENTER, "wafer={wafer} marks=8"),
-    ("spwsp", "INFO", "AlignWafer", PHASE_BODY, "alignment mark detected, offset compensation applied for wafer {wafer}"),
-    ("spwsp", "INFO", "AlignWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("spwsp", "INFO", "ExposeWafer", PHASE_ENTER, "wafer={wafer} dose=30mJ/cm2"),
-    ("spwsp", "INFO", "ExposeWafer", PHASE_BODY, "illumination source power stabilised at setpoint, dose within specification"),
-    # ---- 异常① 编码器反馈抖动（encoder 流）：故障链起点 ----
-    ("encoder", "INFO", "ServoLoop", PHASE_ENTER, "axis=Rz loop=position"),
-    ("encoder", "INFO", "CheckEncoderFeedback", PHASE_ENTER, "axis=Rz threshold=0.50um"),
-    ("encoder", "WARN", "CheckEncoderFeedback", PHASE_BODY, "encoder feedback jitter rms={rms}um exceeds threshold 0.50um axis=Rz code=ERR_MECORE_ENC_JITTER trace={trace}"),
-    ("encoder", "WARN", "CheckEncoderFeedback", PHASE_BODY, "encoder feedback jitter persists after filter update rms={rms2}um code=ERR_MECORE_ENC_JITTER trace={trace}"),
-    ("encoder", "INFO", "CheckEncoderFeedback", PHASE_LEAVE, "axis=Rz elapsed={elapsed} status=degraded"),
-    ("encoder", "INFO", "CompensateJitter", PHASE_ENTER, "axis=Rz"),
-    ("encoder", "ERROR", "CompensateJitter", PHASE_BODY, "servo loop gain reduced to compensate jitter, position stability degraded code=ERR_MECORE_ENC_JITTER trace={trace}"),
-    ("encoder", "INFO", "CompensateJitter", PHASE_LEAVE, "axis=Rz elapsed={elapsed} status=degraded"),
-    ("encoder", "INFO", "ServoLoop", PHASE_LEAVE, "axis=Rz status=degraded"),
-    # ---- 异常② 冷却回路流量不足（coolant 流）：起因是 ① 的伺服补偿持续发热 ----
-    ("coolant", "INFO", "CoolantLoop", PHASE_ENTER, "loop=cpfr-mecore setpoint=5.0L/min"),
-    ("coolant", "INFO", "CheckFlow", PHASE_ENTER, "loop=cpfr-mecore"),
-    ("coolant", "WARN", "CheckFlow", PHASE_BODY, "coolant flow {flow}L/min below threshold 5.0L/min loop=cpfr-mecore code=ERR_CPFR_FLOW_LOW cause=ERR_MECORE_ENC_JITTER trace={trace}"),
-    ("coolant", "INFO", "CheckFlow", PHASE_LEAVE, "loop=cpfr-mecore elapsed={elapsed} status=low"),
-    ("coolant", "INFO", "UpdateThermalBudget", PHASE_ENTER, "loop=cpfr-mecore"),
-    ("coolant", "ERROR", "UpdateThermalBudget", PHASE_BODY, "thermal load from mecore servo compensation exceeds budget code=ERR_CPFR_THERM_OVERLOAD cause=ERR_CPFR_FLOW_LOW trace={trace}"),
-    ("coolant", "INFO", "UpdateThermalBudget", PHASE_LEAVE, "loop=cpfr-mecore elapsed={elapsed} status=degraded"),
-    ("coolant", "INFO", "CoolantLoop", PHASE_LEAVE, "loop=cpfr-mecore status=degraded"),
-    # ---- 异常③ 光源互锁跳闸（interlock 流）：由 ② 的冷却退化触发 ----
-    ("interlock", "INFO", "SourceInterlock", PHASE_ENTER, "loop=sil state=armed"),
-    ("interlock", "ERROR", "SourceInterlock", PHASE_BODY, "source interlock armed, coolant loop degraded code=ERR_SIL_INTERLOCK_ARMED cause=ERR_CPFR_THERM_OVERLOAD trace={trace}"),
-    ("interlock", "INFO", "TripInterlock", PHASE_ENTER, "loop=sil reason=coolant_degraded"),
-    ("interlock", "FATAL", "TripInterlock", PHASE_BODY, "exposure aborted by interlock, wafer {wafer} held on stage code=ERR_SIL_INTERLOCK_TRIP cause=ERR_SIL_INTERLOCK_ARMED trace={trace}"),
-    ("interlock", "INFO", "TripInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=tripped"),
-    ("interlock", "INFO", "SourceInterlock", PHASE_BODY, "interlock cleared after coolant flow restored to 5.4L/min code=ERR_SIL_INTERLOCK_TRIP trace={trace}"),
-    ("interlock", "INFO", "SourceInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=recovered"),
-    # ---- 异常在扫片侧的升级：WARN → ERROR → FATAL，并给出 recovery ----
+_ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
+    # ---- 引子：扫片主流程的最外层帧（跨整轮，不套阶段框） ----
+    ("spwsp", None, "INFO", "ScanLot", PHASE_ENTER, "lot={lot} wafers=25"),
+    ("spwsp", None, "INFO", "ScanWafer", PHASE_ENTER, "wafer={wafer} recipe=SPM-V2026.09.21"),
+    # ---- 阶段①：上片 ----
+    ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_ENTER, "axis=XY target=chuck"),
+    ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_BODY, "wafer stage settled, position error within tolerance"),
+    ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    # ---- 阶段②：对准 ----
+    ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_ENTER, "wafer={wafer} marks=8"),
+    ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_BODY, "alignment mark detected, offset compensation applied for wafer {wafer}"),
+    ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
+    # ---- 阶段③：曝光开始。这个框在 spwsp 上要一直开到互锁恢复之后才合
+    #      （中间夹着编码器 / 冷却 / 互锁各自的阶段，但那些是别的文件，不打断本流）----
+    ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_ENTER, "wafer={wafer} dose=30mJ/cm2"),
+    ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_BODY, "illumination source power stabilised at setpoint, dose within specification"),
+    # ---- 阶段④：伺服采样（编码器流）→ 异常① 故障链起点 ----
+    ("encoder", "SERVO_SAMPLE", "INFO", "ServoLoop", PHASE_ENTER, "axis=Rz loop=position"),
+    ("encoder", "SERVO_SAMPLE", "INFO", "CheckEncoderFeedback", PHASE_ENTER, "axis=Rz threshold=0.50um"),
+    ("encoder", "SERVO_SAMPLE", "WARN", "CheckEncoderFeedback", PHASE_BODY, "encoder feedback jitter rms={rms}um exceeds threshold 0.50um axis=Rz code=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("encoder", "SERVO_SAMPLE", "WARN", "CheckEncoderFeedback", PHASE_BODY, "encoder feedback jitter persists after filter update rms={rms2}um code=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("encoder", "SERVO_SAMPLE", "INFO", "CheckEncoderFeedback", PHASE_LEAVE, "axis=Rz elapsed={elapsed} status=degraded"),
+    ("encoder", "SERVO_SAMPLE", "INFO", "ServoLoop", PHASE_LEAVE, "axis=Rz status=degraded"),
+    # ---- 阶段⑤：冷却流量（冷却流）→ 异常②，起因是 ① 的伺服补偿持续发热 ----
+    ("coolant", "COOLANT_FLOW", "INFO", "CoolantLoop", PHASE_ENTER, "loop=cpfr-mecore setpoint=5.0L/min"),
+    ("coolant", "COOLANT_FLOW", "INFO", "CheckFlow", PHASE_ENTER, "loop=cpfr-mecore"),
+    ("coolant", "COOLANT_FLOW", "WARN", "CheckFlow", PHASE_BODY, "coolant flow {flow}L/min below threshold 5.0L/min loop=cpfr-mecore code=ERR_CPFR_FLOW_LOW cause=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("coolant", "COOLANT_FLOW", "INFO", "CheckFlow", PHASE_LEAVE, "loop=cpfr-mecore elapsed={elapsed} status=low"),
+    ("coolant", "COOLANT_FLOW", "INFO", "CoolantLoop", PHASE_LEAVE, "loop=cpfr-mecore status=degraded"),
+    # ---- 阶段⑥：互锁布防（互锁流）→ 异常③ 的前置条件 ----
+    ("interlock", "INTERLOCK_ARM", "INFO", "SourceInterlock", PHASE_ENTER, "loop=sil state=armed"),
+    ("interlock", "INTERLOCK_ARM", "ERROR", "SourceInterlock", PHASE_BODY, "source interlock armed, coolant loop degraded code=ERR_SIL_INTERLOCK_ARMED cause=ERR_CPFR_THERM_OVERLOAD trace={trace}"),
+    ("interlock", "INTERLOCK_ARM", "INFO", "SourceInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=armed"),
+    # ---- 阶段⑦：伺服补偿（编码器流）→ 对异常① 的处置 ----
+    ("encoder", "SERVO_COMPENSATE", "INFO", "CompensateJitter", PHASE_ENTER, "axis=Rz"),
+    ("encoder", "SERVO_COMPENSATE", "ERROR", "CompensateJitter", PHASE_BODY, "servo loop gain reduced to compensate jitter, position stability degraded code=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("encoder", "SERVO_COMPENSATE", "INFO", "CompensateJitter", PHASE_LEAVE, "axis=Rz elapsed={elapsed} status=degraded"),
+    # ---- 阶段⑧：热预算核算（冷却流）→ 异常② 升级 ----
+    ("coolant", "THERMAL_BUDGET", "INFO", "UpdateThermalBudget", PHASE_ENTER, "loop=cpfr-mecore"),
+    ("coolant", "THERMAL_BUDGET", "ERROR", "UpdateThermalBudget", PHASE_BODY, "thermal load from mecore servo compensation exceeds budget code=ERR_CPFR_THERM_OVERLOAD cause=ERR_CPFR_FLOW_LOW trace={trace}"),
+    ("coolant", "THERMAL_BUDGET", "INFO", "UpdateThermalBudget", PHASE_LEAVE, "loop=cpfr-mecore elapsed={elapsed} status=degraded"),
+    # ---- 阶段⑨：互锁跳闸（互锁流）→ 异常③ 落地 ----
+    ("interlock", "INTERLOCK_TRIP", "INFO", "TripInterlock", PHASE_ENTER, "loop=sil reason=coolant_degraded"),
+    ("interlock", "INTERLOCK_TRIP", "FATAL", "TripInterlock", PHASE_BODY, "exposure aborted by interlock, wafer {wafer} held on stage code=ERR_SIL_INTERLOCK_TRIP cause=ERR_SIL_INTERLOCK_ARMED trace={trace}"),
+    ("interlock", "INTERLOCK_TRIP", "INFO", "TripInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=tripped"),
+    # ---- 阶段⑩：互锁恢复（互锁流）----
+    ("interlock", "INTERLOCK_RECOVER", "INFO", "SourceInterlock", PHASE_ENTER, "loop=sil state=recovering"),
+    ("interlock", "INTERLOCK_RECOVER", "INFO", "SourceInterlock", PHASE_BODY, "interlock cleared after coolant flow restored to 5.4L/min code=ERR_SIL_INTERLOCK_TRIP trace={trace}"),
+    ("interlock", "INTERLOCK_RECOVER", "INFO", "SourceInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=recovered"),
+    # ---- 阶段③ 收尾：曝光确实被互锁中止了（spwsp 上的同一个曝光阶段框到此闭合）----
+    ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=aborted"),
+    # ---- 阶段⑪：扫片停线（spwsp）WARN → ERROR → FATAL，三级升级 ----
     # 前端「实时监听」一次只盯一个模块，所以被观察的那条流自己也必须把整条链的
     # 后果按三个级别记下来 —— 否则只订阅一个模块时只能看到 1 类异常，凑不齐
     # 「至少 3 类异常 + 1 类正常」，也就不方便验证实时监听的过滤/告警效果。
-    ("spwsp", "INFO", "ExposeWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=aborted"),
-    ("spwsp", "INFO", "RetryExposure", PHASE_ENTER, "wafer={wafer} attempt=1"),
-    ("spwsp", "WARN", "RetryExposure", PHASE_BODY, "exposure retry scheduled after interlock recovery code=ERR_SPWSP_RETRY_SCHEDULED cause=ERR_SIL_INTERLOCK_TRIP trace={trace}"),
-    ("spwsp", "ERROR", "RetryExposure", PHASE_BODY, "wafer stage handshake lost, retry aborted code=ERR_SPWSP_STAGE_HANDSHAKE cause=ERR_SPWSP_RETRY_SCHEDULED trace={trace}"),
-    ("spwsp", "INFO", "RetryExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=failed"),
-    ("spwsp", "INFO", "HaltScan", PHASE_ENTER, "wafer={wafer} reason=stage_handshake"),
-    ("spwsp", "FATAL", "HaltScan", PHASE_BODY, "scan sequence halted for wafer {wafer}, manual recovery required code=ERR_SPWSP_SCAN_HALTED cause=ERR_SPWSP_STAGE_HANDSHAKE trace={trace}"),
-    ("spwsp", "INFO", "HaltScan", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=halted"),
-    ("spwsp", "INFO", "RecoverStage", PHASE_ENTER, "wafer={wafer} loop=servo"),
-    ("spwsp", "INFO", "RecoverStage", PHASE_BODY, "recovery sequence completed, stage handshake restored, servo loop re-locked"),
-    ("spwsp", "INFO", "RecoverStage", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("spwsp", "INFO", "ResumeExposure", PHASE_ENTER, "wafer={wafer} from=checkpoint"),
-    ("spwsp", "INFO", "ResumeExposure", PHASE_BODY, "exposure sequence resumed, lot {lot} continues from checkpoint"),
-    ("spwsp", "INFO", "ResumeExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
-    ("spwsp", "INFO", "ScanWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=recovered"),
-    ("spwsp", "INFO", "ScanLot", PHASE_LEAVE, "lot={lot} elapsed={elapsed} status=ok"),
+    ("spwsp", "SCAN_HALT", "INFO", "RetryExposure", PHASE_ENTER, "wafer={wafer} attempt=1"),
+    ("spwsp", "SCAN_HALT", "WARN", "RetryExposure", PHASE_BODY, "exposure retry scheduled after interlock recovery code=ERR_SPWSP_RETRY_SCHEDULED cause=ERR_SIL_INTERLOCK_TRIP trace={trace}"),
+    ("spwsp", "SCAN_HALT", "ERROR", "RetryExposure", PHASE_BODY, "wafer stage handshake lost, retry aborted code=ERR_SPWSP_STAGE_HANDSHAKE cause=ERR_SPWSP_RETRY_SCHEDULED trace={trace}"),
+    ("spwsp", "SCAN_HALT", "INFO", "RetryExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=failed"),
+    ("spwsp", "SCAN_HALT", "INFO", "HaltScan", PHASE_ENTER, "wafer={wafer} reason=stage_handshake"),
+    ("spwsp", "SCAN_HALT", "FATAL", "HaltScan", PHASE_BODY, "scan sequence halted for wafer {wafer}, manual recovery required code=ERR_SPWSP_SCAN_HALTED cause=ERR_SPWSP_STAGE_HANDSHAKE trace={trace}"),
+    ("spwsp", "SCAN_HALT", "INFO", "HaltScan", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=halted"),
+    # ---- 阶段⑫：扫片恢复（spwsp）----
+    ("spwsp", "SCAN_RECOVER", "INFO", "RecoverStage", PHASE_ENTER, "wafer={wafer} loop=servo"),
+    ("spwsp", "SCAN_RECOVER", "INFO", "RecoverStage", PHASE_BODY, "recovery sequence completed, stage handshake restored, servo loop re-locked"),
+    ("spwsp", "SCAN_RECOVER", "INFO", "RecoverStage", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
+    ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_ENTER, "wafer={wafer} from=checkpoint"),
+    ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_BODY, "exposure sequence resumed, lot {lot} continues from checkpoint"),
+    ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
+    # ---- 收尾：最外层帧闭合（不套阶段框）----
+    ("spwsp", None, "INFO", "ScanWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=recovered"),
+    ("spwsp", None, "INFO", "ScanLot", PHASE_LEAVE, "lot={lot} elapsed={elapsed} status=ok"),
 )
+
+#: 实时流的阶段序（按首次出现）—— 就是流程的阶段序号。
+STAGE_CODES: tuple[str, ...] = stage_codes_of(_ROUND_ROWS)
+
+#: 扁平剧本：(目标流, 级别, 函数名, 相位, 正文模板)。阶段框已由展开器插好。
+#: ``expand_stage_groups`` 的输出形状与 ``_ROUND_ROWS`` 扁平化后**一致**，
+#: 所以这里直接转 tuple 即可 —— 再手动换位会把 level/function 拧反。
+_SCRIPT: tuple[tuple[str, str, str, str, str], ...] = tuple(expand_stage_groups(_ROUND_ROWS))
 
 SCRIPT_LENGTH = len(_SCRIPT)
 

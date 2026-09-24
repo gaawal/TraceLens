@@ -6,6 +6,11 @@
 
 from __future__ import annotations
 
+import ipaddress
+import os
+import re
+import socket
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +22,96 @@ SIM_PASSWORD = "tracelens"
 ENVIRONMENT_NAME = "SIM-EUV-01"
 SOFTWARE_VERSION = "SPM-V2026.09.23"
 STATION_USER_ID = "1"
+
+
+# ---------------------------------------------------------------------------
+# 机器地址
+#
+# 模拟机对外的 host 必须是**真的能连上的地址**，不能是 "sim-upper.localhost"
+# 这种只在字面上像主机的字符串 —— 后端是拿这个值直接开 SSH 的，用户也会照着它
+# 手工 ssh 上去复核。所以这里取本机的局域网出口 IP（就是真实网卡地址），
+# 并且监听时同时绑这个地址和回环：
+#
+#   网络 IP:2222   给"另一台机器/另一台设备"访问，路径与真实机台一致
+#   127.0.0.1:2222 本机探测（sim.sh 健康检查、selftest）走这条，不依赖网卡状态
+#
+# 需要固定成某个地址（例如要跟真实机台对齐）时用环境变量覆盖：
+#   SIM_MACHINE_HOST=10.20.30.40 scripts/sim.sh restart fleet
+# ---------------------------------------------------------------------------
+
+
+def _local_ipv4_addresses() -> list[str]:
+    """枚举本机 IPv4 地址（含回环）。取不到就退回 UDP 出口探测。"""
+    found: list[str] = []
+    try:
+        output = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+    for ip in re.findall(r"\binet (?:addr:)?(\d{1,3}(?:\.\d{1,3}){3})", output):
+        if ip not in found:
+            found.append(ip)
+    if not found:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 连外部地址只为让内核选出出口网卡，UDP 不会真的发包。
+            probe.connect(("8.8.8.8", 53))
+            found.append(probe.getsockname()[0])
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    return found
+
+
+def _address_rank(ip: str) -> tuple[int, str]:
+    """越小越优先。
+
+    刻意把**内网段**排在前面：公网/VPN 地址（例如全隧道 VPN 的 utun 地址）
+    虽然"能通"，但 ``apps.atlog`` 的 _is_private_host 会把它当公网拒掉，
+    拿它当模拟机地址会让报告站 URL 直接失效。
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return (9, ip)
+    if addr.is_loopback:
+        return (3, ip)
+    if not addr.is_private:
+        return (4, ip)
+    if ip.startswith("192.168."):
+        return (0, ip)
+    if ip.startswith("10."):
+        return (1, ip)
+    return (2, ip)
+
+
+def detect_machine_host() -> str:
+    """本机局域网 IP；优先级 192.168 → 10 → 其它内网 → 回环。"""
+    override = os.environ.get("SIM_MACHINE_HOST", "").strip()
+    if override:
+        return override
+    candidates = _local_ipv4_addresses()
+    if not candidates:
+        return "127.0.0.1"
+    return min(candidates, key=_address_rank)
+
+
+#: 模拟机对外宣告的地址（两台机器共用本机 IP，靠端口区分）。
+MACHINE_HOST = detect_machine_host()
+
+
+def bind_hosts() -> tuple[str, ...]:
+    """机群/报告站实际绑定的地址：网络 IP 优先，回环兜底（去重）。"""
+    hosts = [MACHINE_HOST, "127.0.0.1"]
+    return tuple(dict.fromkeys(host for host in hosts if host))
+
+
+def public_host() -> str:
+    """对外展示用的地址（与 MACHINE_HOST 一致；回环时也照实显示）。"""
+    return MACHINE_HOST
+
 
 # 远端日志根模板。后端 ResourceSettings 默认模板是 "/log/{username}/debug"。
 LOG_ROOT = "/log/{username}"
@@ -75,7 +170,9 @@ CPD_SAMPLE_STEP_SECONDS = 15
 # ATLog 用例报告站（走后端 HTTP 侧）
 #
 # 模拟发布 ATLog 用例的 nginx 报告站。后端 apps/atlog 用 urllib 抓取，
-# 且 normalize_base_url 要求 host 是内网/回环地址，所以绑定 127.0.0.1。
+# 且 normalize_base_url 要求 host 是内网/回环地址。ATLOG_SITE_HOST 只用来
+# **探测 / 本机抓取**（回环最稳，不受网卡状态影响）；对外展示、给用户粘贴的
+# URL 走 ``public_host()``（局域网 IP），监听时两个地址都绑。
 # ---------------------------------------------------------------------------
 ATLOG_SITE_HOST = "127.0.0.1"
 ATLOG_SITE_PORT = 8901
@@ -123,7 +220,7 @@ class MachineSpec:
 UPPER = MachineSpec(
     key="upper",
     name="SIM-SCH-01",
-    host="sim-upper.localhost",
+    host=MACHINE_HOST,
     ssh_port=2222,
     role="upper",
     station_id="1",
@@ -135,7 +232,7 @@ UPPER = MachineSpec(
 LOWER1 = MachineSpec(
     key="lower1",
     name="SIM-LCH1-01",
-    host="sim-lower1.localhost",
+    host=MACHINE_HOST,
     ssh_port=2223,
     role="lower",
     station_id="2",
@@ -155,9 +252,29 @@ def machine_by_key(key: str) -> MachineSpec:
 
 
 def machine_by_host(host: str) -> MachineSpec | None:
+    """按 host 或机器名找机器。
+
+    两台机器现在共用本机 IP（靠端口区分），所以只给 host 时返回第一台；
+    要精确匹配请用 :func:`machine_by_endpoint`。
+    """
     text = str(host or "").strip().lower()
     for item in FLEET:
         if item.host.lower() == text or item.name.lower() == text:
+            return item
+    return None
+
+
+def machine_by_endpoint(host: str, port: int | str | None = None) -> MachineSpec | None:
+    """按 host:port 精确定位机器（同 IP 多端口时不会认错）。"""
+    text = str(host or "").strip().lower()
+    try:
+        number = int(port) if port not in (None, "") else None
+    except (TypeError, ValueError):
+        number = None
+    for item in FLEET:
+        if item.host.lower() != text:
+            continue
+        if number is None or item.ssh_port == number:
             return item
     return None
 

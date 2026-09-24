@@ -263,30 +263,50 @@ class SimSSHServer(paramiko.ServerInterface):
 
 
 class MachineServer:
-    """一台机器的 SSH 监听服务。"""
+    """一台机器的 SSH 监听服务。
 
-    def __init__(self, spec: fleet.MachineSpec, host_key: paramiko.RSAKey, bind_host: str = "127.0.0.1") -> None:
+    同一端口可以同时绑多个地址（网络 IP + 回环）：对外用局域网 IP 访问，
+    本机健康检查 / selftest 走 127.0.0.1 —— 只要其中一个通就算服务在跑，
+    不会因为网卡切换把本机探测也一起搞挂。
+    """
+
+    def __init__(
+        self,
+        spec: fleet.MachineSpec,
+        host_key: paramiko.RSAKey,
+        bind_hosts: tuple[str, ...] | str = ("127.0.0.1",),
+    ) -> None:
         self.spec = spec
         self.host_key = host_key
-        self.bind_host = bind_host
+        self.bind_hosts = (bind_hosts,) if isinstance(bind_hosts, str) else tuple(dict.fromkeys(bind_hosts))
         self.shell = RemoteShell(spec)
-        self._sock: socket.socket | None = None
+        self._socks: list[socket.socket] = []
         self._stop = threading.Event()
 
     def start(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.bind_host, self.spec.ssh_port))
-        sock.listen(64)
-        sock.settimeout(0.5)
-        self._sock = sock
-        threading.Thread(target=self._accept_loop, daemon=True, name=f"sim-{self.spec.key}").start()
+        try:
+            for bind_host in self.bind_hosts:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((bind_host, self.spec.ssh_port))
+                sock.listen(64)
+                sock.settimeout(0.5)
+                self._socks.append(sock)
+                threading.Thread(
+                    target=self._accept_loop,
+                    args=(sock,),
+                    daemon=True,
+                    name=f"sim-{self.spec.key}-{bind_host}",
+                ).start()
+        except OSError:
+            # 绑到一半失败就把已经起来的关掉，不留半开状态
+            self.stop()
+            raise
 
-    def _accept_loop(self) -> None:
-        assert self._sock is not None
+    def _accept_loop(self, sock: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                client, _address = self._sock.accept()
+                client, _address = sock.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -312,23 +332,39 @@ class MachineServer:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._sock is not None:
+        for sock in self._socks:
             try:
-                self._sock.close()
+                sock.close()
             except OSError:
                 pass
+        self._socks.clear()
 
 
 class FleetServer:
     """整个机群的监听服务集合。"""
 
-    def __init__(self, bind_host: str = "127.0.0.1") -> None:
+    def __init__(self, bind_hosts: tuple[str, ...] | str | None = None) -> None:
         self.host_key = _load_host_key()
-        self.machines = [MachineServer(spec, self.host_key, bind_host) for spec in fleet.FLEET]
+        if bind_hosts is None:
+            self.bind_hosts = fleet.bind_hosts()
+        elif isinstance(bind_hosts, str):
+            self.bind_hosts = (bind_hosts,)
+        else:
+            self.bind_hosts = tuple(dict.fromkeys(bind_hosts))
+        self.machines = [
+            MachineServer(spec, self.host_key, self.bind_hosts) for spec in fleet.FLEET
+        ]
 
     def start(self) -> None:
-        for machine in self.machines:
-            machine.start()
+        started: list[MachineServer] = []
+        try:
+            for machine in self.machines:
+                machine.start()
+                started.append(machine)
+        except OSError:
+            for machine in started:
+                machine.stop()
+            raise
 
     def serve_forever(self) -> None:
         self.start()
@@ -343,5 +379,5 @@ class FleetServer:
             machine.stop()
 
 
-def serve(bind_host: str = "127.0.0.1") -> None:
-    FleetServer(bind_host).serve_forever()
+def serve(bind_hosts: tuple[str, ...] | str | None = None) -> None:
+    FleetServer(bind_hosts).serve_forever()

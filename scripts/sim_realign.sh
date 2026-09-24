@@ -37,7 +37,7 @@ if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:8000/api/" 2>/dev/null; then
   (cd "$BACKEND_DIR" && "$PY" -m simremote.cli seed >"$RUN_DIR/seed.json" 2>&1) \
     || fail "索引刷新失败，见 $RUN_DIR/seed.json"
 else
-  info "后端未运行，跳过索引刷新；下次 scripts/sim_up.sh 会自动写入"
+  info "后端未运行，跳过索引刷新；下次 scripts/sim.sh start 会自动写入"
 fi
 
 info "完成：日志时间线已对齐到 $(date '+%Y-%m-%d %H:%M:%S')"
