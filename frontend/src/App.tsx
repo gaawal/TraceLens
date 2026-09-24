@@ -6207,6 +6207,15 @@ export default function App() {
         setLiveListening(false);
         return { detail: '已停止实时采集' };
       },
+      /**
+       * 打开**当前页面**的数据提取弹窗（不是设置页）。
+       * 采集面板的「管理提取器」走这条：用户在看的日志就是配置提取器的依据，
+       * 把他扔到设置页会丢掉现场。
+       */
+      open_data_extraction: () => {
+        beginDataExtraction();
+        return { detail: '已打开当前页面的数据提取弹窗' };
+      },
       open_log_rule_settings: (detail) => {
         const tab = String(detail.tab || 'semantic');
         const normalizedTab = tab === 'data' || tab === 'anomaly' ? tab : 'semantic';
@@ -6560,6 +6569,25 @@ export default function App() {
       return;
     }
     await startSelectedDataExtraction(selectedRules, { openDataPage: detail.open_data_page !== false });
+  }
+
+  /** 实时采集清单的当前内容。弹窗用它判断按钮状态，避免读打开时的旧快照。 */
+  const liveCaptureRuleIds = useMemo(
+    () => new Set(dataExtractionRules.filter((rule) => rule.liveCapture === true).map((rule) => rule.id)),
+    [dataExtractionRules],
+  );
+
+  /**
+   * 数据提取弹窗里的「加入实时采集」：直接写回提取器上的 liveCapture。
+   *
+   * 和采集面板的勾选是同一个字段、同一份规则列表，所以两边永远一致 ——
+   * 这里不新开一份「实时采集清单」，避免同一个概念出现两个说法。
+   */
+  function setLiveCaptureForRules(ruleIds: string[], enabled: boolean) {
+    const wanted = new Set(ruleIds);
+    setDataExtractionRules((current) => current.map((rule) => wanted.has(rule.id)
+      ? { ...rule, liveCapture: enabled, updatedAt: Date.now() }
+      : rule));
   }
 
   function beginDataExtraction() {
@@ -8605,6 +8633,8 @@ export default function App() {
           datasetName={activeTask?.name || '当前提取数据'}
           liveListening={liveListening}
           onStartLiveExtraction={() => { void startSelectedDataExtraction(); }}
+          onSetLiveCapture={(ruleIds, enabled) => setLiveCaptureForRules(ruleIds, enabled)}
+          liveCaptureIds={liveCaptureRuleIds}
           onToggle={(id) => setDataExtractionDialog((current) => { const next = new Set(current.selectedIds); next.has(id) ? next.delete(id) : next.add(id); return { ...current, selectedIds: next }; })}
           onStart={() => void startSelectedDataExtraction()}
           onCancel={() => dataExtractionAbortRef.current?.abort()}

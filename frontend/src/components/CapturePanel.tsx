@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronUp, Database, Download, LoaderCircle, Pause, Play, SlidersHorizontal, Square, X } from 'lucide-react';
+import { ChevronDown, ChevronUp, Download, ExternalLink, LoaderCircle, Play, SlidersHorizontal, Square, X } from 'lucide-react';
 import { API_BASE, buildApiHeaders } from '../api/resourceApi';
 import { loadDataExtractionRules, extractDataValues, type DataExtractionRule } from '../rendering/dataExtractionRules';
 import { executeUiAction } from '../assistant/workstation';
@@ -24,27 +24,17 @@ interface LogWatchSummary {
   source_rule_id: string;
 }
 
-interface CaptureRow {
-  at: string;
-  label: string;
-  source: string;
-  values: Record<string, string | number | boolean>;
-}
-
 /**
- * The collector panel — a downloads-style list of what monitoring has captured.
+ * 数据采集面板 —— 实时采集的**进度台**：每个采集项采到多少条。
  *
- * Two deliberate decisions:
+ * 刻意只显示条数，不显示采集到的内容：
+ * - 采集到的数值属于数据本身，归属「数据提取」页（那里能回看、绘图、下载）；
+ *   在进度台里再铺一张表只会让人以为这里是看数据的地方，而它一关就没了。
+ * - 面板要能在采集过程中一直挂着，只跑计数比每来一条就渲染一行便宜得多。
  *
- * 1. **It is a floating panel, not a strip.** Docking anything above the log workspace
- *    squeezes the timeline and fights the user's layout; a downloads list belongs in a
- *    corner you can close.
- * 2. **The server captures raw windows; extraction happens here.** The extraction engine
- *    already lives in the browser (`dataExtractionRules.ts`) with semantic templates and
- *    unit conversion. Porting it to Python would create a second implementation that drifts.
- *    Capturing raw windows means unattended monitoring still records evidence, and the
- *    extractor becomes a *view* choice — you can re-read old captures with a different
- *    extractor instead of having to pick one before capturing.
+ * 采集本身仍是「服务端抓原始窗口、浏览器里按提取器抽取」：抽取引擎只有一份
+ * （`dataExtractionRules.ts`），搬到 Python 会多出第二份实现并慢慢跑偏。
+ * 抓原始窗口还意味着无人值守时证据仍然在，提取器只是**看的方式**。
  */
 export function CapturePanel() {
   // Driven by the single 实时监控 toggle rather than its own switch: the collector is a
@@ -56,10 +46,8 @@ export function CapturePanel() {
   const [rules, setRules] = useState<DataExtractionRule[]>([]);
   const [connected, setConnected] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
-  const [activeRuleId, setActiveRuleId] = useState('');
   /** Per-extractor capture target, from the watch's capture_config (0 = continuous). */
   const [targets, setTargets] = useState<Record<string, number>>({});
-  const [detailOpen, setDetailOpen] = useState(true);
   /**
    * 采集分两个阶段，取代过去「打开实时监听就顺带出面板」的隐式行为：
    * - prep  ：先勾选这次要采集哪些提取器（以及目标条数），再按「开始采集」；
@@ -70,7 +58,6 @@ export function CapturePanel() {
   const [allRules, setAllRules] = useState<DataExtractionRule[]>([]);
   const [busy, setBusy] = useState('');
   const [actionError, setActionError] = useState('');
-  const scrollerRef = useRef<HTMLDivElement | null>(null);
   const lastCaptureTokenRef = useRef(0);
 
   useEffect(() => subscribeLiveMonitoring((next) => {
@@ -180,43 +167,50 @@ export function CapturePanel() {
   }, [open, watches]);
 
   /**
-   * The opt-in lives on the extraction rule, so this hands the user to that one page
-   * instead of growing a second, conflicting set of checkboxes inside the panel.
+   * 「管理提取器」打开的是**当前页面的数据提取弹窗**，不是设置页。
+   *
+   * 之前的做法是把用户扔到「设置 → 日志规则 → 数据提取」，用户丢掉当前的日志现场，
+   * 配置完还得自己找回来。提取器的配置、勾选和「加入实时采集」现在都在那个弹窗里，
+   * 这里只需要把它打开。
    */
-  function openExtractorPicker() {
+  function openExtractorManager() {
     window.dispatchEvent(new CustomEvent('tracelens:assistant-ui', {
-      detail: { type: 'open_log_rule_settings', tab: 'data', __claimed: false },
+      detail: { type: 'open_data_extraction', __claimed: false },
+    }));
+  }
+
+  /** 采集结果不在这个面板里，给一个直接去「数据提取」页的入口。 */
+  function openExtractedDataPage() {
+    window.dispatchEvent(new CustomEvent('tracelens:assistant-ui', {
+      detail: { type: 'open_workspace_page', page: 'data', __claimed: false },
     }));
   }
 
   const captureTarget = (ruleId: string) => targets[ruleId] || 0;
 
-  /** Extraction runs over captured windows using the app's own engine. */
-  const captures = useMemo(() => {
-    return rules.map((rule) => {
-      const rows: CaptureRow[] = [];
+  /**
+   * 只数条数：抽取引擎仍然用来判断「这条命中算不算采集到」，
+   * 但结果不留在面板里 —— 面板只负责进度。
+   */
+  const captureCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const rule of rules) {
+      let count = 0;
       for (const hit of hits) {
         if (rule.subsystems.length && hit.subsystem && !rule.subsystems.includes(hit.subsystem)) continue;
         if (rule.modules.length && hit.fm && !rule.modules.includes(hit.fm)) continue;
         const message = String(hit.line_text || '');
         if (!message) continue;
-        const values = extractDataValues(message, rule);
-        if (!values) continue;
-        rows.push({ at: hit.matched_at, label: hit.label || hit.watch_name, source: `${hit.subsystem || ''}/${hit.fm || ''}`, values });
+        if (extractDataValues(message, rule)) count += 1;
       }
-      return { rule, rows };
-    }).filter((item) => item.rows.length > 0);
+      counts[rule.id] = count;
+    }
+    return counts;
   }, [rules, hits]);
-
-  useEffect(() => {
-    const node = scrollerRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [hits]);
 
   if (!open) return null;
 
-  const activeCapture = captures.find((item) => item.rule.id === activeRuleId) || captures[0];
-  const totalRows = captures.reduce((total, item) => total + item.rows.length, 0);
+  const totalRows = Object.values(captureCounts).reduce((total, count) => total + count, 0);
   const errors = watches.filter((watch) => watch.last_error);
   const targetTotal = rules.reduce((total, rule) => total + captureTarget(rule.id), 0);
   const tooMany = rules.length > MAX_ACTIVE_COLLECTORS ? `（超过建议的 ${MAX_ACTIVE_COLLECTORS} 项，面板会较慢）` : '';
@@ -278,7 +272,7 @@ export function CapturePanel() {
           数据采集
         </span>
         <span className="capture-panel-counts">
-          {phase === 'prep' ? `${rules.length} 项已勾选` : `${captures.length} 个采集器 · ${totalRows} 条数据`}
+          {phase === 'prep' ? `${rules.length} 项已勾选` : `${rules.length} 个采集项 · ${totalRows} 条`}
           {phase === 'running' && hits.length > 0 && <em> · {hits.length} 次命中</em>}
         </span>
         <button type="button" onClick={() => setCollapsed((value) => !value)} title={collapsed ? '展开' : '收起'}>
@@ -302,7 +296,7 @@ export function CapturePanel() {
 
           <div className="capture-limit-note">
             <span>{limitNote}</span>
-            <button type="button" className="capture-panel-pick" onClick={openExtractorPicker} title="去「日志规则 → 数据提取」管理提取器本身（字段、Match 等）">
+            <button type="button" className="capture-panel-pick" onClick={openExtractorManager} title="打开当前页面的数据提取弹窗：在那里配置提取器、勾选数据项，并加入实时采集清单">
               <SlidersHorizontal size={11} /> 管理提取器
             </button>
             {phase === 'prep' ? (
@@ -326,12 +320,16 @@ export function CapturePanel() {
           {phase === 'running' && rules.length > 0 && (
             <div className="capture-progress" aria-label="采集进度">
               {rules.map((rule) => {
-                const rowCount = captures.find((item) => item.rule.id === rule.id)?.rows.length || 0;
+                const rowCount = captureCounts[rule.id] || 0;
                 const target = captureTarget(rule.id);
+                // 有目标才画进度条；凭空造一条「总是快满了」的进度比显示「持续采集中」更糟。
                 const percent = target ? Math.min(100, Math.round((rowCount / target) * 100)) : 0;
                 return (
                   <div className="capture-progress-row" key={`progress-${rule.id}`}>
-                    <span className="capture-progress-name" title={rule.name}>{rule.name || rule.matchKeyword || rule.id}</span>
+                    <span className="capture-progress-name" title={rule.name}>
+                      {rule.name || rule.matchKeyword || rule.id}
+                      <em>{(rule.fields || []).length} 字段</em>
+                    </span>
                     <span className="capture-progress-bar" aria-hidden="true">
                       <i className={target ? '' : 'is-live'} style={target ? { width: `${percent}%` } : undefined} />
                     </span>
@@ -339,13 +337,24 @@ export function CapturePanel() {
                   </div>
                 );
               })}
+              {totalRows === 0 && (
+                <div className="capture-empty">
+                  {hits.length > 0
+                    // 有命中却一条都抽不出来，和「什么都没命中」是两回事；说清楚区别，
+                    // 用户才知道该去查字段配置还是继续等。
+                    ? `已命中 ${hits.length} 条日志，但没有任何一条能按当前提取器抽出字段。请检查提取器的 Match 与字段划选是否覆盖这类日志行。`
+                    : connected
+                      ? '监控中，等待命中…（匹配到提取器的日志行后会自动计数）'
+                      : '等待监控通道连接…'}
+                </div>
+              )}
             </div>
           )}
 
           {phase === 'prep' && (
             <div className="capture-pick-list" aria-label="选择要采集的数据项">
               {allRules.length === 0 && (
-                <div className="capture-empty">还没有启用的数据提取器。先去「日志规则 → 数据提取」建一个，再回来勾选。</div>
+                <div className="capture-empty">还没有启用的数据提取器。点上面的「管理提取器」打开数据提取弹窗，新建或启用一个。</div>
               )}
               {allRules.map((rule) => (
                 <label className={`capture-pick-item ${rule.liveCapture ? 'on' : ''}`} key={`pick-${rule.id}`}>
@@ -365,94 +374,13 @@ export function CapturePanel() {
             </div>
           )}
 
-          <div className="capture-list" ref={scrollerRef}>
-            {phase === 'running' && captures.length === 0 && (
-              <div className="capture-empty">
-                {rules.length === 0
-                  ? '这次没有勾选任何数据项。停止采集后可以重新勾选。'
-                  : hits.length > 0
-                    // Hits arriving but nothing extractable is a *different* problem from
-                    // "nothing matched", and saying so is the difference between a user
-                    // checking their字段配置 and one staring at a silent zero.
-                    ? `已命中 ${hits.length} 条日志，但没有任何一条能按当前提取器抽出字段。请检查提取器的 Match 与字段划选是否覆盖这类日志行。`
-                    : connected
-                      ? '监控中，等待命中…（匹配到提取器的日志行后会自动抽取数据）'
-                      : '等待监控通道连接…'}
-              </div>
-            )}
-            {phase === 'running' && captures.length > 0 && rules.map((rule) => {
-              const rows = captures.find((item) => item.rule.id === rule.id)?.rows || [];
-              const isActive = activeCapture?.rule.id === rule.id;
-              // A progress bar only means something against a target. Inventing one that
-              // always looks nearly full would be worse than showing "still collecting".
-              const target = captureTarget(rule.id);
-              const percent = target ? Math.min(100, Math.round((rows.length / target) * 100)) : 0;
-              return (
-                <button
-                  key={rule.id}
-                  type="button"
-                  className={`capture-item ${isActive ? 'active' : ''} selected`}
-                  title="查看这个采集器已采集的数据"
-                  onClick={() => {
-                    setActiveRuleId(rule.id);
-                    setDetailOpen(true);
-                  }}
-                >
-                  <span className="capture-item-check" aria-hidden="true"><Check size={11} /></span>
-                  <span className="capture-item-icon"><Database size={15} /></span>
-                  <span className="capture-item-body">
-                    <strong>{rule.name || rule.matchKeyword || rule.id}</strong>
-                    <small>{(rule.fields || []).length} 个字段 · {rule.sourceCategories.length ? rule.sourceCategories.join('/') : '全部日志'}</small>
-                    {target ? (
-                      <span className="capture-item-bar" aria-hidden="true" title={`目标 ${target} 条`}>
-                        <i style={{ width: `${percent}%` }} />
-                      </span>
-                    ) : (
-                      <span className="capture-item-bar is-live" aria-hidden="true" title="持续采集中，未设目标条数">
-                        <i />
-                      </span>
-                    )}
-                  </span>
-                  <span className="capture-item-count">
-                    <strong>{rows.length}</strong>
-                    <small>条</small>
-                  </span>
-                </button>
-              );
-            })}
+          {/* 采集到的数值不在这个面板里：这里只报条数，看数据请去「数据提取」页。 */}
+          <div className="capture-result-hint">
+            <span>本面板只显示采集条数；采集到的数据请到<strong>数据提取</strong>页查看、绘图和下载。</span>
+            <button type="button" className="capture-panel-pick" onClick={openExtractedDataPage} title="打开数据提取页查看已采集的数据">
+              <ExternalLink size={11} /> 查看数据
+            </button>
           </div>
-
-          {activeCapture && detailOpen && (
-            <div className="capture-detail">
-              <div className="capture-detail-head">
-                <strong>{activeCapture.rule.name} · 采集详情</strong>
-                <span>{activeCapture.rows.length} 行</span>
-                <button type="button" onClick={() => setDetailOpen(false)} title="收起详情"><Pause size={13} /></button>
-              </div>
-              <div className="capture-detail-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>时间</th>
-                      {(activeCapture.rule.fields || []).map((field) => <th key={field.id}>{field.name || field.key}</th>)}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {activeCapture.rows.slice(-80).map((row, index) => (
-                      <tr key={`${row.at}-${index}`}>
-                        <td className="capture-cell-time">{String(row.at).slice(11, 19)}</td>
-                        {(activeCapture.rule.fields || []).map((field) => (
-                          <td key={field.id} title={row.source}>
-                            {String(row.values[field.name || field.key] ?? '')}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
         </>
       )}
     </aside>

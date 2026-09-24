@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, CheckCircle2, Database, Download, Eye, LoaderCircle, Merge, Square, X } from 'lucide-react';
+import { Activity, CheckCircle2, Database, Download, Eye, LoaderCircle, Merge, Plus, Radio, Square, X } from 'lucide-react';
 import type { DataExtractionRule, ExtractedDataRow } from '../rendering/dataExtractionRules';
 import type { ExtractionProgress } from '../rendering/dataExtractionRuntime';
 import { mergeTemporaryRuleData } from '../rendering/extractedDataStore';
@@ -34,6 +34,20 @@ interface Props {
   datasetName?: string;
   liveListening?: boolean;
   onStartLiveExtraction?: () => void;
+  /**
+   * 把提取器加入/移出实时采集清单（写回提取器上的 liveCapture）。
+   * 之前这个开关只存在于「设置 → 日志规则 → 数据提取」和采集面板里，
+   * 在本页面对着的日志上配置提取器时还得跳出去，现在就在这个窗口里完成。
+   */
+  onSetLiveCapture?: (ruleIds: string[], enabled: boolean) => void | Promise<void>;
+  /**
+   * 当前**真正**在实时采集清单里的提取器 id。
+   *
+   * 不能读 `candidates[].rule.liveCapture`：candidates 是打开弹窗那一刻的快照，
+   * 加入实时采集只改了规则本身，快照不会跟着变 —— 结果就是点了按钮没有任何反馈，
+   * 用户只能靠猜自己到底加没加上。
+   */
+  liveCaptureIds?: Set<string>;
 }
 
 export function DataExtractionRunDialog(props: Props) {
@@ -42,6 +56,24 @@ export function DataExtractionRunDialog(props: Props) {
   const matchedResults = useMemo(() => (props.results || []).filter((item) => item.rows.length > 0), [props.results]);
   const resultSignature = matchedResults.map((item) => `${item.rule.id}:${item.rows.length}`).join('|');
   const [mergeSelectedIds, setMergeSelectedIds] = useState<Set<string>>(new Set());
+  const [liveBusyId, setLiveBusyId] = useState('');
+  const [liveMessage, setLiveMessage] = useState('');
+
+  async function setLiveCapture(ruleIds: string[], enabled: boolean) {
+    if (!props.onSetLiveCapture || !ruleIds.length) return;
+    setLiveBusyId(enabled ? 'bulk' : ruleIds[0]);
+    setLiveMessage('');
+    try {
+      await props.onSetLiveCapture(ruleIds, enabled);
+      setLiveMessage(enabled
+        ? `已把 ${ruleIds.length} 个提取器加入实时采集清单，可在「采集」面板查看条数。`
+        : `已把 ${ruleIds.length} 个提取器移出实时采集清单。`);
+    } catch (error) {
+      setLiveMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLiveBusyId('');
+    }
+  }
 
   useEffect(() => {
     if (props.phase !== 'done') return;
@@ -89,15 +121,31 @@ export function DataExtractionRunDialog(props: Props) {
       <div className="data-extraction-dialog-body">
         {props.phase === 'select' && <>
           {!props.candidates.length ? <div className="data-extraction-empty"><Database size={30}/><strong>暂无可用的数据采集能力</strong><span>可以在“设置 → 日志规则 → 数据提取”中新增或启用数据提取器。</span></div> : <>
-            <div className="data-extraction-select-head"><strong>已有 {props.candidates.length} 项数据采集能力</strong><span>请选择本次需要提取的数据，可多选。</span></div>
+            <div className="data-extraction-select-head"><strong>已有 {props.candidates.length} 项数据采集能力</strong><span>勾选本次要提取的数据；需要长期盯着的，用右侧「加入实时采集」放进实时采集清单。</span></div>
             <div className="data-extraction-rule-options">
-              {props.candidates.map(({ rule }) => <label key={rule.id} className={props.selectedIds.has(rule.id) ? 'selected' : ''}>
-                <input type="checkbox" checked={props.selectedIds.has(rule.id)} onChange={() => props.onToggle(rule.id)}/>
-                <span><strong>{rule.name}</strong><small>{rule.description || '数据提取能力'}</small><em>{rule.fields.map((field) => field.name || field.key).join(' / ')}</em></span>
-                <b>{rule.outputFormat === 'text' ? 'TXT' : 'CSV'}</b>
-                <small>{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
-              </label>)}
+              {props.candidates.map(({ rule }) => {
+                const inLiveCapture = props.liveCaptureIds ? props.liveCaptureIds.has(rule.id) : rule.liveCapture === true;
+                return <div key={rule.id} className={`data-extraction-rule-option ${props.selectedIds.has(rule.id) ? 'selected' : ''}`}>
+                <label>
+                  <input type="checkbox" checked={props.selectedIds.has(rule.id)} onChange={() => props.onToggle(rule.id)}/>
+                  <span><strong>{rule.name}</strong><small>{rule.description || '数据提取能力'}</small><em>{rule.fields.map((field) => field.name || field.key).join(' / ')}</em></span>
+                  <b>{rule.outputFormat === 'text' ? 'TXT' : 'CSV'}</b>
+                  <small>{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
+                </label>
+                {props.onSetLiveCapture && <button
+                  type="button"
+                  className={`data-live-capture-add ${inLiveCapture ? 'on' : ''}`}
+                  disabled={Boolean(liveBusyId)}
+                  onClick={() => void setLiveCapture([rule.id], !inLiveCapture)}
+                  title={inLiveCapture ? '从实时采集清单中移除这个提取器' : '把这个提取器加入实时采集清单'}
+                >
+                  {liveBusyId === rule.id ? <LoaderCircle className="spin" size={12}/> : inLiveCapture ? <Radio size={12}/> : <Plus size={12}/>}
+                  {inLiveCapture ? '已在实时采集' : '加入实时采集'}
+                </button>}
+              </div>;
+              })}
             </div>
+            {liveMessage && <div className="data-live-capture-note">{liveMessage}</div>}
           </>}
         </>}
 
@@ -138,7 +186,7 @@ export function DataExtractionRunDialog(props: Props) {
       </div>
 
       <footer>
-        {props.phase === 'select' && <><button className="button ghost" onClick={props.onClose}>取消</button>{props.liveListening && <button className="button secondary" disabled={props.selectedIds.size === 0} onClick={props.onStartLiveExtraction}>实时提取</button>}<button className="button primary" disabled={!props.candidates.length || props.selectedIds.size === 0} onClick={props.onStart}>开始提取</button></>}
+        {props.phase === 'select' && <>{props.onSetLiveCapture && <button className="button secondary" disabled={props.selectedIds.size === 0 || Boolean(liveBusyId)} onClick={() => void setLiveCapture([...props.selectedIds], true)} title="把勾选的提取器一次性加入实时采集清单"><Radio size={14}/> 添加实时采集</button>}<span className="data-extraction-footer-spacer"/><button className="button ghost" onClick={props.onClose}>取消</button>{props.liveListening && <button className="button secondary" disabled={props.selectedIds.size === 0} onClick={props.onStartLiveExtraction}>实时提取</button>}<button className="button primary" disabled={!props.candidates.length || props.selectedIds.size === 0} onClick={props.onStart}>开始提取</button></>}
         {props.phase === 'running' && <button className="button danger" onClick={props.onCancel}><Square size={14}/> 停止提取</button>}
         {(props.phase === 'done' || props.phase === 'error') && <><button className="button secondary" onClick={props.onClose}>关闭</button>{props.recordSaved && <button className="button primary" onClick={props.onOpenData}>进入数据</button>}</>}
       </footer>
