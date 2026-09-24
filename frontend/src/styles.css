@@ -16940,3 +16940,203 @@ html.workstation-docked {
 }
 .capture-result-hint strong { color: #4c6780; }
 .capture-result-hint .capture-panel-pick { flex: none; }
+
+/* ==========================================================================
+   流程地图 —— 把逐行读日志换成「一眼看流程」
+   横轴 = 执行顺序，缩进 = 嵌套层级，颜色 = 异常与否，动画 = 真的有异常的节点。
+   ========================================================================== */
+.call-flow-view-switch {
+  display: flex; align-items: center; gap: 4px; flex: none;
+  padding: 6px 10px; border-bottom: 1px solid #e5ebf1; background: #fbfcfe;
+}
+.call-flow-view-switch button {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid transparent; background: transparent; color: #66748a;
+  border-radius: 7px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+}
+.call-flow-view-switch button:hover { background: #eef3f9; color: #2c5ba5; }
+.call-flow-view-switch button.active { background: #eaf2ff; border-color: #cddffa; color: #1f5eaf; font-weight: 600; }
+
+.flow-map { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.flow-map-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 12px; border-bottom: 1px solid #e8eef4; background: #fff;
+}
+.flow-map-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.flow-map-summary > strong { font-size: 13px; color: #1f3040; }
+.flow-map-stat { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: #7b8794; }
+.flow-map-stat.total { padding: 1px 8px; border-radius: 999px; background: #f1f5f9; color: #56677a; }
+.flow-map-stat.error { color: #c0392b; font-weight: 600; }
+.flow-map-stat.warning { color: #b8860b; }
+.flow-map-stat.normal { color: #2f8f5b; }
+.flow-map-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.flow-map-actions button {
+  display: grid; place-items: center; width: 26px; height: 26px;
+  border: 1px solid #dbe3ec; border-radius: 7px; background: #fff; color: #5c6b7d; cursor: pointer;
+}
+.flow-map-actions button:hover { background: #f2f7fc; color: #23557a; border-color: #b9d2e8; }
+.flow-map-zoom { font-size: 11px; color: #8b97a5; min-width: 34px; text-align: right; }
+
+.flow-map-filterbar {
+  display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap;
+  padding: 7px 12px; border-bottom: 1px solid #edf1f6; background: #fbfcfe;
+}
+.flow-map-trace-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: #7b8794; flex: none; }
+.flow-map-trace-picker select {
+  max-width: 340px; border: 1px solid #dbe3ec; border-radius: 7px;
+  padding: 4px 6px; font-size: 11.5px; color: #33465a; background: #fff;
+}
+.flow-map-labels { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; color: #93a3b2; }
+.flow-map-labels-empty { font-size: 11px; color: #9aa7b4; }
+.flow-map-label-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px; font-size: 11px; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--label-color) 34%, #ffffff);
+  background: color-mix(in srgb, var(--label-color) 12%, #ffffff);
+  color: color-mix(in srgb, var(--label-color) 78%, #1f2c3a);
+}
+.flow-map-label-chip em { font-style: normal; opacity: .62; font-size: 10px; }
+.flow-map-label-chip:hover { filter: brightness(.97); }
+.flow-map-label-chip.active { box-shadow: 0 0 0 2px color-mix(in srgb, var(--label-color) 45%, #ffffff); font-weight: 600; }
+.flow-map-label-clear { border: 0; background: transparent; color: #6c8bb0; font-size: 11px; cursor: pointer; text-decoration: underline; }
+
+.flow-map-viewport {
+  position: relative; flex: 1 1 auto; min-height: 260px; overflow: hidden;
+  background:
+    radial-gradient(circle at 1px 1px, #dfe6ee 1px, transparent 0) 0 0 / 22px 22px,
+    #f7f9fc;
+  cursor: grab; touch-action: none;
+}
+.flow-map-viewport[data-panning='true'] { cursor: grabbing; }
+.flow-map-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.flow-map-edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.flow-map-edge { fill: none; stroke: #c3cedb; stroke-width: 1.6; stroke-linejoin: round; }
+.flow-map-edge.severity-warning { stroke: #e3c07a; }
+.flow-map-edge.severity-error { stroke: #e08d86; stroke-width: 2; }
+
+.flow-map-node { position: absolute; }
+.flow-map-node-main {
+  width: 100%; height: 100%; text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 8px 10px; border-radius: 10px;
+  border: 1.5px solid #d6dfe9; background: #fff;
+  box-shadow: 0 1px 2px rgba(31, 51, 79, .06);
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+.flow-map-node-main:hover { border-color: #8fb4dd; box-shadow: 0 6px 16px rgba(31, 72, 125, .14); transform: translateY(-1px); }
+.flow-map-node.severity-warning .flow-map-node-main { border-color: #e5c98a; background: #fffdf7; }
+.flow-map-node.severity-error .flow-map-node-main { border-color: #dd9a93; background: #fffafa; }
+/* 真的有异常的那一段：红色边框忽明忽暗，扫一眼就知道该看哪里。 */
+.flow-map-node.severity-error.has-error-path .flow-map-node-main {
+  animation: flow-map-alert 1.6s ease-in-out infinite;
+}
+@keyframes flow-map-alert {
+  0%, 100% { border-color: #e0857c; box-shadow: 0 0 0 0 rgba(224, 87, 76, .30); }
+  50% { border-color: #d63b2c; box-shadow: 0 0 0 5px rgba(224, 87, 76, .13), 0 4px 14px rgba(196, 48, 38, .22); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-map-node.severity-error.has-error-path .flow-map-node-main { animation: none; border-color: #d63b2c; }
+}
+.flow-map-node.dimmed { opacity: .26; }
+
+.flow-map-node-top { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.flow-map-node-name {
+  flex: 1 1 auto; min-width: 0; font-size: 12.5px; font-weight: 600; color: #223243;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.flow-map-node-flag {
+  flex: none; font-size: 9.5px; padding: 1px 5px; border-radius: 5px;
+  background: #fdeeea; color: #b4442f;
+}
+.flow-map-node-flag.repeat { background: #eef3fa; color: #4c6c90; }
+.flow-map-node-meta { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 10px; color: #8a97a6; }
+.flow-map-node-component {
+  flex: none; padding: 0 5px; border-radius: 5px;
+  background: #f1f5f9; color: #5a6b7d; font-weight: 600;
+}
+.flow-map-node-time { flex: none; font-variant-numeric: tabular-nums; }
+.flow-map-node-duration { flex: none; color: #7f8fa0; }
+.flow-map-node-errors { flex: none; color: #c0392b; font-weight: 700; }
+.flow-map-node-warns { flex: none; color: #b8860b; font-weight: 600; }
+.flow-map-node-semantic {
+  font-size: 10.5px; color: #3f6079; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.flow-map-node-labels { position: absolute; left: 8px; right: 8px; bottom: -9px; display: flex; gap: 4px; flex-wrap: wrap; }
+.flow-map-node-label {
+  display: inline-flex; align-items: center;
+  padding: 1px 7px; border-radius: 999px; font-size: 10px; cursor: help;
+  border: 1px solid color-mix(in srgb, var(--label-color) 36%, #ffffff);
+  background: color-mix(in srgb, var(--label-color) 16%, #ffffff);
+  color: color-mix(in srgb, var(--label-color) 80%, #17212e);
+  box-shadow: 0 1px 2px rgba(31, 51, 79, .08);
+}
+
+.flow-map-popover {
+  position: absolute; left: 12px; top: calc(100% + 14px); z-index: 40;
+  width: min(680px, 74vw);
+  background: #fff; border: 1px solid #d8e2ec; border-radius: 10px;
+  box-shadow: 0 16px 40px rgba(21, 44, 68, .20);
+  padding: 9px 11px; cursor: default;
+}
+.flow-map-popover-head { display: flex; align-items: center; gap: 6px; color: #1f5eaf; }
+.flow-map-popover-head strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-map-popover-rule { margin-top: 2px; font-size: 10.5px; color: #93a3b2; }
+.flow-map-popover-supplement { margin-top: 4px; font-size: 11px; color: #6b7c8d; line-height: 1.5; }
+.flow-map-popover-log { margin-top: 7px; }
+.flow-map-popover-log .log-row { border-radius: 7px; }
+
+.flow-map-foot {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 12px; border-top: 1px solid #edf1f6; background: #fbfcfe;
+  font-size: 11px; color: #93a3b2;
+}
+.flow-map-foot-filter { color: #4c78a8; }
+.flow-map-foot-hint { color: #9aa7b4; }
+
+/* 流程缩略条：与图的横轴一一对应，颜色 = 严重度，点击定位。 */
+.flow-map-ruler {
+  position: relative; flex: none; height: 20px; margin: 0 12px 6px;
+  border-radius: 6px; background: #eef2f7; overflow: hidden;
+}
+.flow-map-ruler-tick {
+  position: absolute; top: 3px; width: 3px; height: 14px; padding: 0;
+  border: 0; border-radius: 2px; background: #b9c6d4; cursor: pointer;
+}
+.flow-map-ruler-tick.severity-warning { background: #e0b357; height: 17px; top: 1.5px; }
+.flow-map-ruler-tick.severity-error { background: #d63b2c; height: 20px; top: 0; width: 4px; }
+.flow-map-ruler-tick:hover { outline: 2px solid #6b93c0; outline-offset: 1px; }
+
+.flow-map-actions .flow-map-jump {
+  width: auto; padding: 0 9px; gap: 5px; display: inline-flex; align-items: center;
+  font-size: 11.5px; font-weight: 600; color: #b03a2c; border-color: #eccfcb; background: #fffafa;
+}
+.flow-map-actions .flow-map-jump:hover:not(:disabled) { background: #fdeeee; border-color: #dfa9a2; color: #8f2f22; }
+.flow-map-actions .flow-map-jump:disabled { opacity: .5; cursor: default; color: #97a3b0; border-color: #e2e8ee; background: #f8fafc; }
+
+/* 弹框里的日志行要能读完整：日志列表里为了对齐会省略号截断，这里放开换行。 */
+.flow-map-popover-log .log-row {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  padding: 6px 8px;
+}
+.flow-map-popover-log .log-row .log-summary {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+.flow-map-popover-log .log-row .log-time,
+.flow-map-popover-log .log-row .component-badge,
+.flow-map-popover-log .log-row .level-badge { vertical-align: middle; }
+.flow-map-popover-log .log-row .log-row-meta { display: inline-flex; vertical-align: middle; }
+
+/* 流程地图要看整条流程，对话框给它更大的画布；缩进树维持原来的尺寸。 */
+.call-flow-dialog.is-flow-map {
+  width: min(1720px, calc(100vw - 40px));
+  height: min(940px, calc(100vh - 48px));
+}
+.call-flow-dialog.is-flow-map .call-flow-graph-pane { min-width: 0; }

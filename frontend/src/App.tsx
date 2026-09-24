@@ -36,6 +36,7 @@ import {
   Search,
   Settings,
   ServerCog,
+  Share2,
   Sparkles,
   TerminalSquare,
   UploadCloud,
@@ -55,6 +56,7 @@ import { LogRulesSettingsPage } from './components/LogRulesSettingsPage';
 import { LogAuditPage } from './components/LogAuditPage';
 import { ExtractedDataPage } from './components/ExtractedDataPage';
 import { DataExtractionRunDialog, type DataExtractionCandidate, type DataExtractionResultView } from './components/DataExtractionRunDialog';
+import { FlowMapView } from './components/FlowMapView';
 import { SmartAnalysisDialog } from './components/SmartAnalysisDialog';
 import type { AbnormalCase, AbnormalCaseEvidence } from './api/resourceApi';
 import { KnowledgeBasePage } from './components/KnowledgeBasePage';
@@ -3938,6 +3940,13 @@ export default function App() {
   const [showIssues, setShowIssues] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [callFlowDialogOpen, setCallFlowDialogOpen] = useState(false);
+  /**
+   * 调用导航的两种看法：
+   * - tree  ：原来的缩进树，适合逐层核对某一条调用；
+   * - flowmap：横向流程地图，适合「一眼看完整流程、哪里不对」。
+   * 默认给流程地图 —— 用户打开调用导航通常就是想快速定位异常在那一段。
+   */
+  const [callFlowView, setCallFlowView] = useState<'flowmap' | 'tree'>('flowmap');
   const [dragging, setDragging] = useState(false);
   const [showTimeline, setShowTimeline] = useState(false);
   // 悬浮 / 固定二选一。固定时时间线嵌回日志区上方（占位排版），不再盖在日志上。
@@ -8646,7 +8655,7 @@ export default function App() {
 
         {callFlowDialogOpen && createPortal(
           <div className="call-flow-dialog-backdrop" role="presentation" onMouseDown={() => setCallFlowDialogOpen(false)}>
-            <section className="call-flow-dialog" role="dialog" aria-modal="true" aria-labelledby="call-flow-dialog-title" onMouseDown={(event: React.MouseEvent<HTMLElement>) => event.stopPropagation()}>
+            <section className={`call-flow-dialog ${callFlowView === 'flowmap' ? 'is-flow-map' : ''}`} role="dialog" aria-modal="true" aria-labelledby="call-flow-dialog-title" onMouseDown={(event: React.MouseEvent<HTMLElement>) => event.stopPropagation()}>
               <header className="call-flow-dialog-header">
                 <div>
                   <h2 id="call-flow-dialog-title"><GitBranch size={17} /> 调用导航</h2>
@@ -8827,7 +8836,24 @@ export default function App() {
               </div>
                 </aside>
                 <section className="call-flow-graph-pane" aria-label="调用关系图">
-                  <CallGraphPanel state={callGraphState} onSelectNode={focusFunctionFromGraph} />
+                  <div className="call-flow-view-switch" role="tablist" aria-label="函数导航视图">
+                    <button type="button" role="tab" aria-selected={callFlowView === 'flowmap'} className={callFlowView === 'flowmap' ? 'active' : ''} onClick={() => setCallFlowView('flowmap')} title="按标签和异常着色的横向流程地图，可缩放">
+                      <Share2 size={13} /> 流程地图
+                    </button>
+                    <button type="button" role="tab" aria-selected={callFlowView === 'tree'} className={callFlowView === 'tree' ? 'active' : ''} onClick={() => setCallFlowView('tree')} title="缩进树，逐层核对调用">
+                      <ListTree size={13} /> 缩进树
+                    </button>
+                  </div>
+                  {callFlowView === 'flowmap'
+                    ? <FlowMapView
+                        traces={callGraphState?.traces ?? []}
+                        rules={displayRules}
+                        semanticEnabled={semanticLabelsEnabled}
+                        onSelectNode={focusFunctionFromGraph}
+                        onSelectEntry={(entry) => { setSelectedEntry(entry); setCallFlowDialogOpen(false); }}
+                        renderLogRow={(entry) => <LogRow entry={entry} selected={false} onSelect={(selected) => { setSelectedEntry(selected); setCallFlowDialogOpen(false); }} />}
+                      />
+                    : <CallGraphPanel state={callGraphState} onSelectNode={focusFunctionFromGraph} />}
                 </section>
               </div>
             </section>
