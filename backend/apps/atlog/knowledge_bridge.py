@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +11,8 @@ from apps.atlog.services import _case_log_hierarchy, analyze_case, discover_case
 from apps.knowledge.models import AbnormalCase
 from apps.knowledge.serializers import AbnormalCaseSerializer
 from apps.logsources.models import LogFmDefinition
+
+logger = logging.getLogger("tracelens.atlog.knowledge")
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-z_:.+\-/\u4e00-\u9fff]{2,}")
 _ERROR_CODE_RE = re.compile(
@@ -304,15 +307,6 @@ def match_case_knowledge(url: str, *, limit: int = 5, anomaly_rules: list[dict[s
     }
 
 
-def _normalize_template(text: str) -> str:
-    value = str(text or "").strip()
-    value = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<IP>", value)
-    value = re.sub(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b", "<UUID>", value)
-    value = re.sub(r"\b0x[0-9a-fA-F]{4,}\b", "<HEX>", value)
-    value = re.sub(r"(?<![\w.])[-+]?(?:\d+\.\d+|\d+)(?![\w.])", "<N>", value)
-    return re.sub(r"\s+", " ", value).strip()
-
-
 def _anomaly_rules(row: dict[str, Any]) -> list[dict[str, Any]]:
     # AI evidence rows carry the exact user-managed anomaly rules that admitted
     # the log line. Preserve those rules when the diagnosis is accepted into the
@@ -354,22 +348,26 @@ def _anomaly_rules(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _knowledge_evidence(row: dict[str, Any]) -> dict[str, Any] | None:
-    rules = _anomaly_rules(row)
-    source_kind = str(row.get("source_kind") or row.get("source_category") or "").strip().lower()
-    report_evidence = source_kind in {"case_report", "pytest", "xytest", "case-metadata"}
-    if not rules and not report_evidence:
-        return None
+    """一条 AI 证据行 → 一条可保存的举证。
+
+    旧实现会在「既没有异常规则、又不是报告来源」时返回 None，把用例报告执行类证据
+    直接丢掉；随后 build_ai_case_evidences 还会因为「没有运行日志证据」抛错。
+    结果是**用例报告本身的报错反而存不进案例库** —— 而它恰恰是最该沉淀的那类案例。
+    现在只丢弃真的没有内容的行，类型和是否可指纹匹配交给共享模块判定。
+    """
+    from apps.knowledge.evidence import fingerprint_tokens, normalize_evidence_item
+
     raw = str(row.get("raw") or row.get("message") or "").strip()
-    message = str(row.get("message") or raw).strip()
     if not raw:
         return None
+    message = str(row.get("message") or raw).strip()
     source_path = str(row.get("source_path") or row.get("source") or "")
     subsystem, module = _case_log_hierarchy(source_path, str(row.get("component") or ""))
-    template = _normalize_template(message)
     codes = []
     for match in _ERROR_CODE_RE.finditer(f"{message} {raw}"):
         codes.append({"key": re.sub(r"[\s_-]+", "", match.group(1).lower()), "value": match.group(2).lower(), "raw": match.group(0)})
-    return {
+    source_kind = str(row.get("source_kind") or row.get("source_category") or "").strip().lower()
+    return normalize_evidence_item({
         "source_entry_id": f"atlog-ai-{uuid4().hex}",
         "timestamp": str(row.get("time") or ""),
         "raw": raw,
@@ -382,34 +380,38 @@ def _knowledge_evidence(row: dict[str, Any]) -> dict[str, Any] | None:
         "function_name": "",
         "source_file": source_path,
         "source_line": row.get("line_number"),
-        "source_category": "case_report" if report_evidence else "debug" if "full_logs/log/debug/" in source_path else "run",
+        "source_category": source_kind or ("debug" if "full_logs/log/debug/" in source_path else "run"),
         "process_id": "",
         "thread_id": "",
         "trace_id": "",
-        "anomaly_rules": rules,
-        "template": template,
-        "tokens": sorted(_tokens(template))[:120],
+        "anomaly_rules": _anomaly_rules(row),
         "error_codes": codes[:12],
-    }
+    })
 
 
-def build_ai_case_evidences(rows: list[dict[str, Any]], *, require_runtime: bool = True) -> list[dict[str, Any]]:
+def build_ai_case_evidences(rows: list[dict[str, Any]], *, require_runtime: bool = False) -> list[dict[str, Any]]:
+    """AI 证据行 → 案例举证。
+
+    `require_runtime` 保留只为了兼容旧调用点；即使为 True 也不再抛错，而是让调用方
+    通过返回的 matchable 标记自行决定怎么提示。硬性要求「必须有运行日志异常证据」
+    会把用例报告执行类案例永久挡在知识库外面，那正是这个开关曾经的用途。
+    """
     evidences = [item for row in rows if (item := _knowledge_evidence(row)) is not None]
-    if require_runtime:
-        runtime = [item for item in evidences if item.get("anomaly_rules") and item.get("source_category") != "case_report"]
-        if not runtime:
-            raise ValueError("AI 报告缺少可回链的运行日志异常证据，不能保存为案例。")
     # Prefer one coherent evidence chain: test/report evidence first, then runtime evidence.
-    report = [item for item in evidences if item.get("source_category") == "case_report"]
-    runtime = [item for item in evidences if item.get("source_category") != "case_report"]
-    return [*report[:12], *runtime[:88]][:100]
+    report = [item for item in evidences if item.get("evidence_kind") == "case_report"]
+    runtime = [item for item in evidences if item.get("evidence_kind") != "case_report"]
+    ordered = [*report[:12], *runtime[:88]][:100]
+    if require_runtime and not any(item.get("matchable") for item in ordered):
+        # 不再阻断保存：只把「这条案例不会自动被指纹命中」讲清楚。
+        logger.warning("atlog.case_evidences.no_matchable_evidence count=%s", len(ordered))
+    return ordered
 
 
 def accept_ai_diagnosis(result: dict[str, Any], *, target_case_id: int | None = None) -> dict[str, Any]:
     report = result.get("report") if isinstance(result.get("report"), dict) else {}
     analysis = result.get("_deterministic_analysis") if isinstance(result.get("_deterministic_analysis"), dict) else {}
     verified_rows = result.get("_verified_evidence_rows") if isinstance(result.get("_verified_evidence_rows"), list) else []
-    evidences = build_ai_case_evidences(verified_rows, require_runtime=True)
+    evidences = build_ai_case_evidences(verified_rows)
 
     now = datetime.now(timezone.utc).isoformat()
     case_name = str(result.get("case_name") or result.get("case_id") or "自动化用例异常").strip()

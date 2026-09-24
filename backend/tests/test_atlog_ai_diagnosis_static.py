@@ -88,15 +88,23 @@ def test_ai_diagnosis_jobs_expose_public_progress_and_persist_server_side():
 def test_ai_knowledge_acceptance_only_uses_verified_log_evidence():
     bridge = (ROOT / "apps" / "atlog" / "knowledge_bridge.py").read_text(encoding="utf-8")
     agent = (ROOT / "apps" / "atlog" / "ai_agent.py").read_text(encoding="utf-8")
+    evidence = (ROOT / "apps" / "knowledge" / "evidence.py").read_text(encoding="utf-8")
     assert "_verified_evidence_rows" in agent
     assert 'verified_rows = result.get("_verified_evidence_rows")' in bridge
-    assert "缺少可回链的运行日志异常证据" in bridge
     assert "build_ai_case_evidences" in bridge
     assert '"source": "atlog_ai_diagnosis"' in bridge
     assert "match_case_knowledge" in bridge
     assert "target_case_id" in bridge
     assert '"AI补充现场"' in bridge
     assert '"feature_groups": groups' in bridge
+    # 采纳时仍然只保存可回链的真实证据行；但不再用「必须有运行日志异常证据」
+    # 这条硬校验把用例报告执行类案例挡在知识库外 —— 那类案例本来就没有日志行。
+    # 「能不能参与指纹比对」改为写在每条举证上的 matchable 质量信号。
+    assert "缺少可回链的运行日志异常证据" not in bridge
+    assert "require_runtime" in bridge
+    assert "def is_matchable(" in evidence
+    assert "def resolve_evidence_kind(" in evidence
+    assert "EVIDENCE_KIND_CASE_REPORT" in evidence
 
 
 def test_ai_agent_resolves_db_components_then_extracts_targeted_debug_evidence():
@@ -246,7 +254,12 @@ def test_ai_uses_case_intent_report_evidence_and_opens_editor_before_case_save()
     assert "_case_report_evidence_rows" in agent
     assert '"case_report_evidence"' in agent and '"runtime_evidence"' in agent
     assert '"case_evidences"' in agent and '"case_draft"' in agent
-    assert 'source_category in {"case_report", "pytest", "xytest", "case-metadata"}' in serializer
+    # 「哪些来源算用例报告证据」只有一处定义：apps/knowledge/evidence.py。
+    # 序列化器不再自己维护一份副本（两份副本正是「AI 草稿永远存不进案例库」的成因之一）。
+    evidence = (ROOT / "apps" / "knowledge" / "evidence.py").read_text(encoding="utf-8")
+    assert 'REPORT_SOURCE_CATEGORIES = {"case_report", "pytest", "xytest", "case-metadata", "case_metadata"}' in evidence
+    assert "normalize_evidence_item" in serializer
+    assert "evidence_text" in serializer
     assert "AbnormalCaseEditorDialog" in frontend
     assert "setCaseEditorOpen(true)" in frontend
     assert "presetEvidences={aiResult.case_evidences || []}" in frontend

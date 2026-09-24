@@ -1161,6 +1161,21 @@ def _result_card_from_tool(tool: ToolDefinition | None, arguments: dict[str, Any
             ),
             "facts": facts,
             "actions": actions[:2],
+            # 完整的草稿载荷。前端据此在**本轮回答**里直接渲染案例草稿卡片，
+            # 而不是把「整理结构化」留成用户要点第二次的按钮 —— 一次回答就按这个结论走。
+            "case_draft_result": {
+                "ok": True,
+                "markdown": str(data.get("markdown") or ""),
+                "case_draft": draft,
+                "evidences": evidences,
+                "confidence": str(data.get("confidence") or "medium"),
+                "components": [str(item) for item in (data.get("components") or [])],
+                "missing": missing,
+                "missing_labels": missing_labels,
+                "open_questions": [str(item) for item in (data.get("open_questions") or [])],
+                "importable": bool(data.get("importable")),
+                "source": "analysis",
+            },
         }
     return None
 

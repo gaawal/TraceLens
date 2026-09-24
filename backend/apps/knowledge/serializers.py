@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from rest_framework import serializers
 
+from apps.knowledge.evidence import evidence_text, normalize_evidence_item
 from apps.knowledge.models import AbnormalCase
 
 
@@ -13,35 +14,50 @@ def _now_iso() -> str:
 
 
 def _normalize_evidences(value, *, allow_empty: bool = False):
+    """校验并补齐举证。
+
+    只否决「真的没有内容」的举证。指纹模板缺失会推导、异常规则缺失会照常保存，
+    因为有些用例场景的案例不是日志报错，而是用例报告执行过程本身的报错 ——
+    它们没有日志行、没有异常规则，但同样是需要沉淀的案例。
+    「能不能参与指纹匹配」由 apps.knowledge.evidence 判定后写在每条举证上，
+    是质量信号而不是保存门槛。
+    """
     if not isinstance(value, list) or (not value and not allow_empty):
-        raise serializers.ValidationError("至少需要一条异常日志作为举证。")
+        raise serializers.ValidationError("至少需要一条举证。")
     if len(value) > 100:
-        raise serializers.ValidationError("单个现场特征组最多保存 100 条异常举证。")
+        raise serializers.ValidationError("单个现场特征组最多保存 100 条举证。")
     normalized = []
-    has_runtime_rule_evidence = False
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise serializers.ValidationError(f"第 {index + 1} 条举证格式无效。")
-        raw = str(item.get("raw") or "").strip()
-        template = str(item.get("template") or "").strip()
-        anomaly_rules = item.get("anomaly_rules") or []
-        tokens = item.get("tokens") or []
-        source_category = str(item.get("source_category") or "").strip().lower()
-        report_evidence = source_category in {"case_report", "pytest", "xytest", "case-metadata"}
-        if not raw or not template:
-            raise serializers.ValidationError(f"第 {index + 1} 条举证缺少原始日志或指纹模板。")
-        if not isinstance(anomaly_rules, list):
-            raise serializers.ValidationError(f"第 {index + 1} 条举证异常规则格式无效。")
-        if not anomaly_rules and not report_evidence:
-            raise serializers.ValidationError(f"第 {index + 1} 条运行日志举证没有命中异常规则，不能录入异常知识库。")
-        if anomaly_rules and not report_evidence:
-            has_runtime_rule_evidence = True
-        if not isinstance(tokens, list):
-            raise serializers.ValidationError(f"第 {index + 1} 条举证 Token 指纹格式无效。")
-        normalized.append(item)
-    if normalized and not has_runtime_rule_evidence:
-        raise serializers.ValidationError("案例至少需要一条命中异常规则的运行日志证据；pytest/xytest/用例报告证据只能作为补充证据。")
+        for field in ("anomaly_rules", "tokens"):
+            current = item.get(field)
+            if current is not None and not isinstance(current, list):
+                raise serializers.ValidationError(f"第 {index + 1} 条举证 {field} 格式无效。")
+        if not evidence_text(item):
+            raise serializers.ValidationError(f"第 {index + 1} 条举证没有内容（raw / message 都为空）。")
+        normalized.append(normalize_evidence_item(item))
     return normalized
+
+
+def _matchable_evidence_count(groups, evidences) -> int:
+    """案例里真正能参与指纹比对的举证条数。
+
+    界面用它区分「这条案例能被同款日志自动命中」和「这条案例只能靠文本/人工比对」，
+    替代了旧版那句「必须有一条命中异常规则的运行日志」的硬校验。
+
+    有现场特征组时只数组里的：`evidences` 是各组的扁平视图，两边都数会把同一条
+    举证数两遍。
+    """
+    rows = [
+        evidence
+        for group in (groups or [])
+        if isinstance(group, dict) and group.get("enabled", True)
+        for evidence in (group.get("evidences") or [])
+    ]
+    if not rows:
+        rows = list(evidences or [])
+    return sum(1 for row in rows if isinstance(row, dict) and row.get("matchable"))
 
 
 def _make_default_group(evidences, *, source_operation_id: str = "", source_task_name: str = "", environment_name: str = ""):
@@ -67,15 +83,23 @@ def _flatten_groups(groups):
 
 
 class AbnormalCaseSerializer(serializers.ModelSerializer):
+    # 只读的质量信号：这条案例里有多少条举证能参与指纹自动比对。
+    # 为 0 不代表案例无效 —— 用例报告执行类案例本来就只有报告举证。
+    matchable_evidence_count = serializers.SerializerMethodField()
+
     class Meta:
         model = AbnormalCase
         fields = [
             "id", "name", "category", "symptom", "root_cause", "solution", "description",
             "tags", "enabled", "source_operation_id", "source_task_name", "environment",
             "environment_name", "query_snapshot", "evidences", "feature_groups", "governance_history",
-            "fingerprint_version", "evidence_count", "matched_count", "last_matched_at", "created_at", "updated_at",
+            "fingerprint_version", "evidence_count", "matchable_evidence_count",
+            "matched_count", "last_matched_at", "created_at", "updated_at",
         ]
         read_only_fields = ["evidence_count", "matched_count", "last_matched_at", "governance_history", "created_at", "updated_at"]
+
+    def get_matchable_evidence_count(self, instance: AbnormalCase) -> int:
+        return _matchable_evidence_count(instance.feature_groups, instance.evidences)
 
     def validate_name(self, value: str) -> str:
         value = value.strip()

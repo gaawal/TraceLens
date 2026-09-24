@@ -1854,6 +1854,19 @@ export function AiAssistant() {
   }
 
   /**
+   * 把本轮结果卡片里的案例草稿取出来，直接当成本条消息的案例草稿。
+   *
+   * 这就是「一次回答就按这个结论来」：`draft_diagnosis_case` 已经在同一轮里同时产出了
+   * 结论和结构化字段，前端不该再让用户点一次按钮去换第二次模型调用。
+   */
+  function caseDraftFromResultCards(cards?: TraceLensAssistantResultCard[]): AssistantCaseDraftState | undefined {
+    const card = (cards || []).find((item) => item.kind === 'case_draft' && item.case_draft_result?.case_draft);
+    const result = card?.case_draft_result;
+    if (!result?.case_draft) return undefined;
+    return { status: 'ready', result };
+  }
+
+  /**
    * 「整理成案例」 — deterministic trigger, model-assisted extraction.
    *
    * The button (not the model) decides *when* a conclusion becomes a case; this only tells
@@ -2380,11 +2393,16 @@ export function AiAssistant() {
             }
             if (event.type === 'done') {
               settleInterjections('missed');
+              const resultCards = Array.isArray(event.result_cards) ? event.result_cards : undefined;
+              // 本轮分析已经产出案例草稿时，直接挂到消息上：用户看到的是「结论 + 可导入的
+              // 案例草稿」，而不是还要再点一次「整理成案例」去换第二次模型调用。
+              const draftedCase = caseDraftFromResultCards(resultCards);
               updateMessage(conversationId, assistantId, (message) => ({
                 ...message,
                 content: event.message || message.content || '任务已处理。',
                 task: message.task ? { ...message.task, status: message.task.status === 'confirm' ? 'confirm' : 'done', progress: 100 } : message.task,
-                resultCards: Array.isArray(event.result_cards) ? event.result_cards : message.resultCards,
+                resultCards: resultCards || message.resultCards,
+                caseDraft: draftedCase && !message.caseDraft ? draftedCase : message.caseDraft,
                 suggestions: Array.isArray(event.suggested_actions) ? event.suggested_actions.map(String).filter(Boolean).slice(0, 3) : message.suggestions,
               }));
               if (event.memory) {

@@ -454,6 +454,40 @@ def correlate_failure_with_changes(payload: dict) -> dict[str, Any]:
     }
 
 
+def build_case_evidences(entries: list[dict[str, Any]], quoted: list[str]) -> list[dict[str, Any]]:
+    """把「本次分析真实命中的条目」+「模型引用的原文」变成可保存的举证。
+
+    两类都在这里补齐指纹字段（template / tokens / evidence_kind / matchable）。
+    旧实现只写 ``{"raw": ..., "component": "", "timestamp": ""}``，少了 template，
+    于是保存时被序列化器判为「缺少原始日志或指纹模板」——AI 整理的案例**永远存不进去**。
+    补齐放在这里而不是序列化器里，是因为入口就在这：谁产出举证，谁负责让它合法。
+    """
+    from apps.knowledge.evidence import evidence_text, normalize_evidence_item
+
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def push(item: dict[str, Any]) -> None:
+        if len(result) >= 100:
+            return
+        text = evidence_text(item)
+        if not text:
+            return
+        key = text[:400]
+        if key in seen:
+            return
+        seen.add(key)
+        result.append(normalize_evidence_item(item))
+
+    for entry in entries:
+        push({**entry, "source": str(entry.get("source") or "tracepilot")[:64]})
+    for text in quoted:
+        # 模型只给了原文行：来源未知，按自由文本用例片段入库，
+        # 不冒充「带异常规则的运行日志」骗过指纹比对。
+        push({"raw": text[:4000], "source": "tracepilot", "evidence_kind": "case_fragment"})
+    return result
+
+
 @register_function_tool(ToolDefinition(
     id="draft_diagnosis_case",
     name="把诊断结论整理成案例草稿",
@@ -491,17 +525,33 @@ def correlate_failure_with_changes(payload: dict) -> dict[str, Any]:
                 "description": "支撑结论的真实日志原文，必须来自实际读取到的日志",
             },
             "open_questions": {"type": "array", "items": {"type": "string"}, "default": []},
+            "evidence_entries": {
+                "type": "array",
+                "items": {"type": "object"},
+                "default": [],
+                "description": (
+                    "当前分析任务里真实命中的日志/报告条目（原样传入，不要改写）。"
+                    "用于把案例举证绑定到被分析的那份日志上：能带 anomaly_rules / level / "
+                    "source_file / source_line / source_category / evidence_kind 的都要带上，"
+                    "缺失的字段由后端补齐指纹。"
+                ),
+            },
+            "source_task_name": {"type": "string", "default": "", "description": "被分析的日志任务名"},
+            "environment_id": {"type": "integer", "description": "被分析日志所属环境 ID"},
+            "environment_name": {"type": "string", "default": ""},
+            "query_snapshot": {"type": "object", "default": {}, "description": "被分析的日志查询条件快照"},
         },
         "required": ["name", "symptom"],
     },
     use_when=(
-        "一次日志分析已经得出结论，且用户可能需要把它沉淀成案例时。"
-        "结论必须有真实日志证据支撑；不确定的部分写进 open_questions，不要编造根因。"
+        "一次日志分析已经得出结论时就应当调用，不要等用户再问一次。"
+        "本工具一次调用同时产出结论和可入库的案例草稿，用户随后只需确认，不需要再次交互。"
+        "结论必须有真实证据支撑；不确定的部分写进 open_questions，不要编造根因。"
     ),
     do_not_use_when="还在取证阶段、结论尚未成立时；先继续查日志。",
     validation_rules=(
         "root_cause 为空时必须用 open_questions 说明还缺什么证据，不要用猜测填充",
-        "evidence 必须是真实读取到的日志原文",
+        "evidence / evidence_entries 必须来自实际读取到的日志或用例报告，不能改写或编造",
     ),
     implementation="apps.tooling.plugins.analysis.draft_diagnosis_case",
 ))
@@ -525,6 +575,17 @@ def draft_diagnosis_case(payload: dict) -> dict[str, Any]:
     components = [str(item).strip()[:128] for item in (payload.get("components") or []) if str(item).strip()][:12]
     evidence = [str(item).strip() for item in (payload.get("evidence") or []) if str(item).strip()][:40]
     open_questions = [str(item).strip() for item in (payload.get("open_questions") or []) if str(item).strip()][:10]
+    # 案例要绑定到「被分析的那份日志」，而不是只留一段模型摘抄：
+    # 任务名/环境/查询条件进 case_draft，真实条目进 evidences。
+    source_task_name = str(payload.get("source_task_name") or "").strip()[:255]
+    environment_name = str(payload.get("environment_name") or "").strip()[:128]
+    query_snapshot = payload.get("query_snapshot") if isinstance(payload.get("query_snapshot"), dict) else {}
+    environment_id = payload.get("environment_id")
+    try:
+        environment_id = int(environment_id) if environment_id not in (None, "") else None
+    except (TypeError, ValueError):
+        environment_id = None
+    evidence_entries = [item for item in (payload.get("evidence_entries") or []) if isinstance(item, dict)][:100]
 
     if not name or not symptom:
         raise ValueError("name / symptom 不能为空。")
@@ -533,10 +594,14 @@ def draft_diagnosis_case(payload: dict) -> dict[str, Any]:
     # Two renderings on purpose: `missing` stays machine-checkable (callers gate on it),
     # `missing_labels` is what a human reads — deriving both here keeps them in step and
     # stops every consumer from inventing its own Chinese translation of a field name.
+    # 举证可能来自 evidence_entries（页面当时展示的真实日志）而不只是模型引用的原文，
+    # 所以先把最终举证算出来，再判断缺什么 —— 否则「缺证据」会被误报。
+    evidences = build_case_evidences(evidence_entries, evidence)
+
     missing: list[str] = []
     if not root_cause:
         missing.append("root_cause")
-    if not evidence:
+    if not evidences:
         missing.append("evidence")
     if open_questions:
         missing.append("open_questions")
@@ -562,10 +627,10 @@ def draft_diagnosis_case(payload: dict) -> dict[str, Any]:
         lines.append("")
         lines.append("### 处理建议")
         lines.append(solution)
-    if evidence:
+    if evidences:
         lines.append("")
-        lines.append(f"### 关键证据（{len(evidence)} 条）")
-        lines.extend(f"- `{item[:400]}`" for item in evidence[:12])
+        lines.append(f"### 关键证据（{len(evidences)} 条）")
+        lines.extend(f"- `{str(item.get('raw'))[:400]}`" for item in evidences[:12])
     if open_questions:
         lines.append("")
         lines.append("### 待确认")
@@ -586,11 +651,12 @@ def draft_diagnosis_case(payload: dict) -> dict[str, Any]:
             "solution": solution,
             "description": markdown,
             "tags": tags,
+            "source_task_name": source_task_name,
+            "environment": environment_id,
+            "environment_name": environment_name,
+            "query_snapshot": query_snapshot,
         },
-        "evidences": [
-            {"raw": item[:4000], "component": "", "timestamp": "", "source": "tracepilot"}
-            for item in evidence
-        ],
+        "evidences": evidences,
         "confidence": confidence,
         "components": components,
         "missing": missing,

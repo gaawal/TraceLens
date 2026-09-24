@@ -16821,3 +16821,38 @@ html.workstation-docked {
 .docked-timeline-body .process-gantt-scroll-shell { flex: 1 1 auto; min-height: 0; }
 .docked-timeline-body .process-gantt-scroll { height: 100%; max-height: none; }
 .docked-timeline-body > .live-ribbon { flex: none; }
+
+/* ---- 案例举证：用例片段（不是日志报错的案例也要能入库） ---- */
+.knowledge-fragment-picker { border-color: #dbe6f5; background: #fbfdff; }
+.knowledge-fragment-input { display: flex; gap: 8px; align-items: flex-end; padding: 0 12px 10px; }
+.knowledge-fragment-input textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #334155;
+  background: #fff;
+  border: 1px solid #dde5ef;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.knowledge-fragment-input textarea:focus { outline: none; border-color: #9fc0ed; box-shadow: 0 0 0 3px rgba(59, 130, 246, .12); }
+.knowledge-fragment-input .button { flex: none; }
+.knowledge-fragment-row { display: flex; align-items: flex-start; gap: 8px; }
+.knowledge-fragment-row .knowledge-evidence-select-content { flex: 1 1 auto; min-width: 0; }
+.knowledge-fragment-remove {
+  flex: none;
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border: 0; border-radius: 6px;
+  background: transparent; color: #94a3b8; cursor: pointer;
+}
+.knowledge-fragment-remove:hover { background: #fdecec; color: #c2410c; }
+
+/* 非日志举证（用例片段 / 用例报告）用纯文本行，不套日志行的假字段版式。 */
+.knowledge-evidence-log-row.is-non-log-evidence { grid-template-columns: minmax(0, 1fr); }
+.knowledge-evidence-log-row.is-non-log-evidence .log-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-category-badge.case-report { background: #eef2ff; color: #4338ca; }
+.log-category-badge.case-fragment { background: #fff7ed; color: #b45309; }

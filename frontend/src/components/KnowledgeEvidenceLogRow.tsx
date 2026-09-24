@@ -33,6 +33,9 @@ function sourceCategoryMeta(category?: string): { label: string; className: stri
     case 'run': return { label: '运行日志', className: 'run' };
     case 'helf': return { label: 'HELF日志', className: 'helf' };
     case 'sil': return { label: 'SIL日志', className: 'sil' };
+    // 不是日志的举证也要能一眼认出来源，而不是被当成「没有来源的日志」。
+    case 'case_report': return { label: '用例报告', className: 'case-report' };
+    case 'case_fragment': return { label: '用例片段', className: 'case-fragment' };
     default: return undefined;
   }
 }
@@ -105,6 +108,11 @@ export function KnowledgeEvidenceLogRow({ evidence, entry, errorRules = [], onLo
   const level = entry?.level || evidence?.level || 'LOG';
   const severity = severityFrom(level, entry?.severity || evidence?.severity);
   const message = messageOverride ?? entry?.message ?? evidence?.message ?? evidence?.raw ?? '';
+  // 用例片段/报告证据不是日志行：没有时间、级别、模块，硬套日志行的版式
+  // 会显示成「— | 未知模块 | LOG」这种假字段。这里换成纯文本行。
+  const isLogEvidence = Boolean(entry) || (evidence?.evidence_kind
+    ? evidence.evidence_kind === 'runtime_log'
+    : Boolean(evidence?.timestamp || evidence?.level || evidence?.module || evidence?.component));
   const sourceFile = entry?.source.fileName || entry?.sourceFile || evidence?.source_file || '';
   const sourceLine = entry?.source.lineNumber || entry?.lineNumber || evidence?.source_line;
   const sourceText = sourceFile ? `${sourceFile}${sourceLine ? `:${sourceLine}` : ''}` : '';
@@ -133,13 +141,15 @@ export function KnowledgeEvidenceLogRow({ evidence, entry, errorRules = [], onLo
   }
 
   return <div
-    className={`log-row knowledge-evidence-log-row severity-${severity}`}
+    className={`log-row knowledge-evidence-log-row ${isLogEvidence ? `severity-${severity}` : 'is-non-log-evidence'}`}
     style={componentStyle(component)}
     title={messageOverride ?? entry?.raw ?? evidence?.raw ?? message}
   >
-    <span className="log-time" title={timestamp}>{timestamp}</span>
-    <span className="component-badge compact" style={componentStyle(component)} title={`模块：${component}`}>{component}</span>
-    <span className={`level-badge level-${String(level).toLowerCase()}`}>{level}</span>
+    {isLogEvidence && <>
+      <span className="log-time" title={timestamp}>{timestamp}</span>
+      <span className="component-badge compact" style={componentStyle(component)} title={`模块：${component}`}>{component}</span>
+      <span className={`level-badge level-${String(level).toLowerCase()}`}>{level}</span>
+    </>}
     <span className="log-summary" title={message}><HighlightedEvidenceText text={message} rules={highlightRules}/></span>
     <span className="log-row-meta">
       {sourceText && <button type="button" className={`source-location-button ${copied ? 'copied' : ''}`} onClick={copySource} title={`${sourceText}\n点击复制代码文件和行号`}><Copy size={12}/><span>{copied ? '已复制' : basename(sourceText)}</span></button>}

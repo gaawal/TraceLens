@@ -1,4 +1,5 @@
 import { registerPageContextReader } from './assistant/contextRegistry';
+import { createAbnormalEvidence } from './rendering/abnormalKnowledge';
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import {
@@ -5147,6 +5148,20 @@ export default function App() {
           displayed_page_sampled: pageEvidence.length < paginatedEntries.length,
           displayed_evidence_source: 'rendered-current-page',
           displayed_evidence: pageEvidence,
+          // 结构化版本（同一批条目）。字符串版给模型读，这一份给后端把案例**绑定到
+          // 被分析的这份日志**：保存案例时不需要模型再抄一遍日志行，也不依赖第二次
+          // AI 交互。字段与知识库举证契约一致，指纹缺失时由后端补齐。
+          displayed_evidence_entries: pageEvidenceCandidates
+            .slice(0, 12)
+            .map((entry) => {
+              const evidence = createAbnormalEvidence(entry, errorRules);
+              return {
+                ...evidence,
+                raw: String(evidence.raw || '').slice(0, 1200),
+                message: String(evidence.message || '').slice(0, 600),
+                evidence_kind: 'runtime_log',
+              };
+            }),
           displayed_entries: paginatedEntries.slice(0, 80).map((entry) => ({ id: entry.id, line_number: entry.lineNumber, source_file: entry.sourceFile, timestamp: entry.timestamp, trace_id: entry.rpc.traceId, component: entry.component })),
           folding_enabled: foldingEnabled,
           function_fold_summary: assistantFunctionFoldSummary,

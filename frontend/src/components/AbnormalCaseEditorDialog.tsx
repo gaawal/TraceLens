@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { AlertTriangle, BookOpenCheck, Check, GitMerge, PlusCircle, Save, ShieldCheck, X } from 'lucide-react';
+import { AlertTriangle, BookOpenCheck, BookPlus, Check, GitMerge, PlusCircle, Save, ShieldCheck, X } from 'lucide-react';
 import {
   createAbnormalCase,
   listAbnormalCases,
@@ -39,6 +39,14 @@ interface Props {
   embedded?: boolean;
   /** 嵌入时把标题改成标签页语义，避免出现第二层「录入异常案例」。 */
   embeddedTitle?: string;
+}
+
+/** 举证类型的中文标签。后端会带 evidence_kind_label，这里只是老数据的兜底。 */
+function evidenceKindLabel(evidence: AbnormalCaseEvidence): string {
+  if (evidence.evidence_kind_label) return evidence.evidence_kind_label;
+  if (evidence.evidence_kind === 'case_report' || evidence.source_category === 'case_report') return '用例报告';
+  if (evidence.evidence_kind === 'case_fragment') return '用例片段';
+  return '运行日志';
 }
 
 function featureGroupId(): string {
@@ -89,18 +97,58 @@ export function AbnormalCaseEditorDialog(props: Props) {
   const [selectedPresetIds, setSelectedPresetIds] = useState<Set<string>>(() => new Set(presetEvidences.map((evidence, index) => evidence.source_entry_id || `preset-${index}`)));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  // 用例片段举证：有些用例场景的案例根本不是日志报错，而是用例报告执行过程本身的报错。
+  // 这类案例没有日志行可选，必须允许用户直接贴一段报告原文/用例描述作为举证。
+  const [fragmentDraft, setFragmentDraft] = useState('');
+  const [fragmentEvidences, setFragmentEvidences] = useState<AbnormalCaseEvidence[]>([]);
   const [duplicateCandidates, setDuplicateCandidates] = useState<AbnormalCaseDuplicateCandidate[]>();
 
   const newEvidences = useMemo(() => {
     const preset = presetEvidences.filter((evidence, index) => selectedPresetIds.has(evidence.source_entry_id || `preset-${index}`));
     const live = abnormalEntries.filter((entry) => selectedIds.has(entry.id)).map((entry) => createAbnormalEvidence(entry, errorRules));
     const seen = new Set<string>();
-    return [...preset, ...live].filter((evidence) => {
+    return [...preset, ...fragmentEvidences, ...live].filter((evidence) => {
       const key = `${evidence.source_file}|${evidence.source_line || ''}|${evidence.raw}`;
       if (seen.has(key)) return false;
       seen.add(key); return true;
     });
-  }, [abnormalEntries, errorRules, presetEvidences, selectedIds, selectedPresetIds]);
+  }, [abnormalEntries, errorRules, presetEvidences, fragmentEvidences, selectedIds, selectedPresetIds]);
+
+  function addFragmentEvidence() {
+    const text = fragmentDraft.trim();
+    if (!text) return;
+    const evidence: AbnormalCaseEvidence = {
+      source_entry_id: `fragment-${Date.now()}-${fragmentEvidences.length}`,
+      // 不写时间戳/级别：用例片段不是日志行，编一个假时间只会让它看起来像日志。
+      timestamp: '',
+      raw: text,
+      message: text,
+      level: '',
+      severity: 'warning',
+      subsystem: '',
+      module: '',
+      component: '',
+      function_name: '',
+      source_file: '',
+      source_line: undefined,
+      source_category: 'case_fragment',
+      anomaly_rules: [],
+      // 指纹字段留空：后端会按原文推导。这里不自己造模板，避免两套归一化各说各话。
+      template: '',
+      tokens: [],
+      error_codes: [],
+      evidence_kind: 'case_fragment',
+      evidence_kind_label: '用例片段',
+    };
+    setFragmentEvidences((current) => [...current, evidence]);
+    setFragmentDraft('');
+    setDuplicateCandidates(undefined);
+  }
+
+  function removeFragmentEvidence(id: string) {
+    setFragmentEvidences((current) => current.filter((item) => item.source_entry_id !== id));
+    setDuplicateCandidates(undefined);
+  }
   const previewEvidences = props.caseItem ? activeAbnormalCaseEvidences(props.caseItem) : newEvidences;
   const allEvidenceSelected = abnormalEntries.length > 0 && abnormalEntries.every((entry) => selectedIds.has(entry.id));
 
@@ -169,7 +217,7 @@ export function AbnormalCaseEditorDialog(props: Props) {
   async function save(forceCreate = false) {
     const trimmed = name.trim();
     if (!trimmed) { setError('请填写案例名称。'); return; }
-    if (!props.caseItem && !newEvidences.length) { setError('至少选择一条异常日志作为案例举证。'); return; }
+    if (!props.caseItem && !newEvidences.length) { setError('至少选择一条举证：运行日志、用例报告或用例片段都可以。'); return; }
     setSaving(true); setError('');
     try {
       if (props.caseItem) {
@@ -209,7 +257,7 @@ export function AbnormalCaseEditorDialog(props: Props) {
         </section>
 
         {!props.caseItem && presetEvidences.length > 0 && <section className="knowledge-evidence-picker ai-prefill-evidence">
-          <header><div><BookOpenCheck size={17}/><strong>AI 已验证举证</strong><span>{selectedPresetIds.size} / {presetEvidences.length}</span></div><div className="knowledge-evidence-picker-actions"><small>包含用例报告证据与运行日志证据，可在保存前取消不需要的证据。</small></div></header>
+          <header><div><BookOpenCheck size={17}/><strong>AI 已验证举证</strong><span>{selectedPresetIds.size} / {presetEvidences.length}</span></div><div className="knowledge-evidence-picker-actions"><small>可包含运行日志、用例报告和用例片段举证；可在保存前取消不需要的证据。</small></div></header>
           <div className="knowledge-evidence-list">
             {presetEvidences.map((evidence, index) => {
               const id = evidence.source_entry_id || `preset-${index}`;
@@ -218,11 +266,33 @@ export function AbnormalCaseEditorDialog(props: Props) {
                 <span className="knowledge-check">{selected ? <Check size={13}/> : null}</span>
                 <div className="knowledge-evidence-select-content">
                   <KnowledgeEvidenceLogRow evidence={evidence}/>
-                  <div className="knowledge-evidence-select-meta"><span>来源：{evidence.source_category === 'case_report' ? '用例报告' : '运行日志'}</span><span>异常规则：{evidence.anomaly_rules?.map((rule) => rule.keyword).join(', ') || '报告证据'}</span>{evidence.module && <span>组件：{evidence.subsystem ? `${evidence.subsystem} / ` : ''}{evidence.module}</span>}</div>
+                  <div className="knowledge-evidence-select-meta"><span>类型：{evidenceKindLabel(evidence)}</span><span>{evidence.anomaly_rules?.length ? `异常规则：${evidence.anomaly_rules.map((rule) => rule.keyword).join(', ')}` : '不含异常规则（不参与指纹比对）'}</span>{evidence.module && <span>组件：{evidence.subsystem ? `${evidence.subsystem} / ` : ''}${evidence.module}</span>}</div>
                 </div>
               </div>;
             })}
           </div>
+        </section>}
+
+        {!props.caseItem && <section className="knowledge-evidence-picker knowledge-fragment-picker">
+          <header><div><BookPlus size={17}/><strong>用例片段举证</strong><span>{fragmentEvidences.length} 条</span></div><div className="knowledge-evidence-picker-actions"><small>用例报告执行过程本身的报错（断言失败、超时、pytest/xytest 报错）不是日志行，直接贴原文即可入库。</small></div></header>
+          <div className="knowledge-fragment-input">
+            <textarea
+              value={fragmentDraft}
+              onChange={(event) => setFragmentDraft(event.target.value)}
+              placeholder="例如：AssertionError: expected dose 3.0 got 5.2（粘贴用例报告/断言/执行过程的原文）"
+              rows={3}
+            />
+            <button type="button" className="button secondary compact" disabled={!fragmentDraft.trim()} onClick={addFragmentEvidence}><PlusCircle size={13}/> 加为举证</button>
+          </div>
+          {fragmentEvidences.length > 0 && <div className="knowledge-evidence-list">
+            {fragmentEvidences.map((evidence) => <div className="knowledge-evidence-select selected knowledge-fragment-row" key={evidence.source_entry_id}>
+              <div className="knowledge-evidence-select-content">
+                <KnowledgeEvidenceLogRow evidence={evidence} messageOverride={evidence.raw}/>
+                <div className="knowledge-evidence-select-meta"><span>类型：用例片段</span><span>不含异常规则（不参与指纹比对，仍会入库并可被检索）</span></div>
+              </div>
+              <button type="button" className="knowledge-fragment-remove" aria-label="移除这条用例片段举证" onClick={() => removeFragmentEvidence(String(evidence.source_entry_id))}><X size={13}/></button>
+            </div>)}
+          </div>}
         </section>}
 
         {!props.caseItem && <section className="knowledge-evidence-picker">
@@ -239,7 +309,7 @@ export function AbnormalCaseEditorDialog(props: Props) {
                 </div>
               </div>;
             })}
-            {!abnormalEntries.length && <div className="knowledge-empty-inline"><AlertTriangle size={18}/>当前筛选范围没有异常日志。</div>}
+            {!abnormalEntries.length && <div className="knowledge-empty-inline"><AlertTriangle size={18}/>当前筛选范围没有异常日志；可以用上面的「用例片段举证」直接贴报告原文。</div>}
           </div>
         </section>}
 
@@ -259,10 +329,10 @@ export function AbnormalCaseEditorDialog(props: Props) {
           <header><strong>指纹预览</strong><span>{previewEvidences.length} 条证据{props.caseItem ? ` · ${effectiveAbnormalCaseFeatureGroups(props.caseItem).length} 组现场特征` : ''}</span></header>
           <div className="knowledge-fingerprint-list">
             {previewEvidences.map((evidence, index) => <article key={`${evidence.source_entry_id || index}-${index}`}>
-              <div className="knowledge-fingerprint-title"><b>证据 {index + 1}</b><span>{evidence.subsystem ? `${evidence.subsystem} / ` : ''}{evidence.module || evidence.component || '未知模块'}</span></div>
+              <div className="knowledge-fingerprint-title"><b>证据 {index + 1} · {evidenceKindLabel(evidence)}</b><span>{evidence.subsystem ? `${evidence.subsystem} / ` : ''}{evidence.module || evidence.component || (evidence.evidence_kind === 'runtime_log' ? '未知模块' : '不绑定模块')}</span></div>
               <div className="knowledge-fingerprint-log-label">归一化指纹</div>
               <KnowledgeEvidenceLogRow evidence={evidence} messageOverride={evidence.template}/>
-              <div className="knowledge-fingerprint-meta"><span>异常规则：{evidence.anomaly_rules?.length ? evidence.anomaly_rules.map((rule) => rule.keyword).join(', ') : '—'}</span><span>Token：{evidence.tokens?.slice(0, 10).join(', ') || '—'}</span><span>函数：{evidence.function_name || '—'}</span><span>错误码：{evidence.error_codes?.length ? evidence.error_codes.map((item) => item.value).join(', ') : '无显式错误码（不影响录入）'}</span></div>
+              <div className="knowledge-fingerprint-meta"><span>异常规则：{evidence.anomaly_rules?.length ? evidence.anomaly_rules.map((rule) => rule.keyword).join(', ') : '—'}</span><span>Token：{evidence.tokens?.slice(0, 10).join(', ') || '—'}</span><span>函数：{evidence.function_name || '—'}</span><span>错误码：{evidence.error_codes?.length ? evidence.error_codes.map((item) => item.value).join(', ') : '无显式错误码（不影响录入）'}</span>{evidence.matchable === false && <span>不参与指纹比对，仍会入库并可被检索</span>}</div>
             </article>)}
           </div>
         </section>

@@ -96,6 +96,82 @@ class EnvironmentContextManager:
             targets.append({"subsystem": subsystem, "module": module})
         return targets
 
+    @staticmethod
+    def _case_evidence_entries(locator: dict[str, Any]) -> list[dict[str, Any]]:
+        """把「用户当时正在看的那批日志」变成案例举证。
+
+        浏览器已经把结构化条目放在 `displayed_evidence_entries` 里（含异常规则、来源文件、
+        行号、级别、指纹）。这里只做搬运和裁剪，绝不重新解析字符串版本 ——
+        重新解析是伪造来源的最短路径。
+        """
+        entries: list[dict[str, Any]] = []
+        selected = locator.get("selected_entry") if isinstance(locator.get("selected_entry"), dict) else None
+        candidates = list(locator.get("displayed_evidence_entries") or [])
+        if selected:
+            candidates.insert(0, selected)
+        seen: set[str] = set()
+        for item in candidates:
+            if not isinstance(item, dict) or len(entries) >= 12:
+                continue
+            raw = str(item.get("raw") or item.get("message") or "").strip()
+            if not raw:
+                continue
+            key = raw[:400]
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = {key_name: item.get(key_name) for key_name in (
+                "raw", "message", "level", "severity", "subsystem", "module", "component",
+                "function_name", "source_file", "source_line", "source_category",
+                "timestamp", "anomaly_rules", "template", "tokens", "error_codes",
+            )}
+            entry["raw"] = raw[:4000]
+            entry["source"] = str(item.get("source_file") or "tracepilot")[:255]
+            entry["evidence_kind"] = str(item.get("evidence_kind") or "").strip() or None
+            entries.append({key_name: value for key_name, value in entry.items() if value not in (None, "")})
+        return entries
+
+    def _inject_case_binding(self, next_args: dict[str, Any], runtime: dict[str, Any]) -> None:
+        """把案例草稿绑定到「本次分析的那份日志」。
+
+        模型只决定「现在该沉淀案例了」；绑定到哪份日志、用哪些举证，是运行时已经
+        掌握的确定性事实，不该让模型复述一遍（它抄错一次，案例就挂到别人身上了）。
+        """
+        locator = runtime.get("log_locator") if isinstance(runtime.get("log_locator"), dict) else {}
+        if not locator:
+            return
+        if not str(next_args.get("source_task_name") or "").strip():
+            next_args["source_task_name"] = str(locator.get("task_name") or "")[:255]
+        if not next_args.get("environment_id"):
+            environment_id = self._positive_int(locator.get("environment_id") or runtime.get("environment_id"))
+            if environment_id is not None:
+                next_args["environment_id"] = environment_id
+        if not str(next_args.get("environment_name") or "").strip():
+            next_args["environment_name"] = str(
+                runtime.get("_assistant_resolved_environment_name") or locator.get("environment_name") or ""
+            )[:128]
+        if not isinstance(next_args.get("query_snapshot"), dict) or not next_args.get("query_snapshot"):
+            request_range = locator.get("query_time_range") if isinstance(locator.get("query_time_range"), dict) else {}
+            next_args["query_snapshot"] = {
+                "task_id": str(locator.get("task_id") or ""),
+                "task_name": str(locator.get("task_name") or "")[:255],
+                "source": str(locator.get("source") or ""),
+                "start_time": str(request_range.get("start") or ""),
+                "end_time": str(request_range.get("end") or ""),
+                "source_categories": list(locator.get("source_categories") or [])[:8],
+                "fm_targets": list(locator.get("fm_targets") or [])[:12],
+                "keyword": str(locator.get("keyword") or "")[:255],
+                "errors_only": bool(locator.get("errors_only")),
+                "result_count": locator.get("result_count"),
+                "source_files": list(locator.get("source_files") or [])[:8],
+            }
+        # 模型自己传了结构化条目就优先用它的；否则用页面当时展示的那一批，
+        # 保证「保存的案例」和「刚分析过的日志」是同一份证据。
+        if not next_args.get("evidence_entries"):
+            entries = self._case_evidence_entries(locator)
+            if entries:
+                next_args["evidence_entries"] = entries
+
     def absorb_result(self, tool_id: str, data: Any, context: dict[str, Any] | None) -> None:
         """Persist deterministic Tool facts back into the runtime context.
 
@@ -187,6 +263,9 @@ class EnvironmentContextManager:
                     "client_ip": str(trace_context.get("client_ip") or "").strip(),
                     "source": str(trace_context.get("source") or "assistant").strip() or "assistant",
                 }
+
+        if tool_id == "draft_diagnosis_case":
+            self._inject_case_binding(next_args, runtime)
 
         if "environment_id" in properties:
             # A resolver-produced id is authoritative.  Never let the model guess or

@@ -727,6 +727,16 @@ export interface AbnormalCaseEvidence {
   template: string;
   tokens: string[];
   error_codes: AbnormalCaseErrorCode[];
+  /**
+   * 举证类型：runtime_log（运行日志）/ case_report（用例报告）/ case_fragment（用例片段）。
+   *
+   * 有些用例场景的案例不是日志报错，而是用例报告执行过程本身的报错 —— 它们没有日志行，
+   * 也该能入库。所以「是不是日志」只是类型，不是保存门槛。
+   */
+  evidence_kind?: 'runtime_log' | 'case_report' | 'case_fragment' | string;
+  evidence_kind_label?: string;
+  /** 后端判定：这条举证能否参与指纹自动比对。false 不影响保存与检索。 */
+  matchable?: boolean;
 }
 
 export interface AbnormalCaseFeatureGroup {
@@ -1092,6 +1102,13 @@ export interface TraceLensAssistantResultCard {
   summary?: string;
   facts?: Array<{ label: string; value: string }>;
   actions?: Array<{ label: string; kind: 'ui' | 'prompt' | string; action?: Record<string, unknown>; prompt?: string }>;
+  /**
+   * `case_draft` 卡片专用：本轮分析已经产出的完整案例草稿。
+   *
+   * 有了它，「整理成案例」不再需要第二次模型调用 —— 本轮回答里就直接渲染案例草稿
+   * 卡片。字段与 /tools/case-draft/ 的返回一致，前端只有一条渲染路径。
+   */
+  case_draft_result?: TraceLensCaseDraftResponse;
 }
 
 export interface TraceLensAssistantTokenUsage {
