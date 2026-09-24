@@ -1096,6 +1096,32 @@ def _append_step_output(
     )
 
 
+def process_control_command(environment: Environment, action: str) -> tuple[str, str]:
+    """一键「停进程 / 启动进程」用的命令。
+
+    与部署步骤共用同一份命令文本（停止命令和启动命令的三种仿真模式分支），
+    避免这里和部署流程各写一套、改一边忘一边。
+
+    仿真模式取自该环境最近一次部署；没有部署记录时按默认 sim0_sil。
+    """
+    deployment = environment.deployments.order_by("-created_at").first()
+    mode = str(getattr(deployment, "simulation_mode", "") or "").strip() or "sim0_sil"
+    configuration = (getattr(deployment, "configuration", None) or {}) if deployment else {}
+    precheck_stop_lower = bool(configuration.get("precheck_stop_lower", False))
+    if action == "stop":
+        command = "cd ~/SW && stop.sh -les" if precheck_stop_lower else "cd ~/SW && stop.sh -ls"
+        return command, STEP_NAMES[STEP_STOP]
+    if action != "start":
+        raise ValueError("只支持 stop / start。")
+    if mode == "sim2":
+        command = "cd ~/SW && start.sh -f"
+    elif mode == "sim0_real":
+        command = "cd ~/SW && start.sh -ef"
+    else:
+        command = "cd ~/SW && start.sh -eif"
+    return command, STEP_NAMES[STEP_START]
+
+
 def _publish_deployment_state(deployment_id: int) -> None:
     DeploymentEventBus.publish_state(deployment_id)
 

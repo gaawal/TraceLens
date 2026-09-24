@@ -17,11 +17,14 @@ import {
   LoaderCircle,
   Network,
   Pencil,
+  Play,
   Plus,
+  PowerOff,
   RefreshCw,
   Search,
   Server,
   Settings2,
+  Star,
   Terminal,
   Trash2,
   X,
@@ -41,6 +44,7 @@ import {
   listEnvironmentFolders,
   listEnvironments,
   queryVersion,
+  runEnvironmentProcessControl,
   syncLowerMachineTime,
   testMachineDraft,
   updateEnvironment,
@@ -263,6 +267,8 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
   const [activeResourceId, setActiveResourceId] = useState<number | undefined>(loadStoredActiveResource);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
+  /** 最近一次「停/启进程」的命令与输出，贴在详情里，比一句「已完成」可信。 */
+  const [processResult, setProcessResult] = useState<{ environmentId: number; action: 'stop' | 'start'; ok: boolean; label: string; command: string; output: string }>();
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [resourceMessages, setResourceMessages] = useState<Record<number, string>>(() => loadStoredResourceNotices(RESOURCE_MESSAGES_STORAGE_KEY));
@@ -395,6 +401,15 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
     groups.push({ key: 'unfiled', title: '未分组', depth: 0, environments: environments.filter((item) => !item.folder) });
     return groups.filter((group) => group.environments.length > 0);
   }, [environments, folders]);
+
+  // 总览统计：部署中直接取部署状态，收藏取环境上的 is_favorite，避免再引一份易漂移的本地状态。
+  const overviewStats = useMemo(() => ({
+    deploying: environments.filter((item) => {
+      const status = deploymentByEnvironment[item.id]?.status;
+      return Boolean(status && ['pending', 'running', 'stopping'].includes(status));
+    }).length,
+    favorite: environments.filter((item) => item.is_favorite).length,
+  }), [environments, deploymentByEnvironment]);
 
   async function refresh(preferredId?: number) {
     setLoading(true);
@@ -584,6 +599,34 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
       if (resourceId) setResourceErrors((current) => ({ ...current, [resourceId]: text }));
       else setError(text);
     } finally { setBusy(''); }
+  }
+
+  /** 收藏：写环境上的 is_favorite，成功后本地就地更新（不必整表重拉）。 */
+  async function toggleFavorite(environment: EnvironmentSummary) {
+    const next = !environment.is_favorite;
+    try {
+      await updateEnvironment(environment.id, { is_favorite: next });
+      setEnvironments((current) => current.map((item) => item.id === environment.id ? { ...item, is_favorite: next } : item));
+      setResourceMessage(environment.id, next ? `已收藏 ${environment.name}` : `已取消收藏 ${environment.name}`);
+    } catch (exc) {
+      setResourceErrors((current) => ({ ...current, [environment.id]: exc instanceof Error ? exc.message : String(exc) }));
+    }
+  }
+
+  /**
+   * 一键停/启进程：跑的是部署流程里同一份 stop.sh / start.sh。
+   * 会真的停掉现场进程，所以点之前必须确认，结果（命令 + 输出）原样贴出来。
+   */
+  async function runProcessControl(environment: EnvironmentSummary, action: 'stop' | 'start') {
+    const label = action === 'stop' ? '停止进程' : '启动进程';
+    if (!window.confirm(`确认对 ${environment.name} 执行「${label}」？\n将在上位机 ${environment.upper_machine.host} 上执行与部署相同的脚本。`)) return;
+    await run(`process-${action}`, async () => {
+      const result = await runEnvironmentProcessControl(environment.id, action);
+      const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
+      setProcessResult({ environmentId: environment.id, action, ok: result.ok, label: result.label, command: result.command, output });
+      if (result.ok) setResourceMessage(environment.id, `${result.label}完成：${result.command}`);
+      else setResourceErrors((current) => ({ ...current, [environment.id]: `${result.label}失败（exit ${result.exit_status}）：${output || '无输出'}` }));
+    }, environment.id);
   }
 
   function setResourceMessage(resourceId: number, text: string) {
@@ -1083,6 +1126,16 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
             <div><strong>{environment.name}{environment.is_dhh_environment ? <em className="resource-dhh-label">DHH环境</em> : null}</strong><small>{environment.folder_name || '未分组'}</small></div>
           </div>
           {isDeploying && <span className="resource-card-deploying" title={deploymentState?.message || '部署中'}><LoaderCircle className="spin" size={14} />部署中</span>}
+          <button
+            type="button"
+            className={`resource-card-favorite ${environment.is_favorite ? 'active' : ''}`}
+            title={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
+            aria-label={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
+            aria-pressed={Boolean(environment.is_favorite)}
+            onClick={(event) => { event.stopPropagation(); void toggleFavorite(environment); }}
+          >
+            <Star size={15} fill={environment.is_favorite ? 'currentColor' : 'none'} />
+          </button>
         </header>
 
         <div className="resource-card-machine-section">
@@ -1169,7 +1222,7 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
 
         {loading ? <div className="resource-loading"><LoaderCircle className="spin" /> 正在读取环境资源...</div> : !activeResource ? (
           <section className="resource-overview-section">
-            <div className="resource-section-heading"><div><h2>{folderFilter === undefined ? '全部环境' : folderFilter === 'unfiled' ? '未分组' : folders.find((item) => item.id === folderFilter)?.name || '环境资源'}</h2><span>{visibleEnvironments.length} 套</span></div><div className="resource-batch-actions">{selectedResources.size > 0 && <div className="batch-toolbar"><strong>已选 {selectedResources.size}</strong><button className="button ghost compact" type="button" onClick={() => void batchRefreshRuntime()}>刷新所选状态</button><button className="button danger-outline compact" type="button" onClick={() => void batchDeleteResources()}>删除</button><button className="button ghost compact" type="button" onClick={() => setSelectedResources(new Set())}>清空</button></div>}</div></div>
+            <div className="resource-section-heading"><div><h2>{folderFilter === undefined ? '全部环境' : folderFilter === 'unfiled' ? '未分组' : folders.find((item) => item.id === folderFilter)?.name || '环境资源'}</h2><span>{visibleEnvironments.length} 套</span><span className="resource-overview-stats" title="按全部环境资源统计"><em>统计</em>部署中 <strong className={overviewStats.deploying ? 'tone-run' : undefined}>{overviewStats.deploying}</strong> 台<em className="divider">·</em><Star size={12} fill={overviewStats.favorite ? 'currentColor' : 'none'} />收藏 <strong className={overviewStats.favorite ? 'tone-favorite' : undefined}>{overviewStats.favorite}</strong> 台</span></div><div className="resource-batch-actions">{selectedResources.size > 0 && <div className="batch-toolbar"><strong>已选 {selectedResources.size}</strong><button className="button ghost compact" type="button" onClick={() => void batchRefreshRuntime()}>刷新所选状态</button><button className="button danger-outline compact" type="button" onClick={() => void batchDeleteResources()}>删除</button><button className="button ghost compact" type="button" onClick={() => setSelectedResources(new Set())}>清空</button></div>}</div></div>
             {folderFilter === undefined ? <div className="resource-overview-groups">
               {overviewGroups.map((group) => <section className="resource-overview-group" key={group.key}>
                 <header><div><FolderOpen size={15} /><strong>{group.title}</strong></div><span>{group.environments.length} 套</span></header>
@@ -1182,8 +1235,23 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
           <div className="resource-tab-content">
             <section className={`resource-detail-summary ${activeResource.version_mismatch ? 'version-warning' : ''}`}>
               <div className="resource-detail-title"><div className="resource-card-icon large"><Network size={22} /></div><div><h2>{activeResource.name}{activeResource.version_mismatch ? <em className="resource-version-warning-label">版本不一致</em> : null}</h2><p>{activeResource.description || '暂无描述'}</p></div></div>
-              <div className="resource-detail-actions"><button type="button" className="button secondary" disabled={busy === 'runtime'} onClick={() => void refreshOneRuntime(activeResource)}>{busy === 'runtime' ? <LoaderCircle className="spin" size={15} /> : <Activity size={15} />} {busy === 'runtime' ? '刷新中' : '刷新状态'}</button><button type="button" className={`button secondary resource-deploy-button ${activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? 'running' : ''}`} onClick={() => setDeploymentOpen(true)}>{activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? <LoaderCircle className="spin" size={15} /> : <Terminal size={15} />} {activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? '部署中' : '部署环境'}</button><button type="button" className="button secondary" onClick={() => setEditOpen(true)}><Pencil size={15} /> 编辑</button></div>
+              <div className="resource-detail-actions"><button type="button" className="button secondary" disabled={busy === 'runtime'} onClick={() => void refreshOneRuntime(activeResource)}>{busy === 'runtime' ? <LoaderCircle className="spin" size={15} /> : <Activity size={15} />} {busy === 'runtime' ? '刷新中' : '刷新状态'}</button><button type="button" className="button secondary resource-process-stop" disabled={Boolean(busy)} onClick={() => void runProcessControl(activeResource, 'stop')}>{busy === 'process-stop' ? <LoaderCircle className="spin" size={15} /> : <PowerOff size={15} />} {busy === 'process-stop' ? '停止中' : '停进程'}</button><button type="button" className="button secondary resource-process-start" disabled={Boolean(busy)} onClick={() => void runProcessControl(activeResource, 'start')}>{busy === 'process-start' ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />} {busy === 'process-start' ? '启动中' : '启动进程'}</button><button type="button" className={`button secondary resource-deploy-button ${activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? 'running' : ''}`} onClick={() => setDeploymentOpen(true)}>{activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? <LoaderCircle className="spin" size={15} /> : <Terminal size={15} />} {activeDeployment && ['pending', 'running', 'stopping'].includes(activeDeployment.status) ? '部署中' : '部署环境'}</button><button type="button" className="button secondary" onClick={() => setEditOpen(true)}><Pencil size={15} /> 编辑</button></div>
             </section>
+
+            {processResult && processResult.environmentId === activeResource.id && (
+              <section className={`resource-process-result ${processResult.ok ? 'ok' : 'error'}`}>
+                <header>
+                  <div>
+                    <strong>{processResult.label}{processResult.ok ? '完成' : '失败'}</strong>
+                    <code>{processResult.command}</code>
+                  </div>
+                  <button type="button" className="button ghost compact" onClick={() => setProcessResult(undefined)}><X size={13} /> 关闭</button>
+                </header>
+                {processResult.output
+                  ? <pre>{processResult.output}</pre>
+                  : <p>脚本无输出，按退出码判定为{processResult.ok ? '成功' : '失败'}。</p>}
+              </section>
+            )}
 
             <section className="resource-feature-section resource-function-card-section">
               <div className="resource-section-heading"><div><h2>资源功能</h2><span>按功能卡片进入当前资源能力，后续功能会继续在同一行扩展。</span></div></div>

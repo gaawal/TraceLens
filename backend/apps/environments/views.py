@@ -715,6 +715,47 @@ class EnvironmentViewSet(
         DeploymentEventBus.warm_active_index(deployments)
         return Response(EnvironmentDeploymentSummarySerializer(deployments, many=True).data)
 
+    @action(detail=True, methods=["post"], url_path="process-control")
+    def process_control(self, request, pk=None):
+        """一键「停进程 / 启动进程」：在上位机执行与部署步骤相同的 stop.sh / start.sh。
+
+        这是会真的停掉/拉起现场进程的动作，所以命令文本与部署完全共用
+        （``process_control_command``），前端点击前必须二次确认。
+        """
+        from apps.common.services.ssh import SshOperationError, execute
+        from apps.environments.services.deployment import process_control_command
+
+        try:
+            environment = self.get_object()
+        except Environment.DoesNotExist:
+            return Response({"message": "环境不存在"}, status=404)
+        payload = request.data if isinstance(request.data, dict) else {}
+        action = str(payload.get("action") or "").strip().lower()
+        if action not in {"stop", "start"}:
+            return Response({"message": "action 只能是 stop 或 start。"}, status=400)
+        try:
+            command, label = process_control_command(environment, action)
+        except ValueError as exc:
+            return Response({"message": str(exc)}, status=400)
+
+        machine = environment.upper_machine
+        logger.info("environment.process_control.start environment=%s action=%s host=%s", environment.id, action, machine.host)
+        try:
+            result = execute(machine, command, timeout=int(payload.get("timeout") or 600))
+        except SshOperationError as exc:
+            logger.warning("environment.process_control.ssh_failed environment=%s action=%s error=%s", environment.id, action, exc)
+            return Response({"message": f"{label}失败：{exc}", "action": action, "label": label, "command": command}, status=502)
+        return Response({
+            "action": action,
+            "label": label,
+            "command": command,
+            "machine": machine.host,
+            "exit_status": result.exit_status,
+            "stdout": (result.stdout or "")[-8000:],
+            "stderr": (result.stderr or "")[-4000:],
+            "ok": result.exit_status == 0,
+        })
+
     @action(detail=True, methods=["get"], url_path="deployment-defaults")
     def deployment_defaults(self, request, pk=None):
         environment = self.get_object()

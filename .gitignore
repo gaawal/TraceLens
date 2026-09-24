@@ -43,6 +43,9 @@ backend/runtime/
 runtime/
 backend/simremote/run/
 backend/simremote/remote_fs/
+# ATLog 用例报告站：由 `simremote.cli init/realign` 生成，每次生成都会刷新
+# summary.ini / summary_report.xml / *.html 里的时间戳，跟踪只会得到无意义 diff。
+backend/simremote/atlog_site/
 scripts/run/
 *.log
 *.pid

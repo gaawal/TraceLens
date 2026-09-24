@@ -98,6 +98,9 @@ class Environment(TimeStampedModel):
     version_checked_at = models.DateTimeField("版本查询时间", null=True, blank=True)
     deployment_scripts = models.JSONField("部署后脚本历史", default=list, blank=True)
     description = models.TextField("描述", blank=True)
+    # 收藏（五角星）。存在环境上而不是浏览器里：资源是团队共享的，
+    # 「收藏了几台」这种统计只有在共享的前提下才有意义。
+    is_favorite = models.BooleanField("收藏", default=False, db_index=True)
 
     class Meta:
         verbose_name = "环境"

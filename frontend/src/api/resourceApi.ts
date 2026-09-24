@@ -50,6 +50,8 @@ export interface EnvironmentSummary {
   version_mismatch_hosts?: string[];
   last_discovered_at?: string;
   description: string;
+  /** 收藏（五角星）：存在环境上，所以团队看到的是同一份收藏。 */
+  is_favorite?: boolean;
 }
 
 export type DeploymentStatus = 'scheduled' | 'pending' | 'running' | 'stopping' | 'stopped' | 'success' | 'failed';
@@ -1577,6 +1579,28 @@ export async function createEnvironmentFolder(payload: { name: string; parent?: 
   return api('/environment-folders/', { method: 'POST', body: JSON.stringify(payload) });
 }
 
+/** 一键「停进程 / 启动进程」：在上位机执行与部署步骤相同的 stop.sh / start.sh。 */
+export interface EnvironmentProcessControlResult {
+  action: 'stop' | 'start';
+  label: string;
+  command: string;
+  machine: string;
+  exit_status: number;
+  stdout: string;
+  stderr: string;
+  ok: boolean;
+}
+
+export async function runEnvironmentProcessControl(
+  id: number,
+  action: 'stop' | 'start',
+): Promise<EnvironmentProcessControlResult> {
+  return api<EnvironmentProcessControlResult>(`/environments/${id}/process-control/`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  });
+}
+
 export async function updateEnvironmentFolder(id: number, payload: Partial<EnvironmentFolder>): Promise<EnvironmentFolder> {
   return api(`/environment-folders/${id}/`, { method: 'PATCH', body: JSON.stringify(payload) });
 }
@@ -1624,7 +1648,7 @@ export async function disconnectMachineSession(id: number): Promise<void> {
   return api(`/machines/${id}/disconnect-session/`, { method: 'POST', body: '{}' });
 }
 
-export async function updateEnvironment(id: number, payload: { name?: string; description?: string; folder?: number | null }): Promise<EnvironmentSummary> {
+export async function updateEnvironment(id: number, payload: { name?: string; description?: string; folder?: number | null; is_favorite?: boolean }): Promise<EnvironmentSummary> {
   return api(`/environments/${id}/`, { method: 'PATCH', body: JSON.stringify(payload) });
 }
 

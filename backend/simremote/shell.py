@@ -187,9 +187,16 @@ class RemoteShell:
         return "/" + relative.as_posix()
 
     def rewrite_command(self, command: str) -> str:
-        """把命令里的远端绝对路径替换成本地路径。"""
+        """把命令里的远端绝对路径与 ~ / $HOME 替换成本地路径。
+
+        ``~`` 必须一起换：命令是交给本机 shell 执行的，不换就会展开成**开发机的
+        /Users/xxx**（部署与一键停/启进程的 ``cd ~/SW && stop.sh`` 正好是这种写法），
+        于是一会儿 No such file、一会儿动到真实家目录。
+        """
         replacement = str(self.root).rstrip("/") + "/"
+        simulated_home = str(self.home).rstrip("/")
         text = command.replace('"$HOME"/', replacement).replace("$HOME/", replacement)
+        text = re.sub(r"(?<![\w.\-])~(?=/|\s|$)", simulated_home, text)
         return _PREFIX_RE.sub(lambda match: replacement + match.group(1), text)
 
     # ------------------------------------------------------------------ 执行
@@ -207,7 +214,7 @@ class RemoteShell:
         mapped = self.rewrite_command(text)
         try:
             proc = subprocess.run(
-                mapped,
+                self._with_script_path(mapped),
                 shell=True,
                 capture_output=True,
                 cwd=str(self.root) if self.root.exists() else None,
@@ -216,9 +223,18 @@ class RemoteShell:
             return CommandResult(b"", f"shell: {exc}\n".encode("utf-8"), 127)
         return CommandResult(proc.stdout, proc.stderr, proc.returncode)
 
+    def _with_script_path(self, command: str) -> str:
+        """把模拟机的 ~/SW 放进 PATH。
+
+        部署和「一键停/启进程」都写成 `cd ~/SW && stop.sh -ls`（不带 ./），
+        依赖远端把安装脚本放进 PATH；本机 sh 不会从当前目录找可执行文件，
+        不补这一下仿真里就是 `stop.sh: command not found`。
+        """
+        return f'PATH="{self.home}/SW:$PATH"; ' + command
+
     def popen(self, command: str) -> subprocess.Popen:
         """用于 tail -F 这类长驻流式命令。"""
-        mapped = self.rewrite_command(command)
+        mapped = self._with_script_path(self.rewrite_command(command))
         return subprocess.Popen(
             mapped,
             shell=True,

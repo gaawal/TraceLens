@@ -292,7 +292,7 @@ class EnvironmentSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "folder", "folder_name", "upper_machine", "lower_machines", "dhh_machine", "is_dhh_environment", "status", "status_label",
             "station_user_id", "software_version", "version_checked_at", "version_mismatch", "version_mismatch_hosts", "last_discovered_at",
-            "description", "created_at", "updated_at",
+            "description", "is_favorite", "created_at", "updated_at",
         ]
         read_only_fields = [
             "upper_machine", "status", "station_user_id", "software_version",

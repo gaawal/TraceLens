@@ -603,6 +603,17 @@ def prune_tree(root: Path, keep: set[Path], report: GenerationReport) -> None:
         print(f"  [loggen] 另有 {remaining} 个残留待清理，再跑一次 init 即可（小批量保护）")
 
 
+def _sim_script(action: str) -> bytes:
+    """仿真用的 stop.sh / start.sh：忽略部署传的开关（-ls/-les/-es/-f/-ef/-eif），成功退出。"""
+    label = "停止" if action == "stop" else "启动"
+    return (
+        "#!/bin/sh\n"
+        f"# 仿真占位脚本：真实环境由安装包提供。忽略开关，回显一行。\n"
+        f"echo \"[sim] {action}.sh 已执行（{label}上位机进程）args=$*\"\n"
+        "exit 0\n"
+    ).encode("utf-8")
+
+
 def plan_machine(spec: fleet.MachineSpec, *, now: datetime) -> list[tuple[str, Path, bytes, int]]:
     """一台机器的全部**日志**产物：(远端根, 相对路径, 内容, 行数)。"""
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -621,6 +632,12 @@ def plan_machine(spec: fleet.MachineSpec, *, now: datetime) -> list[tuple[str, P
         f"{fleet.SOFTWARE_VERSION}\n".encode("utf-8"),
         1,
     ))
+    # 部署与「一键停/启进程」用的脚本。真实机器上是安装包带的，
+    # 仿真里没有就会 `stop.sh: command not found` —— 功能看着像坏了。
+    # 这里给最小实现：接受部署用到的那些开关，回显一行，退出码 0。
+    home = f"/home/{fleet.SIM_USERNAME}"
+    plan.append((home, Path("SW") / "stop.sh", _sim_script("stop"), 1))
+    plan.append((home, Path("SW") / "start.sh", _sim_script("start"), 1))
 
     if spec.role == "upper":
         for lower in [item for item in fleet.FLEET if item.role == "lower"]:
@@ -656,6 +673,9 @@ def write_plan(
         keep.add(target.resolve())
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
+        # 仿真脚本要能直接执行（部署与一键停/启进程都是 ./stop.sh 风格）
+        if target.suffix == ".sh":
+            target.chmod(0o755)
         report.files += 1
         report.bytes_written += len(payload)
         report.lines += count

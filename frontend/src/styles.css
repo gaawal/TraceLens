@@ -16658,3 +16658,91 @@ html.workstation-docked {
   color: #64748b;
   font-size: 11px;
 }
+
+/* ---- 环境资源总览：收藏星标 / 部署中·收藏统计 / 一键停启进程 ---- */
+.resource-overview-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: #f2f5fa;
+  border: 1px solid #e4eaf3;
+  font-size: 11.5px;
+  color: #7b879a;
+  white-space: nowrap;
+}
+.resource-overview-stats em { font-style: normal; color: #9aa5b6; margin-right: 2px; }
+.resource-overview-stats em.divider { margin: 0 4px; color: #ccd4e0; }
+.resource-overview-stats svg { color: #c9a227; flex: none; }
+.resource-overview-stats strong { font-size: 12px; color: #64748b; }
+.resource-overview-stats strong.tone-run { color: #c2740b; }
+.resource-overview-stats strong.tone-favorite { color: #b8860b; }
+
+.resource-card-favorite {
+  flex: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #c2cbd8;
+  cursor: pointer;
+  transition: color .15s ease, background .15s ease, transform .15s ease;
+}
+.resource-card-favorite:hover { color: #e0a800; background: #fdf6e3; transform: scale(1.08); }
+.resource-card-favorite.active { color: #f0b400; }
+.resource-card-favorite.active:hover { color: #d99e00; }
+.resource-card-favorite:disabled { opacity: .5; cursor: default; }
+
+.resource-process-stop { color: #a83a3a; border-color: #eccfcf; background: #fdf7f7; }
+.resource-process-stop:hover:not(:disabled) { color: #8f2f2f; background: #fbeeee; border-color: #e0b6b6; }
+.resource-process-start { color: #1f7a4d; border-color: #cbe6d8; background: #f6fcf9; }
+.resource-process-start:hover:not(:disabled) { color: #17603d; background: #ecf8f1; border-color: #aed8c4; }
+
+.resource-process-result {
+  border-radius: 12px;
+  border: 1px solid #dbe4ef;
+  background: #fff;
+  padding: 11px 13px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 2px rgba(35, 48, 70, .035);
+}
+.resource-process-result.ok { border-color: #cbe6d8; background: #fafefb; }
+.resource-process-result.error { border-color: #eccfcf; background: #fffafa; }
+.resource-process-result > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.resource-process-result > header > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.resource-process-result strong { font-size: 13px; }
+.resource-process-result.ok strong { color: #1f7a4d; }
+.resource-process-result.error strong { color: #a83a3a; }
+.resource-process-result code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: #4b5a70;
+  background: #f4f7fb;
+  border: 1px solid #e5ebf3;
+  border-radius: 6px;
+  padding: 3px 7px;
+  overflow-wrap: anywhere;
+}
+.resource-process-result pre {
+  margin: 9px 0 0;
+  max-height: 210px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #33415a;
+  background: #f8fafc;
+  border: 1px solid #eaeff6;
+  border-radius: 8px;
+  padding: 9px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.resource-process-result p { margin: 8px 0 0; font-size: 11.5px; color: #8793a6; }
