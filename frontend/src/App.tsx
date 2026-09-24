@@ -2846,18 +2846,10 @@ function LogPaginationBar({
   onPageChange,
   onPageSizeChange,
   showResultActions,
-  onToggleFolding,
-  foldingEnabled,
   onToggleCallFlow,
   callFlowOpen,
   onToggleSemantic,
   semanticEnabled,
-  onExtractData,
-  onRecordCase,
-  onAnalyzeCases,
-  canRecordCase,
-  canAnalyzeCases,
-  onDownload,
   statistics,
 }: {
   page: number;
@@ -2866,18 +2858,10 @@ function LogPaginationBar({
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
   showResultActions?: boolean;
-  onToggleFolding?: () => void;
-  foldingEnabled?: boolean;
   onToggleCallFlow?: () => void;
   callFlowOpen?: boolean;
   onToggleSemantic?: () => void;
   semanticEnabled?: boolean;
-  onExtractData?: () => void;
-  onRecordCase?: () => void;
-  onAnalyzeCases?: () => void;
-  canRecordCase?: boolean;
-  canAnalyzeCases?: boolean;
-  onDownload?: () => void;
   statistics?: { source: number; modules: number; processes: number; threads: number; functions: number; errorTraces: number; errors: number };
 }) {
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -2887,7 +2871,34 @@ function LogPaginationBar({
 
   return (
     <div className="log-pagination-bar" aria-label="日志工具与分页">
-      <div className="log-enhancement-tools" aria-label="日志统计">
+      <div className="log-enhancement-tools" aria-label="日志显示开关与统计">
+        {/* 这三个开关原本就在这里。之前把「折叠/提取/案例/分析/下载」搬到上方 metric-strip 时，
+            连它们的渲染一起删掉了 —— props 还在传，按钮却没了，于是：
+            · 源码语义（每行右侧的语义/标签文本 + 时间线泳道上的彩色标签格子）只能靠默认值常开；
+            · 调用导航（函数名 + 折叠后的树形窗口）没有任何入口能打开。
+            开关放回底部左侧增强工具区，和统计并列。 */}
+        {showResultActions && <>
+          <button
+            type="button"
+            className={`button ghost compact-button ${semanticEnabled ? 'active-tool' : ''}`}
+            aria-pressed={Boolean(semanticEnabled)}
+            onClick={onToggleSemantic}
+            title={semanticEnabled
+              ? '当前显示语义说明与自定义标签（每行右侧），并把标签颜色画到时间线泳道上；点击关闭'
+              : '显示语义说明与自定义标签（每行右侧），并把标签颜色画到时间线泳道上'}
+          >
+            <Sparkles size={14} /> 源码语义
+          </button>
+          <button
+            type="button"
+            className={`button ghost compact-button ${callFlowOpen ? 'active-tool' : ''}`}
+            aria-pressed={Boolean(callFlowOpen)}
+            onClick={onToggleCallFlow}
+            title={callFlowOpen ? '关闭调用导航窗口' : '打开调用导航：函数名与折叠后的调用树'}
+          >
+            <GitBranch size={14} /> 调用导航
+          </button>
+        </>}
         {statistics && <>
           <MetricItem icon={<FileCode2 size={15} />} label="日志源" value={statistics.source} />
           <MetricItem icon={<Boxes size={15} />} label="模块" value={statistics.modules} />
@@ -4631,6 +4642,9 @@ export default function App() {
       const sourceFile = entry.source.fileName;
       const functionName = entry.boundaryFunctionName || entry.functionName;
       if (!sourceFile || !functionName) continue;
+      // 服务端只接受 .py 源码；解析不出 .py 路径的日志（例如只有模块名的日志）会让整个
+      // 批次 400，自动源码语义一个也拿不到。这里先过滤，再让下面的空集分支如实说明原因。
+      if (!sourceFile.trim().toLowerCase().endsWith('.py')) continue;
       const key = semanticSourceKey(sourceFile, functionName);
       if (!key || unique.has(key)) continue;
       unique.set(key, { key, source_file: sourceFile, source_line: entry.source.lineNumber, function_name: functionName });
@@ -4638,7 +4652,7 @@ export default function App() {
     }
 
     if (!targets.length || unique.size === 0) {
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'ready', autoSemantics: {}, semanticAutoMessage: '当前任务没有可自动识别的源码函数或日志未关联源码位置' } : item));
+      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, semanticAutoStatus: 'ready', autoSemantics: {}, semanticAutoMessage: '当前任务没有可自动识别的源码函数（需要日志带 .py 源码位置）' } : item));
       return;
     }
 
@@ -8266,18 +8280,10 @@ export default function App() {
                 onPageChange={setLogPage}
                 onPageSizeChange={(size) => { setLogPageSize(Math.max(100, Math.min(MAX_LOG_PAGE_SIZE, size))); setLogPage(1); }}
                 showResultActions={activeTask.entries.length > 0}
-                onToggleFolding={() => setFoldingEnabled((current) => !current)}
-                foldingEnabled={foldingEnabled}
                 onToggleCallFlow={() => { if (callFlowDialogOpen) setCallFlowDialogOpen(false); else openCallFlowDialog(); }}
                 callFlowOpen={callFlowDialogOpen}
                 onToggleSemantic={() => setSemanticLabelsEnabled((current) => !current)}
                 semanticEnabled={semanticLabelsEnabled}
-                onExtractData={() => void beginDataExtraction()}
-                onRecordCase={() => setAbnormalCaseEditorOpen(true)}
-                onAnalyzeCases={() => setAbnormalCaseAnalysisOpen(true)}
-                canRecordCase={navigableErrorEntries.length > 0}
-                canAnalyzeCases={navigableErrorEntries.length > 0}
-                onDownload={downloadVisibleLogs}
                 statistics={{
                   source: currentSourceCount,
                   modules: currentComponentCount,
