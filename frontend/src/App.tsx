@@ -8181,6 +8181,68 @@ export default function App() {
 
         <div className="metric-strip">
           <div className="metric-strip-actions">
+            {/* 左侧固定组：视图开关与三个窗口。它们决定「怎么看日志」，
+                和右侧那些「对日志做什么」的动作分开摆，位置固定不随手边的按钮增减而移动。 */}
+            <div className="metric-strip-left" aria-label="日志视图工具">
+              <SwitchControl
+                checked={foldingEnabled}
+                label="函数折叠"
+                hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
+                onChange={(checked) => setFoldingEnabled(checked)}
+              />
+            <button
+              type="button"
+              className={`button ghost metric-action-button ${callFlowDialogOpen ? 'active' : ''}`}
+              disabled={!activeTask || activeTask.status !== 'ready' || rawLogMode}
+              aria-pressed={callFlowDialogOpen}
+              onClick={() => { if (callFlowDialogOpen) setCallFlowDialogOpen(false); else openCallFlowDialog(); }}
+              title={
+                rawLogMode ? '原始日志模式不显示调用导航'
+                : !activeTask || activeTask.status !== 'ready' ? '先查询日志，调用导航会按进程 / 函数 / 调用链展开'
+                : callFlowDialogOpen ? '关闭调用导航' : '打开调用导航（进程 / 函数 / 调用链树）'
+              }
+            >
+              <GitBranch size={14} /> 调用导航
+            </button>
+            <button
+              type="button"
+              className="button ghost metric-action-button"
+              disabled={!remoteLogLocator?.environment || !remoteLogLocator.startTime.trim() || !remoteLogLocator.endTime.trim()}
+              onClick={() => {
+                const locator = remoteLogLocator;
+                if (!locator?.environment || !locator.startTime.trim() || !locator.endTime.trim()) return;
+                setEventRestorePreset({
+                  environmentId: locator.environment.id,
+                  environmentName: locator.environment.name,
+                  startTime: locator.startTime.trim(),
+                  endTime: locator.endTime.trim(),
+                });
+                setEventRestoreOpen(true);
+              }}
+              title="选择时间范围后直接读取运行日志 event.log 并展示根因树"
+            >
+              <ListTree size={14} /> 根因树
+            </button>
+            <button
+              type="button"
+              className={`button ghost metric-action-button ${showTimeline ? 'active' : ''}`}
+              disabled={!activeTask || activeTask.status !== 'ready' || rawLogMode}
+              aria-pressed={showTimeline}
+              onClick={() => {
+                const next = !showTimeline;
+                if (next) positionTimelineBelowToolbar();
+                setShowTimeline(next);
+                setProcessTimelineExpanded(true);
+              }}
+              title={
+                rawLogMode ? '原始日志模式不显示时间线'
+                : !activeTask || activeTask.status !== 'ready' ? '先查询日志，时间线会展示模块 / 进程 / Trace 的时间分布'
+                : showTimeline ? '关闭时间线' : '打开时间线（模块 / 进程 / Trace 时间分布）'
+              }
+            >
+              <Clock size={14} /> 时间线
+            </button>
+            </div>
             <div className="error-navigation" aria-label="异常导航">
               <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === 0} onClick={() => jumpToAdjacentError(-1)} title="自动跳到上一条异常所在页并定位日志"><ArrowUp size={14}/> 上一异常</button>
               {/* 只报「第几个异常」。翻页是实现细节：点上一/下一异常会自动跳到它所在的页，
@@ -8256,86 +8318,22 @@ export default function App() {
                 clearLiveCaptureItems();
               }}
             />
-            <SwitchControl
-              checked={foldingEnabled}
-              label="函数折叠"
-              hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
-              onChange={(checked) => setFoldingEnabled(checked)}
-            />
+            <button
+              type="button"
+              className={`button ghost compact-button toolbar-icon-button ${collecting ? 'active' : ''}`}
+              onClick={() => void beginDataExtraction()}
+              title={collecting ? '数据采集中（图标转圈即表示正在采集）· 点开查看每项进度' : '数据采集：勾选要对当前日志采集的数据项'}
+            >
+              {collecting ? <LoaderCircle className="spin" size={14} /> : <Database size={14} />} 数据采集
+            </button>
             <SwitchControl
               checked={rawLogMode}
               label="原始日志"
               hint={rawLogMode ? '直接展示日志原文，不做解析' : '使用结构化日志视图'}
               onChange={setRawLogMode}
             />
-            {/* 三个窗口按「定位 → 定性 → 定时」排：先看是哪个进程/函数/调用链（调用导航），
-                再看为什么失败（根因树），最后看发生的时间分布（时间线）。 */}
-            <button
-              type="button"
-              className={`button ghost metric-action-button ${callFlowDialogOpen ? 'active' : ''}`}
-              disabled={!activeTask || activeTask.status !== 'ready' || rawLogMode}
-              aria-pressed={callFlowDialogOpen}
-              onClick={() => { if (callFlowDialogOpen) setCallFlowDialogOpen(false); else openCallFlowDialog(); }}
-              title={
-                rawLogMode ? '原始日志模式不显示调用导航'
-                : !activeTask || activeTask.status !== 'ready' ? '先查询日志，调用导航会按进程 / 函数 / 调用链展开'
-                : callFlowDialogOpen ? '关闭调用导航' : '打开调用导航（进程 / 函数 / 调用链树）'
-              }
-            >
-              <GitBranch size={14} /> 调用导航
-            </button>
-            <button
-              type="button"
-              className="button ghost metric-action-button"
-              disabled={!remoteLogLocator?.environment || !remoteLogLocator.startTime.trim() || !remoteLogLocator.endTime.trim()}
-              onClick={() => {
-                const locator = remoteLogLocator;
-                if (!locator?.environment || !locator.startTime.trim() || !locator.endTime.trim()) return;
-                setEventRestorePreset({
-                  environmentId: locator.environment.id,
-                  environmentName: locator.environment.name,
-                  startTime: locator.startTime.trim(),
-                  endTime: locator.endTime.trim(),
-                });
-                setEventRestoreOpen(true);
-              }}
-              title="选择时间范围后直接读取运行日志 event.log 并展示根因树"
-            >
-              <ListTree size={14} /> 根因树
-            </button>
-            {/* 时间线是全局工具，不是实时监控的一部分：只要加载过日志就能打开，
-                所以它放在工具栏里常驻，而不是挂在某个模式下面。 */}
-            <button
-              type="button"
-              className={`button ghost metric-action-button ${showTimeline ? 'active' : ''}`}
-              disabled={!activeTask || activeTask.status !== 'ready' || rawLogMode}
-              aria-pressed={showTimeline}
-              onClick={() => {
-                const next = !showTimeline;
-                if (next) positionTimelineBelowToolbar();
-                setShowTimeline(next);
-                setProcessTimelineExpanded(true);
-              }}
-              title={
-                rawLogMode ? '原始日志模式不显示时间线'
-                : !activeTask || activeTask.status !== 'ready' ? '先查询日志，时间线会展示模块 / 进程 / Trace 的时间分布'
-                : showTimeline ? '关闭时间线' : '打开时间线（模块 / 进程 / Trace 时间分布）'
-              }
-            >
-              <Clock size={14} /> 时间线
-            </button>
             {activeTask && activeTask.status === 'ready' && (
               <div className="log-search-action-tools" aria-label="日志操作">
-                {/* 只有一个入口：数据采集。提取器在这里勾选、在这里加入实时采集，
-                    加进去之后采集进度框会自己浮出来（纯按清单内容决定，不再单独一个按钮）。 */}
-                <button
-                  type="button"
-                  className={`button ghost compact-button toolbar-icon-button ${collecting ? 'active' : ''}`}
-                  onClick={() => void beginDataExtraction()}
-                  title={collecting ? '数据采集中（图标转圈即表示正在采集）· 点开查看每项进度' : '数据采集：勾选要对当前日志采集的数据项'}
-                >
-                  {collecting ? <LoaderCircle className="spin" size={14} /> : <Database size={14} />} 数据采集
-                </button>
                 {/* 案例录入与相似案例匹配合成一个窗口的两个标签页：同一条工作流的进出两端，
                     分成两个按钮只会让用户先猜哪个是自己要的。 */}
                 <button

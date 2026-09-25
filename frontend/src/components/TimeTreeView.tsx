@@ -3,6 +3,7 @@ import { AlertTriangle, Maximize2, ZoomIn, ZoomOut } from 'lucide-react';
 import type { ContentSeverity, FunctionNode, TraceTimeline } from '../types';
 import { functionNodeEntries, matchDisplayRulesToFunction, type DisplayRule } from '../rendering/displayRules';
 import { durationNs, formatDuration } from '../parser/treeBuilder';
+import { timestampToNs } from '../parser/logParser';
 
 /**
  * 时间轴缩进树 —— 保留折叠树的嵌套结构，同时把「谁先谁后」画清楚。
@@ -52,13 +53,28 @@ function subtreeSeverity(node: FunctionNode): ContentSeverity {
   }, 'normal');
 }
 
+/**
+ * 一条日志的纳秒时间。
+ *
+ * `timestampNs` 是格式化解析器算出来的；解析器不认这个时间格式时它会是 undefined，
+ * 而 `timestamp` 字符串**仍然在**（日志里明明有时间）。之前只看 `timestampNs`，
+ * 于是这类日志被判成「没有可用的时间戳，无法按时间铺开」——
+ * 时间就在那儿，只是没人去解它。这里补一次兜底解析。
+ */
+function entryNs(entry: { timestampNs?: bigint; timestamp?: string }): bigint | undefined {
+  if (entry.timestampNs !== undefined) return entry.timestampNs;
+  const text = String(entry.timestamp || '').trim();
+  return text ? timestampToNs(text) : undefined;
+}
+
 /** 节点的时间范围：优先用折叠边界，缺失时退回子树内日志行的最早/最晚时间。 */
 function nodeRange(node: FunctionNode): { startNs?: bigint; endNs?: bigint } {
-  if (node.startEntry.timestampNs !== undefined) {
-    return { startNs: node.startEntry.timestampNs, endNs: node.endEntry?.timestampNs ?? node.startEntry.timestampNs };
+  const directStart = entryNs(node.startEntry);
+  if (directStart !== undefined) {
+    return { startNs: directStart, endNs: entryNs(node.endEntry ?? node.startEntry) ?? directStart };
   }
   const times = functionNodeEntries(node)
-    .map((entry) => entry.timestampNs)
+    .map((entry) => entryNs(entry))
     .filter((value): value is bigint => value !== undefined);
   if (!times.length) return {};
   return {
@@ -276,7 +292,12 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
                   <em>{tick.label}</em>
                 </span>
               ))}
-              {!span && <span className="time-tree-axis-hint">这批日志没有可用的时间戳，无法按时间铺开</span>}
+              {!span && (
+                <span className="time-tree-axis-hint">
+                  这批日志的解析结果里没有时间戳，无法按时间铺开。
+                  日志行里如果有时间但这里是空的，通常是「设置 → 日志规则」的格式解析没配时间字段或时间格式不匹配。
+                </span>
+              )}
             </div>
           </div>
 

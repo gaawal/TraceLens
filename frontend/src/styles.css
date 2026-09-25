@@ -17373,3 +17373,14 @@ html.workstation-docked {
 .data-extraction-dialog-dragbar button { cursor: pointer; }
 /* 拖过之后窗口是 fixed 定位，backdrop 的网格居中不再管它。 */
 .data-collection-backdrop .data-extraction-dialog[style*="position: fixed"] { max-height: 90vh; }
+
+/* 工具栏分两组：左边是「怎么看日志」（视图开关 + 三个窗口），位置固定；
+   右边是「对日志做什么」。左侧组用 margin-right:auto 把其余内容推到右边，
+   这样右侧按钮增减不会让左侧那排跟着左右横跳。 */
+.metric-strip-left {
+  display: flex; align-items: center; gap: 7px; flex: none;
+  margin-right: auto;
+  padding-right: 10px;
+  border-right: 1px solid #e6ecf2;
+}
+.metric-strip-left + * { margin-left: 2px; }
