@@ -230,12 +230,19 @@ RUN_ROOT = LOG_ROOT + "/run"
 # ---------------------------------------------------------------------------
 SUBSYSTEM_MODULES: dict[str, tuple[str, ...]] = {
     "spwsp": ("spwsp", "lgsw", "wtrm"),
+    # wsp = 工件台点位子系统。它的 fm 日志专门记**绝对移动点位**
+    # （``move absolute { x:…, y:… }``），内容规则见 loggen.WSP_MOVE_POINTS。
+    "wsp": ("wsp",),
     "mecore": ("mecore", "cpcore", "metrl"),
     "cpfr": ("cpfr", "frhyd"),
     "sil": ("sil", "silrt"),
     "hmi": ("hmi", "hmidsp"),
     "swlib": ("swlib", "adflib"),
 }
+
+#: 有**专属日志内容规则**的子系统：它们的 fm 日志不走通用扫片调用链程序
+#: （``loggen._DEBUG_PROGRAM``），而是用各自的程序。见 ``loggen.program_for``。
+CONTENT_SPECIFIC_SUBSYSTEMS: tuple[str, ...] = ("wsp",)
 
 # executor 树：<elog root>/<lower_host>/<subsystem>/<executor>_cp_<nn>.log
 # 后端用 r"^(?P<module>.+?)_cp(?:_|$)" 提取模块名。

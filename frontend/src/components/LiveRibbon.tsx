@@ -3,6 +3,7 @@ import { Pause, Play, Radio } from 'lucide-react';
 import { API_BASE, buildApiHeaders } from '../api/resourceApi';
 import { subscribeLiveMonitoring } from '../services/liveMonitoring';
 import { primeSeq, subscribeWatchHits, subscribeWatchStatus, type WatchHitEvent } from '../services/watchRealtime';
+import { isCustomLabelColor, moduleColor } from '../rendering/componentColor';
 
 /**
  * Live tag ribbon — the streaming view of watch hits.
@@ -132,19 +133,31 @@ export function LiveRibbon({ environmentId }: { environmentId?: number }) {
         }}
       >
         {hits.length === 0 && <span className="live-ribbon-empty">监控中，等待标签命中…（服务端持续监听，关掉页面也在跑）</span>}
-        {hits.map((hit) => (
-          <span
-            key={`${hit.watch_id}-${hit.seq}-${hit.hit_id}`}
-            className="live-ribbon-tag"
-            style={{ borderColor: hit.label_color || '#2563eb' }}
-            title={`${hit.display_text || hit.label}\n${hit.line_text || ''}`}
-          >
-            <i style={{ background: hit.label_color || '#2563eb' }} aria-hidden="true" />
-            <time>{String(hit.matched_at || '').slice(11, 19)}</time>
-            <strong>{hit.label || hit.watch_name}</strong>
-            {typeof hit.burst_count === 'number' && <em>×{hit.burst_count}</em>}
-          </span>
-        ))}
+        {hits.map((hit) => {
+          // 普通 INFO 命中（没有自定义标签色的规则）按**模块**上色，和日志列表里的
+          // 模块徽标同一个 hash —— 一条全是蓝色的标签流等于没有颜色信息，
+          // 看不出哪个模块在推进。只有用户真的给规则挑过颜色时才用那个颜色。
+          const module = String(hit.fm || hit.subsystem || '').trim();
+          const custom = isCustomLabelColor(hit.label_color);
+          const tone = moduleColor(module || hit.watch_name || 'default');
+          const chip = custom
+            ? { border: hit.label_color, dot: hit.label_color, text: '#2f3e50' }
+            : tone;
+          return (
+            <span
+              key={`${hit.watch_id}-${hit.seq}-${hit.hit_id}`}
+              className={`live-ribbon-tag ${custom ? 'is-labeled' : 'is-module'}`}
+              style={{ borderColor: chip.border, borderLeftColor: chip.dot }}
+              title={[hit.display_text || hit.label, module ? `模块：${module}` : '', hit.line_text || ''].filter(Boolean).join('\n')}
+            >
+              <i style={{ background: chip.dot }} aria-hidden="true" />
+              <time>{String(hit.matched_at || '').slice(11, 19)}</time>
+              {module && <b className="live-ribbon-module" style={{ color: chip.text }}>{module}</b>}
+              <strong>{hit.label || hit.watch_name}</strong>
+              {typeof hit.burst_count === 'number' && <em>×{hit.burst_count}</em>}
+            </span>
+          );
+        })}
       </div>
     </div>
   );

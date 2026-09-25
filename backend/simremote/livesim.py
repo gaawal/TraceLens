@@ -5,7 +5,7 @@
 （见 ``apps/logsources/services/remote_logs.py::_open_live_tail_runtime``）。
 本模块在模拟机上扮演那个守护进程：
 
-* 往 4 条 ``<root>/debug/<子系统>/<模块>.log`` 持续追加**合规的八字段调试日志**
+* 往 5 条 ``<root>/debug/<子系统>/<模块>.log`` 持续追加**合规的八字段调试日志**
   （匹配 ``DEBUG_PATTERN``，否则前端解析不出 level/module）；
 * 正文遵守项目的调用链规则：``[函数名] >()`` 入口、``[函数名] <()`` 出口，
   同名 LIFO 配对（拼装逻辑复用 ``loggen.log_message``）。前端就是靠这对方向符
@@ -14,9 +14,12 @@
   ``trace=`` / ``cause=`` 与同一个 lot / wafer 编号显式关联 ——
   编码器抖动 → 伺服补偿发热 → 冷却流量不足 → 光源互锁跳闸 → 扫片侧
   WARN/ERROR/FATAL 三级升级 → 复位重试；
-* 因为前端「实时监听」一次只盯一个模块，被观察的 ``spwsp`` 流自己也会把整条链的
-  后果按 WARN / ERROR / FATAL 三个级别记一遍，只订阅一个模块就能同时看到
-  「≥3 类异常 + 1 类正常节拍」；
+* 其中 ``wsp`` 这条流是**工件台点位**日志：每一行都是一条固定格式的
+  ``move absolute { x:…, y:… }``（点位表见 ``loggen.WSP_MOVE_POINTS``），
+  它自己也带一条 WARN → ERROR → FATAL 的停位异常链，所以单独订阅它同样有料；
+* 因为前端「实时监听」一次只盯一个模块，需要被单独盯住的流（``spwsp`` / ``wsp``，
+  见 :data:`OBSERVER_KEYS`）自己也会把整条链的后果按 WARN / ERROR / FATAL
+  三个级别记一遍，只订阅一个模块就能同时看到「≥3 类异常 + 1 类正常节拍」；
 * 活动文件写满 ``MAX_LIVE_LINES`` 行就**轮转**（改名成带关闭边界的归档、重建空文件），
   日志目录里只留最新一份归档，旧的搬进 ``run/recycle/``（用改名而不是删除，
   见 ``reclaim()``），所以活动文件永远不超过 1000 行、目录也不会越堆越乱。
@@ -42,6 +45,7 @@ from .loggen import (
     PHASE_LEAVE,
     expand_stage_groups,
     log_message,
+    point_body,
     source_line,
     stage_codes_of,
 )
@@ -52,9 +56,9 @@ from .loggen import (
 MAX_LIVE_LINES = 1000
 
 #: 每行间隔（秒）。1s 一行 ≈ 1000 行 / 17 分钟写满一轮活动文件。
-#: 注意剧本是**4 条流交错**的一条扁平序列，每 tick 只落一行，
-#: 所以被观察的那一条流实际是 ``4 × DEFAULT_INTERVAL_SECONDS`` 才走一行。
-#: 想让自己盯的那条流 1 秒一行，用 ``--interval 0.25``。
+#: 注意剧本是**5 条流交错**的一条扁平序列，每 tick 只落一行，
+#: 所以被观察的那一条流实际是 ``5 × DEFAULT_INTERVAL_SECONDS`` 才走一行。
+#: 想让自己盯的那条流 1 秒一行，用 ``--interval 0.2``。
 DEFAULT_INTERVAL_SECONDS = 1.0
 
 #: 轮转后留给远端 ``tail -F`` 的检测窗口：BSD/GNU tail 都是每秒 stat 一次文件名，
@@ -97,15 +101,31 @@ class StreamTarget:
 
 _MACHINES: dict[str, fleet.MachineSpec] = {item.key: item for item in fleet.FLEET}
 
-#: 剧本里的 4 条流。都放在上位机：后端「实时监听」默认盯的就是调试日志根，
-#: 上位机调试根下 6 个子系统的 fm 都在（``loggen.plan_machine`` 每台机器都生成全套）。
+#: 剧本里的 5 条流。都放在上位机：后端「实时监听」默认盯的就是调试日志根，
+#: 上位机调试根下各子系统的 fm 都在（``loggen.plan_machine`` 每台机器都生成全套）。
+#:
+#: ``role`` 只是给人读的标签：normal = 正常节拍流、motion = 工件台点位流，
+#: 其余三条各自对应故障链上的一环。
 TARGETS: tuple[StreamTarget, ...] = (
     StreamTarget("spwsp", "upper", "spwsp", "spwsp", "normal"),
+    StreamTarget("wsp", "upper", "wsp", "wsp", "motion"),
     StreamTarget("encoder", "upper", "mecore", "cpcore", "encoder"),
     StreamTarget("coolant", "upper", "cpfr", "cpfr", "coolant"),
     StreamTarget("interlock", "upper", "sil", "sil", "interlock"),
 )
 _TARGET_BY_KEY = {item.key: item for item in TARGETS}
+
+#: 会被用户**单独订阅**的流。前端「实时监听」一次只盯一个模块，所以这些流自己
+#: 就必须凑齐「≥3 类异常 + 1 类正常节拍」，否则单模块视图里只有 1 类异常，
+#: 过滤/告警效果就没法验证。新增"让人专门去看"的流时，把 key 加进来 ——
+#: ``selftest`` 会挨个查。
+OBSERVER_KEYS: tuple[str, ...] = ("spwsp", "wsp")
+
+#: "正常节拍"的判定标记：在这条流里找得到任意一个，就说明它不只是异常刷屏。
+NORMAL_BEAT_MARKERS: tuple[str, ...] = (
+    "position error within tolerance",
+    "status:settled",
+)
 
 
 # --------------------------------------------------------------------------- 剧本
@@ -146,18 +166,42 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     # ---- 引子：扫片主流程的最外层帧（跨整轮，不套阶段框） ----
     ("spwsp", None, "INFO", "ScanLot", PHASE_ENTER, "lot={lot} wafers=25"),
     ("spwsp", None, "INFO", "ScanWafer", PHASE_ENTER, "wafer={wafer} recipe=SPM-V2026.09.21"),
+    # ---- 阶段⓪：工件台回零（wsp 点位流）----
+    # wsp 这条流记的是**工件台运动轨迹**，所以它跟着主流程一路走：回零 → 上片点 →
+    # 对准点 → 扫描点 → 停位检查 → 卸片点。每行都是一条固定格式的移动点位
+    # （``move absolute { x:…, y:… }``），点位表在 ``loggen.WSP_MOVE_POINTS``。
+    # 之所以**插在主流程各个节点之间**而不是整块放在末尾：真实机台的点位日志是
+    # 跟着动作持续刷的，整块放末尾会让"实时监听 wsp"变成几十秒静默 + 一串爆发。
+    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_ENTER, "axis=XY mode=absolute search=reference_mark"),
+    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_BODY, point_body("origin")),
+    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 阶段①：上片 ----
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_ENTER, "axis=XY target=chuck"),
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_BODY, "wafer stage settled, position error within tolerance"),
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    # ---- 阶段①b：工件台走上片点（wsp）----
+    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=load_position profile=rapid"),
+    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("load_position")),
+    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 阶段②：对准 ----
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_ENTER, "wafer={wafer} marks=8"),
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_BODY, "alignment mark detected, offset compensation applied for wafer {wafer}"),
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
+    # ---- 阶段②b：工件台逐个对准标记对位（wsp）----
+    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=align_mark_01 profile=align"),
+    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("align_mark_01")),
+    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("align_mark_08")),
+    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 阶段③：曝光开始。这个框在 spwsp 上要一直开到互锁恢复之后才合
     #      （中间夹着编码器 / 冷却 / 互锁各自的阶段，但那些是别的文件，不打断本流）----
     ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_ENTER, "wafer={wafer} dose=30mJ/cm2"),
     ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_BODY, "illumination source power stabilised at setpoint, dose within specification"),
+    # ---- 阶段③b：工件台走扫描轨迹（wsp）—— 曝光期间真正在动的就是它 ----
+    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=exposure_start profile=scan"),
+    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_start")),
+    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_mid")),
+    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_end")),
+    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 阶段④：伺服采样（编码器流）→ 异常① 故障链起点 ----
     ("encoder", "SERVO_SAMPLE", "INFO", "ServoLoop", PHASE_ENTER, "axis=Rz loop=position"),
     ("encoder", "SERVO_SAMPLE", "INFO", "CheckEncoderFeedback", PHASE_ENTER, "axis=Rz threshold=0.50um"),
@@ -193,6 +237,19 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     ("interlock", "INTERLOCK_RECOVER", "INFO", "SourceInterlock", PHASE_LEAVE, "loop=sil elapsed={elapsed} status=recovered"),
     # ---- 阶段③ 收尾：曝光确实被互锁中止了（spwsp 上的同一个曝光阶段框到此闭合）----
     ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=aborted"),
+    # ---- 阶段⑩b：工件台停位检查（wsp 点位流）——曝光被中止后工件台停不住 ----
+    # 异常出处：编码器抖动（上游 ERR_MECORE_ENC_JITTER）→ 位置偏差超差 → 停位超时
+    # → 逼近软限位、动作中止。这条 WARN → ERROR → FATAL 的本地链让 **wsp 单独订阅
+    # 也有 3 类异常**；根因仍挂在编码器上，所以 trace 与其它子系统同号，跨模块关联
+    # 照样成立（wsp 就是第 5 条流）。
+    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_ENTER, "axis=XY tolerance=0.020um"),
+    ("wsp", "WSP_SETTLE", "WARN", "CheckPositionError", PHASE_BODY, "position error 0.031um exceeds tolerance 0.020um axis=XY code=ERR_WSP_POSITION_DEVIATION cause=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("wsp", "WSP_SETTLE", "ERROR", "CheckPositionError", PHASE_BODY, "settling window expired, position error not converged axis=XY code=ERR_WSP_SETTLE_TIMEOUT cause=ERR_WSP_POSITION_DEVIATION trace={trace}"),
+    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=deviated"),
+    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_ENTER, "axis=XY reason=settle_timeout"),
+    ("wsp", "WSP_SETTLE", "FATAL", "AbortMotion", PHASE_BODY, "motion aborted near soft limit, travel range guard triggered axis=XY code=ERR_WSP_SOFT_LIMIT_PROXIMITY cause=ERR_WSP_SETTLE_TIMEOUT trace={trace}"),
+    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_BODY, "stage re-settled after motion abort, position error within tolerance"),
+    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=aborted"),
     # ---- 阶段⑪：扫片停线（spwsp）WARN → ERROR → FATAL，三级升级 ----
     # 前端「实时监听」一次只盯一个模块，所以被观察的那条流自己也必须把整条链的
     # 后果按三个级别记下来 —— 否则只订阅一个模块时只能看到 1 类异常，凑不齐
@@ -211,6 +268,10 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_ENTER, "wafer={wafer} from=checkpoint"),
     ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_BODY, "exposure sequence resumed, lot {lot} continues from checkpoint"),
     ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
+    # ---- 阶段⑫b：工件台退回卸片位（wsp 点位流）----
+    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=unload_position profile=rapid"),
+    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("unload_position")),
+    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 收尾：最外层帧闭合（不套阶段框）----
     ("spwsp", None, "INFO", "ScanWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=recovered"),
     ("spwsp", None, "INFO", "ScanLot", PHASE_LEAVE, "lot={lot} elapsed={elapsed} status=ok"),
@@ -406,7 +467,7 @@ def trim_to_capacity(path: Path, limit: int = MAX_LIVE_LINES) -> int:
 
 
 def prepare(state: StreamState, *, report: bool = False) -> list[str]:
-    """确保 4 条流的目录/文件存在，并把当前段裁到 1000 行以内。
+    """确保每条流的目录/文件存在，并把当前段裁到 1000 行以内。
 
     启动时 ``<fm>.log`` 往往带着 loggen 生成的当天历史（00:00 → 现在，通常 1400+ 行）。
     这里**只截掉超出的部分**，不整段收档归零，理由有两个：

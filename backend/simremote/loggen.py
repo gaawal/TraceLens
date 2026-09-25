@@ -125,6 +125,11 @@ PHASE_KEYWORDS: dict[str, str] = {
     "UpdateThermalBudget": "thermal budget update",
     "SourceInterlock": "source interlock check",
     "TripInterlock": "interlock trip",
+    # ---- 工件台点位子系统（wsp）----
+    "HomeStage": "stage homing",
+    "MoveAbsolute": "stage absolute move",
+    "CheckPositionError": "position error check",
+    "AbortMotion": "motion abort",
     # ---- 流程阶段框 ----
     "Stage_WAFER_LOAD": "wafer load stage",
     "Stage_ALIGNMENT": "alignment stage",
@@ -140,7 +145,51 @@ PHASE_KEYWORDS: dict[str, str] = {
     "Stage_SCAN_RECOVER": "scan recover stage",
     "Stage_MEASUREMENT": "measurement stage",
     "Stage_UNLOAD": "wafer unload stage",
+    # 工件台点位流的阶段框
+    "Stage_WSP_HOME": "stage homing stage",
+    "Stage_WSP_LOAD_MOVE": "load move stage",
+    "Stage_WSP_ALIGN_MOVE": "align move stage",
+    "Stage_WSP_SCAN_MOVE": "scan move stage",
+    "Stage_WSP_SETTLE": "stage settle stage",
+    "Stage_WSP_UNLOAD_MOVE": "unload move stage",
 }
+
+
+# --------------------------------------------------------------------------- 移动点位
+#
+# ``wsp``（工件台点位）组件的日志不是泛泛的"扫片正文"，而是**固定的绝对移动点位**：
+#
+#     move absolute { x:0.003, y:0.999, z:0.000, rz:0.0021, speed:120.0, mode:absolute, point:load_position, status:settled }
+#
+# 三个"固定"，是为了让它可被当检索锚点用：
+#   * 字段顺序固定（x / y / z / rz / speed / mode / point / status）；
+#   * 数值精度固定（位置 3 位小数、rz 4 位、speed 1 位）；
+#   * 点位名固定（见 WSP_MOVE_POINTS，全表就这几个）。
+#
+# 生成与校验共用下面这一份定义：``move_point()`` 负责拼、``MOVE_POINT_PATTERN``
+# 负责校。改格式时两边一起改，不会出现"生成变了、校验还在按老格式找"。
+
+#: 固定的移动点位表：(点位名, x, y, z, rz, speed)。
+#: 单位：x/y/z = mm，rz = 度，speed = mm/s。点位名只许小写字母/数字/下划线。
+WSP_MOVE_POINTS: tuple[tuple[str, float, float, float, float, float], ...] = (
+    ("origin", 0.000, 0.000, 0.000, 0.0000, 50.0),
+    ("load_position", 0.003, 0.999, 0.000, 0.0021, 120.0),
+    ("align_mark_01", 0.031, 1.247, 0.000, 0.0018, 120.0),
+    ("align_mark_08", 0.263, 1.508, 0.000, 0.0034, 120.0),
+    ("exposure_start", 0.500, 2.000, 0.000, 0.0000, 300.0),
+    ("exposure_mid", 1.250, 2.400, 0.000, 0.0007, 300.0),
+    ("exposure_end", 2.000, 2.800, 0.000, 0.0012, 300.0),
+    ("unload_position", 0.004, 0.998, 0.000, 0.0023, 150.0),
+)
+
+_MOVE_POINT_BY_NAME = {row[0]: row[1:] for row in WSP_MOVE_POINTS}
+
+#: 一条移动点位正文的**校验正则**，与 :func:`move_point` 的输出严格对应。
+MOVE_POINT_PATTERN = (
+    r"move absolute \{ x:-?\d+\.\d{3}, y:-?\d+\.\d{3}, z:-?\d+\.\d{3}, "
+    r"rz:-?\d+\.\d{4}, speed:\d+\.\d, mode:absolute, "
+    r"point:[a-z0-9_]+, status:[a-z]+ \}"
+)
 
 
 def stage_function(code: str) -> str:
@@ -161,6 +210,54 @@ def log_message(function: str, phase: str, body: str) -> str:
     if phase == PHASE_LEAVE:
         return f"[{function}] {EXIT_MARKER} leave {keyword} end {body}"
     return f"[{function}] {body}"
+
+
+def move_point(
+    *,
+    x: float,
+    y: float,
+    z: float = 0.0,
+    rz: float = 0.0,
+    speed: float = 120.0,
+    point: str = "scan",
+    status: str = "settled",
+) -> str:
+    """一条「绝对移动点位」日志正文（wsp 组件的固定格式）。
+
+    ⚠️ 正文里带 ``{ ... }`` 花括号，而剧本是要过 ``str.format`` 的（模板变量
+    ``{trace}`` / ``{elapsed}``）。直接把它当模板存进去会被 ``format`` 当占位符解析并
+    抛 ``KeyError`` / ``ValueError``。所以这里返回的是**已转义**的模板片段
+    （``{{ ... }}``），拼进模板后由 ``format`` 还原；要拿"最终写进日志的样子"，
+    用 :func:`body_text` 反解。
+    """
+    text = (
+        f"move absolute {{ x:{x:.3f}, y:{y:.3f}, z:{z:.3f}, rz:{rz:.4f}, "
+        f"speed:{speed:.1f}, mode:absolute, point:{point}, status:{status} }}"
+    )
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def point_body(name: str, *, status: str = "settled") -> str:
+    """按 :data:`WSP_MOVE_POINTS` 渲染指定点位的一条移动点位正文（已转义）。"""
+    try:
+        x, y, z, rz, speed = _MOVE_POINT_BY_NAME[name]
+    except KeyError:
+        raise KeyError(
+            f"点位 {name!r} 没登记在 WSP_MOVE_POINTS（已登记：{sorted(_MOVE_POINT_BY_NAME)}）"
+        ) from None
+    return move_point(x=x, y=y, z=z, rz=rz, speed=speed, point=name, status=status)
+
+
+def body_text(body: str) -> str:
+    """把（可能转义过的）正文模板还原成"最终写进日志的样子"。
+
+    只有 :func:`move_point` 产出的片段会带转义花括号；普通正文原样返回。
+    校验类代码（查中文、查方向符、查移动点位格式）必须按还原后的文本判，
+    否则看到的是模板而不是日志。
+    """
+    if "{{" not in body and "}}" not in body:
+        return body
+    return body.replace("{{", "{").replace("}}", "}")
 
 
 def stage_codes_of(rows) -> tuple[str, ...]:  # noqa: ANN001 - 迭代即可
@@ -351,6 +448,116 @@ ERROR_STEP_INDEX = next(
     if _phase == PHASE_BODY and level in ("ERROR", "FATAL")
 )
 
+
+# --------------------------------------------------------------------------- wsp 程序
+#
+# ``wsp``（工件台点位）组件的 fm 日志**不写通用扫片正文** —— 它记的是工件台自己的
+# 运动轨迹：回零 → 上片点 → 对准点 → 扫描点 → 停位检查 → 卸片点。每一行都是一条
+# 固定的绝对移动点位（见 ``move_point``），这样用户打开 ``wsp.log`` 一眼看到的就是
+# "点位日志"，而不是又一份扫片日志。
+#
+# 级别约定与通用程序一致：**入口/出口固定 INFO，异常只落在正文行**。
+# 停位检查里刻意留了一条 WARN → ERROR → FATAL 的本地升级链，且根因挂在
+# ``ERR_MECORE_ENC_JITTER`` 上 —— 于是 wsp 既能单独订阅看异常，又仍然串在整条
+# 跨模块因果链里（``trace=`` 与其它子系统同号）。
+_WSP_GROUPS: tuple[tuple[str | None, tuple[tuple[str, str, str, str], ...]], ...] = (
+    ("WSP_HOME", (
+        ("HomeStage", PHASE_ENTER, "INFO", "axis=XY mode=absolute search=reference_mark"),
+        ("HomeStage", PHASE_BODY, "INFO", point_body("origin")),
+        ("HomeStage", PHASE_BODY, "INFO", "reference mark acquired, encoder counter zeroed at origin"),
+        ("HomeStage", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    )),
+    ("WSP_LOAD_MOVE", (
+        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=load_position profile=rapid"),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("load_position")),
+        ("MoveAbsolute", PHASE_BODY, "INFO", "in position window reached, settling servo loop"),
+        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    )),
+    ("WSP_ALIGN_MOVE", (
+        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=align_mark_01 profile=align"),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("align_mark_01")),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("align_mark_08")),
+        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    )),
+    ("WSP_SCAN_MOVE", (
+        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=exposure_start profile=scan"),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_start")),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_mid")),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_end")),
+        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    )),
+    ("WSP_SETTLE", (
+        ("CheckPositionError", PHASE_ENTER, "INFO", "axis=XY tolerance=0.020um"),
+        ("CheckPositionError", PHASE_BODY, "INFO", "position error within tolerance, stage has settled"),
+        ("CheckPositionError", PHASE_BODY, "WARN",
+         "position error 0.031um exceeds tolerance 0.020um axis=XY "
+         "code=ERR_WSP_POSITION_DEVIATION cause=ERR_MECORE_ENC_JITTER trace={trace}"),
+        ("CheckPositionError", PHASE_BODY, "ERROR",
+         "settling window expired, position error not converged axis=XY "
+         "code=ERR_WSP_SETTLE_TIMEOUT cause=ERR_WSP_POSITION_DEVIATION trace={trace}"),
+        ("CheckPositionError", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=deviated"),
+        ("AbortMotion", PHASE_ENTER, "INFO", "axis=XY reason=settle_timeout"),
+        ("AbortMotion", PHASE_BODY, "FATAL",
+         "motion aborted near soft limit, travel range guard triggered axis=XY "
+         "code=ERR_WSP_SOFT_LIMIT_PROXIMITY cause=ERR_WSP_SETTLE_TIMEOUT trace={trace}"),
+        ("AbortMotion", PHASE_BODY, "INFO", "stage re-settled after motion abort, position error within tolerance"),
+        ("AbortMotion", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=aborted"),
+    )),
+    ("WSP_UNLOAD_MOVE", (
+        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=unload_position profile=rapid"),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("unload_position")),
+        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    )),
+)
+
+#: wsp 程序的阶段序（按首次出现）。
+WSP_STAGE_CODES: tuple[str, ...] = tuple(code for code, _steps in _WSP_GROUPS if code)
+
+_WSP_PROGRAM: tuple[tuple[str, str, str, str], ...] = tuple(
+    (function, phase, level, body)
+    for _key, level, function, phase, body in expand_stage_groups(
+        [
+            (None, code, level, function, phase, body)
+            for code, steps in _WSP_GROUPS
+            for function, phase, level, body in steps
+        ]
+    )
+)
+
+#: 子系统 -> 专属调用链程序。没登记的子系统沿用通用扫片程序。
+SUBSYSTEM_PROGRAMS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+    "wsp": _WSP_PROGRAM,
+}
+
+
+def program_for(subsystem: str) -> tuple[tuple[str, str, str, str], ...]:
+    """取某个子系统的调用链程序。
+
+    同一子系统的所有 fm 模块（debug / executor）共用一份程序 —— 否则同一个组件在
+    调试视图和执行器视图里会变成两套不相干的日志。
+    """
+    return SUBSYSTEM_PROGRAMS.get(str(subsystem or "").strip().lower(), _DEBUG_PROGRAM)
+
+
+def error_step_index(subsystem: str) -> int:
+    """子系统程序里第一条 ERROR/FATAL 正文的位置。
+
+    失败用例的日志夹具要把错误行**钉在故障时刻**。索引必须按**该系统自己的程序**
+    算 —— 拿通用程序的索引去索引 wsp 程序，钉出来的可能是一条正常的点位行。
+    """
+    program = program_for(subsystem)
+    for index, (_function, phase, level, _body) in enumerate(program):
+        if phase == PHASE_BODY and level in ("ERROR", "FATAL"):
+            return index
+    return ERROR_STEP_INDEX
+
+
+#: 所有程序（通用 + 各子系统专属）—— 校验类代码要逐个过一遍，别漏了专属程序。
+ALL_PROGRAMS: tuple[tuple[str, tuple[tuple[str, str, str, str], ...]], ...] = (
+    ("批量日志", _DEBUG_PROGRAM),
+    *((f"批量日志 {name}", program) for name, program in SUBSYSTEM_PROGRAMS.items()),
+)
+
 _RUN_MESSAGES = (
     "lot started, process sequence initialised",
     "recipe step advanced to next stage",
@@ -391,9 +598,13 @@ def _stamp(moment: datetime) -> str:
     return f"{moment:%Y-%m-%d %H:%M:%S}.{moment.microsecond // 1000:03d}"
 
 
-def _program_values(moment: datetime, seq: int, function: str) -> dict[str, str]:
-    """调用链程序的模板变量。第几轮（``seq // 程序长度``）决定晶圆/批次。"""
-    round_index = seq // len(_DEBUG_PROGRAM)
+def _program_values(moment: datetime, seq: int, function: str, length: int) -> dict[str, str]:
+    """调用链程序的模板变量。第几轮（``seq // length``）决定晶圆/批次。
+
+    ``length`` 是**该子系统自己的程序长度** —— 用通用程序长度去除，wsp 这种短程序
+    会每隔几行就跳一个批次号，看着像数据错乱。
+    """
+    round_index = seq // max(1, length)
     elapsed = 6 + zlib.crc32(function.encode("utf-8")) % 180
     return {
         "wafer": f"W{1 + round_index % 25:02d}",
@@ -404,14 +615,22 @@ def _program_values(moment: datetime, seq: int, function: str) -> dict[str, str]
 
 
 def debug_line(moment: datetime, subsystem: str, module: str, seq: int) -> str:
-    """八字段调试日志，匹配 DEBUG_PATTERN；正文带 ``[函数名] >()`` / ``<()`` 调用链边界。"""
-    function, phase, level, template = _DEBUG_PROGRAM[seq % len(_DEBUG_PROGRAM)]
-    process_id = 20000 + (abs(hash(subsystem)) % 9000)
+    """八字段调试日志，匹配 DEBUG_PATTERN；正文带 ``[函数名] >()`` / ``<()`` 调用链边界。
+
+    内容按**子系统**选程序：通用扫片子系统走 ``_DEBUG_PROGRAM``，wsp 走点位程序。
+    """
+    program = program_for(subsystem)
+    function, phase, level, template = program[seq % len(program)]
+    process_id = 20000 + zlib.crc32(subsystem.encode("utf-8")) % 9000
     # 线程号按模块固定：一次调用链跑在同一个线程上，前端才能把它们归到同一条执行泳道
     # （折叠、×N 聚合都以 component/process/thread 相同为前提）。
-    thread_id = 30000 + (abs(hash(module)) % 500)
+    # 用 crc32 而不是内置 hash()：hash() 每个进程都带随机种子，重新生成一次日志
+    # 线程号就变了，历史段和实时段会被前端当成两条不同的泳道。
+    thread_id = 30000 + zlib.crc32(module.encode("utf-8")) % 500
     rpc = f"{module}:{function}:{source_line(function)}"
-    message = log_message(function, phase, template.format(**_program_values(moment, seq, function)))
+    message = log_message(
+        function, phase, template.format(**_program_values(moment, seq, function, len(program)))
+    )
     return (
         f"[{_stamp(moment)}] [{level}] [{subsystem.upper()}] [{process_id}] "
         f"[{thread_id}] [{module}] [{call_mode(function)}] [{rpc}] {message}"
@@ -422,13 +641,17 @@ def executor_line(moment: datetime, subsystem: str, module: str, seq: int, *, in
     """执行器日志：100 内部（context/rpc/mode）与 101 外部（mode/rpc）两种布局。
 
     EXECUTOR_PATTERN 的 rpc 组要求形如 ``a:b:c``（两个冒号），不能省。
-    正文与调试日志走同一套调用链程序，所以执行器视图里同样能折出函数卡片。
+    正文与调试日志走**同一个子系统程序**，所以执行器视图里同样能折出函数卡片，
+    并且 wsp 的执行器日志也仍然是点位日志。
     """
-    function, phase, level, template = _DEBUG_PROGRAM[seq % len(_DEBUG_PROGRAM)]
-    process_id = 40000 + (abs(hash(module)) % 5000)
-    thread_id = 50000 + (abs(hash(module)) % 300)
+    program = program_for(subsystem)
+    function, phase, level, template = program[seq % len(program)]
+    process_id = 40000 + zlib.crc32(module.encode("utf-8")) % 5000
+    thread_id = 50000 + zlib.crc32(module.encode("utf-8")) % 300
     rpc = f"{module}:{function}:{source_line(function)}"
-    message = log_message(function, phase, template.format(**_program_values(moment, seq, function)))
+    message = log_message(
+        function, phase, template.format(**_program_values(moment, seq, function, len(program)))
+    )
     if inner:
         context = f"ctx{(seq % 8) + 1}"
         return (

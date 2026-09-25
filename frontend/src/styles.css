@@ -16059,6 +16059,10 @@ html.workstation-docked {
 }
 @keyframes live-tag-in { from { opacity: 0; transform: translateX(10px) scale(.96); } to { opacity: 1; transform: none; } }
 .live-ribbon-tag > i { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+/* 模块名跟着芯片颜色一起变化，颜色才有意义 —— 没有图例的配色等于没有配色。 */
+.live-ribbon-tag .live-ribbon-module { font-size: 10px; font-weight: 600; white-space: nowrap; }
+.live-ribbon-tag.is-module { background: #fff; }
+.live-ribbon-tag.is-labeled { background: #fffdf8; }
 .live-ribbon-tag time { color: #8a95a4; font-size: 10px; font-variant-numeric: tabular-nums; }
 .live-ribbon-tag strong { font-size: 11px; color: #2f3e50; white-space: nowrap; }
 .live-ribbon-tag em { font-style: normal; font-size: 10px; color: #b45309; }

@@ -344,7 +344,10 @@ def _debug_lines(spec: CaseSpec, line: CaseTimeline) -> tuple[bytes, int]:
         # 校验也就失去了样本。这里直接把程序里的 ERROR 正文钉到故障时刻。
         rows.append((
             line.failure,
-            loggen.debug_line(line.failure, spec.subsystem, spec.module, loggen.ERROR_STEP_INDEX),
+            loggen.debug_line(
+                line.failure, spec.subsystem, spec.module,
+                loggen.error_step_index(spec.subsystem),
+            ),
         ))
     rows.sort(key=lambda item: item[0])
     return ("\n".join(text for _, text in rows) + "\n").encode("utf-8"), len(rows)

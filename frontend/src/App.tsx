@@ -1,4 +1,5 @@
 import { registerPageContextReader } from './assistant/contextRegistry';
+import { componentHue, componentStyle } from './rendering/componentColor';
 import { createAbnormalEvidence } from './rendering/abnormalKnowledge';
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -1014,18 +1015,6 @@ function TimelineAnomalyMarkers({
       })}
     </>
   );
-}
-
-function componentHue(component: string): number {
-  let hash = 0;
-  for (let index = 0; index < component.length; index += 1) {
-    hash = (hash * 31 + component.charCodeAt(index)) % 360;
-  }
-  return hash;
-}
-
-function componentStyle(component: string): React.CSSProperties {
-  return { '--component-hue': componentHue(component) } as React.CSSProperties;
 }
 
 // One tone per module, deliberately spread across *hue families* rather than shades of
