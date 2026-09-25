@@ -147,8 +147,8 @@ export function DataExtractionRunDialog(props: Props) {
           <h2>数据采集</h2>
           <p>
             {props.liveActive
-              ? '实时监听进行中：采集项与实时进度一起展示，实时采集在后台持续写入。'
-              : '选择要对当前日志采集的数据项；打开右侧开关的采集项会在实时监听时持续采集。'}
+              ? '实时监听进行中：勾选采集项后点「开始采集（实时采集）」，进度会随命中实时更新。'
+              : '勾选要对当前日志采集的数据项；打开工具栏的「实时监听」后会转为实时采集模式。'}
           </p>
         </div>
         {props.phase !== 'running' && <button className="icon-button" onClick={props.onClose}><X size={18}/></button>}
@@ -159,11 +159,6 @@ export function DataExtractionRunDialog(props: Props) {
           {!props.candidates.length ? <div className="data-extraction-empty"><Database size={30}/><strong>暂无可用的数据采集能力</strong><span>可以在“设置 → 日志规则 → 数据提取”中新增或启用数据提取器。</span></div> : <>
             <div className="data-extraction-select-head">
               <strong>已有 {props.candidates.length} 项数据采集能力</strong>
-              <span>
-                {props.liveActive
-                  ? '实时监听进行中：右侧开关决定这一项要不要边跑边采，进度条就是它当前采到的条数。'
-                  : '勾选本次要从当前日志采集的数据；想让某一项在实时监听时持续采，打开右侧开关。'}
-              </span>
             </div>
             <div className="data-extraction-rule-options">
               {props.candidates.map(({ rule }) => {
@@ -184,7 +179,8 @@ export function DataExtractionRunDialog(props: Props) {
                   <small className="data-extraction-rule-scope">{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
                 </label>
                 {/* 实时进度直接长在采集项上：不用再去别处对「这一项采到多少」。 */}
-                {inLiveCapture && props.liveProgress && (
+                {/* 进度只在实时监听开着时出现：关掉实时按钮就没有「采集中」这回事了。 */}
+                {props.liveActive && inLiveCapture && props.liveProgress && (
                   <span className="data-extraction-rule-progress" title={`已采集 ${liveCount} 条`}>
                     <span className="data-extraction-rule-progress-track" aria-hidden="true">
                       <i className={progressTarget ? '' : 'is-live'} style={progressTarget ? { width: `${Math.min(100, Math.round((liveCount / progressTarget) * 100))}%` } : undefined} />
@@ -205,8 +201,6 @@ export function DataExtractionRunDialog(props: Props) {
                     ><Activity size={12}/> 绘图</button>
                   </span>
                 )}
-                {/* 采集方式由底部的「开始采集（…）」决定，这里不再单独放加入/移出按钮。 */}
-                {inLiveCapture && !props.liveActive && <span className="data-extraction-rule-flag">实时采集中</span>}
               </div>;
               })}
             </div>
@@ -273,21 +267,25 @@ export function DataExtractionRunDialog(props: Props) {
         {props.phase === 'select' && <>
           <span className="data-extraction-footer-spacer"/>
           <button className="button ghost" onClick={props.onClose}>关闭</button>
-          {/* 采集方式不再用「加入实时采集」这类按钮表达，直接写在开始按钮的括号里。 */}
-          <button
-            className="button secondary"
-            disabled={!props.candidates.length || props.selectedIds.size === 0 || !props.onStartLiveCollection}
-            onClick={() => void startLive()}
-            title="勾选项按实时采集运行：跟着实时监听持续采，进度实时更新，可实时绘图"
-          >{liveBusyId === 'live' ? <LoaderCircle className="spin" size={14}/> : <Radio size={14}/>} 开始采集（实时采集）</button>
-          <button
-            className="button primary"
-            disabled={!props.candidates.length || props.selectedIds.size === 0 || props.batchAvailable === false}
-            onClick={props.onStart}
-            title={props.batchAvailable === false
-              ? '当前没有可批量采集的已解析日志；实时监听期间请用左侧「开始采集（实时采集）」'
-              : '对当前日志一次性批量采集选中的项'}
-          >开始采集（当前日志）</button>
+          {/* 只有一个开始按钮：采集方式由工具栏的「实时监听」开关决定，
+              所以按钮文案跟着它变，而不是让用户先在两颗按钮里选。 */}
+          {props.liveActive ? (
+            <button
+              className="button primary"
+              disabled={!props.candidates.length || props.selectedIds.size === 0 || !props.onStartLiveCollection}
+              onClick={() => void startLive()}
+              title="按实时采集运行：跟着实时监听持续采，进度实时更新，可实时绘图"
+            >{liveBusyId === 'live' ? <LoaderCircle className="spin" size={14}/> : <Radio size={14}/>} 开始采集（实时采集）</button>
+          ) : (
+            <button
+              className="button primary"
+              disabled={!props.candidates.length || props.selectedIds.size === 0 || props.batchAvailable === false}
+              onClick={props.onStart}
+              title={props.batchAvailable === false
+                ? '当前没有可批量采集的已解析日志；打开工具栏的「实时监听」即可转为实时采集'
+                : '对当前日志一次性批量采集选中的项'}
+            >开始采集（当前日志）</button>
+          )}
         </>}
         {props.phase === 'running' && <button className="button danger" onClick={props.onCancel}><Square size={14}/> 停止提取</button>}
         {(props.phase === 'done' || props.phase === 'error') && <><button className="button secondary" onClick={props.onClose}>关闭</button>{props.recordSaved && <button className="button primary" onClick={props.onOpenData}>进入数据</button>}</>}
