@@ -17572,3 +17572,16 @@ html.workstation-docked {
   .function-fold-line { animation-duration: .24s; }
   .function-card.is-absorbing { animation: none; }
 }
+
+/* 异常上/下滚动按钮挪到右下角：紧挨在翻页控件前面 —— 它跟翻页本来就是一回事
+   （点一次就会自动跳到该异常所在页），放在一起视线不用在工具栏和底栏之间来回跑。 */
+.log-pagination-right .error-navigation {
+  flex: 0 0 auto;
+  margin-right: 2px;
+}
+.log-pagination-right .error-nav-button { height: 24px; }
+/* 窄屏优先保住翻页与页码：异常导航退化成图标（title / aria-label 仍在）。 */
+@media (max-width: 1240px) {
+  .log-pagination-right .error-nav-button { padding: 0 6px; font-size: 0; }
+  .log-pagination-right .error-nav-button svg { width: 15px; height: 15px; }
+}

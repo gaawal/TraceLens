@@ -2912,6 +2912,7 @@ function LogPaginationBar({
   onPageChange,
   onPageSizeChange,
   statistics,
+  errorNav,
 }: {
   page: number;
   pageSize: number;
@@ -2919,6 +2920,8 @@ function LogPaginationBar({
   onPageChange: (page: number) => void;
   onPageSizeChange: (pageSize: number) => void;
   statistics?: { source: number; modules: number; processes: number; threads: number; functions: number; errorTraces: number; errors: number };
+  /** 异常上/下滚动按钮：放在右下角、翻页控件的前面，跟翻页是一件事（都会换页）。 */
+  errorNav?: React.ReactNode;
 }) {
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(page, pageCount);
@@ -2946,6 +2949,7 @@ function LogPaginationBar({
           <strong>{start.toLocaleString()}–{end.toLocaleString()}</strong>
           <span>共 {total.toLocaleString()} 条日志</span>
         </div>
+        {errorNav}
         <div className="log-pagination-controls">
           <label className="page-size-control">
             <span>每页</span>
@@ -8340,13 +8344,6 @@ export default function App() {
                 onChange={(checked) => setFoldingEnabled(checked)}
               />
             </div>
-            <div className="error-navigation" aria-label="异常导航">
-              <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === 0} onClick={() => jumpToAdjacentError(-1)} title="自动跳到上一条异常所在页并定位日志"><ArrowUp size={14}/> 上一异常</button>
-              {/* 只报「第几个异常」。翻页是实现细节：点上一/下一异常会自动跳到它所在的页，
-    把页码写在这里反而让人以为要先自己翻页。 */}
-              <span className="error-nav-position" title={`当前筛选范围共 ${navigableErrorEntries.length} 条异常；跳转会自动翻页`}>{selectedErrorIndex >= 0 ? selectedErrorIndex + 1 : 0} / {navigableErrorEntries.length}</span>
-              <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === navigableErrorEntries.length - 1} onClick={() => jumpToAdjacentError(1)} title="自动跳到下一条异常所在页并定位日志">下一异常 <ArrowDown size={14}/></button>
-            </div>
             <button
               type="button"
               className="button ghost metric-action-button"
@@ -8617,6 +8614,15 @@ export default function App() {
                   errorTraces: errorTraceCount,
                   errors: errorEntryCount,
                 }}
+                errorNav={(
+                  <div className="error-navigation" aria-label="异常导航">
+                    <button type="button" className="button ghost compact-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === 0} onClick={() => jumpToAdjacentError(-1)} title="自动跳到上一条异常所在页并定位日志"><ArrowUp size={14}/> 上一异常</button>
+                    {/* 只报「第几个异常」。翻页是实现细节：点上一/下一异常会自动跳到它所在的页，
+                        把页码写在这里反而让人以为要先自己翻页。 */}
+                    <span className="error-nav-position" title={`当前筛选范围共 ${navigableErrorEntries.length} 条异常；跳转会自动翻页`}>{selectedErrorIndex >= 0 ? selectedErrorIndex + 1 : 0} / {navigableErrorEntries.length}</span>
+                    <button type="button" className="button ghost compact-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === navigableErrorEntries.length - 1} onClick={() => jumpToAdjacentError(1)} title="自动跳到下一条异常所在页并定位日志">下一异常 <ArrowDown size={14}/></button>
+                  </div>
+                )}
               />
             )}
           </div>
