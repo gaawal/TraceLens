@@ -17729,3 +17729,8 @@ html.workstation-docked {
   .process-gantt-live-dot,
   .process-gantt-live-playhead-dot { animation: none; }
 }
+
+/* 实时采集落下来的数据记录：在记录表里标出「这是实时采的、按命中回放」。 */
+.data-live-record-tag { color: #15803d !important; }
+.data-live-range { color: #15803d; font-weight: 700; }
+.data-live-capture-note.saved { border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }

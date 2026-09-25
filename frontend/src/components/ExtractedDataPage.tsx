@@ -10,6 +10,7 @@ import {
 } from '../api/resourceApi';
 import type { DataExtractionRule, ExtractedDataRow } from '../rendering/dataExtractionRules';
 import { restoreExtractionRecord, type ExtractionProgress } from '../rendering/dataExtractionRuntime';
+import { isLiveCaptureRecord, liveCaptureSnapshot, restoreLiveCaptureRecord } from '../services/liveCaptureRestore';
 import {
   downloadMergedTemporaryRuleData,
   downloadTemporaryRuleData,
@@ -43,6 +44,16 @@ function formatMoment(value?: string | null): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value).replace('T', ' ').slice(0, 19);
   return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+/** 实时采集落下来的记录：还原走 watch 命中，不重读日志。 */
+function liveCaptureLabel(record: DataExtractionRecord): string {
+  const snapshot = liveCaptureSnapshot(record);
+  if (!snapshot) return '';
+  const window = [snapshot.started_at, snapshot.ended_at]
+    .map((value) => String(value || '').replace('T', ' ').slice(11, 19))
+    .filter(Boolean);
+  return `实时采集${window.length === 2 ? ` ${window[0]}–${window[1]}` : ''}${snapshot.hits ? ` · 命中 ${snapshot.hits.toLocaleString()} 条` : ''}`;
 }
 
 function resultLabel(record: DataExtractionRecord) {
@@ -94,7 +105,22 @@ export function ExtractedDataPage({ sourceOperationFilter, onClearSourceOperatio
     abortRef.current = controller;
     setRestoreRecord(record); setRestoreProgress(undefined); setRestoreError(''); setRestoreMergeIds(new Set());
     try {
-      const result = await restoreExtractionRecord({ record, signal: controller.signal, onProgress: setRestoreProgress });
+      // 实时采集落下来的记录：命中已经由后端落库，直接按 watch 命中还原行，不用重读日志。
+      const result = isLiveCaptureRecord(record)
+        ? await restoreLiveCaptureRecord({
+            record,
+            signal: controller.signal,
+            onProgress: (progress) => setRestoreProgress({
+              phase: 'extracting',
+              hourIndex: progress.current,
+              hourCount: progress.total,
+              percent: Math.round((progress.current / Math.max(1, progress.total)) * 100),
+              processedEntries: 0,
+              totalRows: progress.rows,
+              message: progress.message,
+            }),
+          })
+        : await restoreExtractionRecord({ record, signal: controller.signal, onProgress: setRestoreProgress });
       const rules = record.rule_snapshots as unknown as DataExtractionRule[];
       const session: TemporaryExtractionSession = {
         key: temporarySessionKey(record.id),
@@ -274,15 +300,17 @@ export function ExtractedDataPage({ sourceOperationFilter, onClearSourceOperatio
         const result = resultLabel(record);
         const session = sessionFor(record);
         return <tr key={record.id}>
-          <td><strong>{record.name}</strong><small>#{record.id} · {record.source_operation_id ? record.source_operation_id.slice(0, 12) : '无远程审计'}</small></td>
+          <td><strong>{record.name}</strong><small>#{record.id} · {record.source_operation_id ? record.source_operation_id.slice(0, 12) : '无远程审计'}</small>{liveCaptureLabel(record) && <small className="data-live-record-tag">{liveCaptureLabel(record)} · 还原按命中回放，不重读日志</small>}</td>
           <td>{record.task_name || '—'}</td>
           <td>{record.environment_name || (record.environment ? `环境 #${record.environment}` : '—')}</td>
-          <td><small>{String(record.query_snapshot?.start_time || '—')}</small><span className="data-range-separator">→</span><small>{String(record.query_snapshot?.end_time || '—')}</small></td>
+          <td>{isLiveCaptureRecord(record)
+            ? <small className="data-live-range">实时采集 {String(liveCaptureSnapshot(record)?.started_at || '—').replace('T', ' ').slice(0, 19)} → {String(liveCaptureSnapshot(record)?.ended_at || '—').replace('T', ' ').slice(11, 19)}</small>
+            : <><small>{String(record.query_snapshot?.start_time || '—')}</small><span className="data-range-separator">→</span><small>{String(record.query_snapshot?.end_time || '—')}</small></>}</td>
           <td><div className="data-field-chips">{record.rule_snapshots.slice(0, 4).map((raw, index) => <span key={String((raw as { id?: string }).id || index)}>{String((raw as { name?: string }).name || `规则${index + 1}`)}</span>)}{record.rule_snapshots.length > 4 && <span>+{record.rule_snapshots.length - 4}</span>}</div></td>
           <td><span className={`data-record-status ${result.cls}`}>{result.text}</span>{session && <small className="data-session-ready">当前浏览器已还原</small>}</td>
           <td>{formatMoment(record.updated_at)}</td>
           <td><div className="data-row-actions">
-            <button onClick={() => void restore(record)}><RotateCcw size={13}/> 还原</button>
+            <button onClick={() => void restore(record)}><RotateCcw size={13}/> {isLiveCaptureRecord(record) ? '回放数据' : '还原'}</button>
             <button disabled={!session} onClick={() => openSession(record)}><Eye size={13}/> 查看</button>
             <button disabled={!session} onClick={() => openSessionVisualization(record)}><Eye size={13}/> 可视化</button>
             <button disabled={!session} onClick={() => {

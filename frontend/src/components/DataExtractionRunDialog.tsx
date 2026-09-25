@@ -60,6 +60,8 @@ interface Props {
   liveProgress?: LiveCaptureProgress;
   /** 实时监听是否开着；决定这块进度是在实时计数还是在跑批量采集。 */
   liveActive?: boolean;
+  /** 实时采集结束时保存数据记录的结果说明（成功/失败都给用户一句实话）。 */
+  liveSavedNote?: string;
   /**
    * 当前有没有可做批量采集的已解析日志。
    * 实时监听期间没有 —— 但**实时采集照常可用**，所以这里只禁用批量那一个按钮，
@@ -123,6 +125,8 @@ export function DataExtractionRunDialog(props: Props) {
    * 新采到的点会自动出现在图上（signature 保持稳定，所以用户的图表配置不会被重置）。
    */
   const [livePlotRuleId, setLivePlotRuleId] = useState<string>();
+  /** 「查看」打开的实时采集数据表格（行就是这一轮采到的数据，可视化从同一份行画）。 */
+  const [livePreviewRuleId, setLivePreviewRuleId] = useState<string>();
   const [liveMessage, setLiveMessage] = useState('');
 
   /** 「开始采集（实时采集）」：把勾选项作为这一轮的实时采集项，并进入进度视图。 */
@@ -240,25 +244,27 @@ export function DataExtractionRunDialog(props: Props) {
                       <i className={progressTarget ? '' : 'is-live'} style={progressTarget ? { width: `${Math.min(100, Math.round((liveCount / progressTarget) * 100))}%` } : undefined} />
                     </span>
                     <em>{liveCount}{progressTarget ? ` / ${progressTarget}` : ''} 条</em>
-                    {/* 按钮一直在：采到第一条之前点它只提示「还没数据」，而不是让按钮忽隐忽现。 */}
+                    {/* 按钮一直在：采到第一条之前点它只提示「还没数据」，而不是让按钮忽隐忽现。
+                        点开的是**数据表格**（这一轮实时采到的行），图从同一份行画 —— 先看数据再决定画什么。 */}
                     <button
                       type="button"
                       className="data-extraction-live-plot"
                       onClick={() => {
                         if (!(props.liveProgress?.rows[rule.id] || []).length) {
-                          setLiveMessage('还没有采到数据；等第一条采到后就能实时绘图。');
+                          setLiveMessage('还没有采到数据；等第一条采到后就能查看。');
                           return;
                         }
-                        setLivePlotRuleId(rule.id);
+                        setLivePreviewRuleId(rule.id);
                       }}
-                      title="用已采到的数据实时绘图：新数据进来图会跟着更新"
-                    ><Activity size={12}/> 绘图</button>
+                      title="查看这一轮实时采集到的数据表格（可再从表格进入可视化）"
+                    ><Eye size={12}/> 查看</button>
                   </span>
                 )}
               </div>;
               })}
             </div>
             {liveMessage && <div className="data-live-capture-note">{liveMessage}</div>}
+            {props.liveSavedNote && <div className="data-live-capture-note saved">{props.liveSavedNote}</div>}
           </>}
         </>}
 
@@ -302,6 +308,8 @@ export function DataExtractionRunDialog(props: Props) {
         {props.phase === 'select' && <>
           <span className="data-extraction-footer-spacer"/>
           <button className="button ghost" onClick={props.onClose}>关闭</button>
+          {/* 刚结束一轮实时采集时，直接把用户送到「数据」页去看那条记录。 */}
+          {props.liveSavedNote && props.recordSaved && <button className="button secondary" onClick={props.onOpenData}>进入数据</button>}
           {/* 只有一个开始按钮：采集方式由工具栏的「实时监听」开关决定，
               所以按钮文案跟着它变，而不是让用户先在两颗按钮里选。 */}
           {props.liveActive ? (
@@ -333,6 +341,34 @@ export function DataExtractionRunDialog(props: Props) {
     <footer><span>{previewResult.rows.length > 1000 ? '仅预览前 1000 行，下载可获取全部数据。' : `共 ${previewResult.rows.length} 行。`}</span><div className="data-preview-footer-actions"><button className="button secondary" onClick={() => openVisualization(previewResult)}><Activity size={14}/> 绘图</button><button className="button primary" onClick={() => props.onDownload(previewResult)}><Download size={14}/> 下载</button></div></footer>
   </section></div>}
   {visualization && <DataVisualizationDialog dataset={visualization} onClose={() => setVisualization(undefined)}/>}
+  {livePreviewRuleId && (() => {
+    // 实时采集的「查看」：这一轮采到的行，表头就是提取器的字段。
+    const rule = props.candidates.find((item) => item.rule.id === livePreviewRuleId)?.rule;
+    const rows = props.liveProgress?.rows[livePreviewRuleId] || [];
+    if (!rule) return null;
+    const fields = rule.fields.map((field) => field.name || field.key);
+    const total = props.liveProgress?.counts[livePreviewRuleId] || rows.length;
+    return <div className="data-preview-backdrop" onMouseDown={() => setLivePreviewRuleId(undefined)}><section className="data-preview-dialog data-preview-dialog-wide" onMouseDown={(event) => event.stopPropagation()}>
+      <header>
+        <div>
+          <span className="eyebrow">LIVE CAPTURE DATA</span>
+          <h2>{rule.name}</h2>
+          <p>实时采集数据 · 命中 {total.toLocaleString()} 条 · 当前保留最近 {rows.length.toLocaleString()} 行（关掉实时监听时会连同规则快照保存成一条数据记录）</p>
+        </div>
+        <button className="icon-button" onClick={() => setLivePreviewRuleId(undefined)}><X size={18}/></button>
+      </header>
+      <div className="data-preview-table-wrap"><table><thead><tr><th>时间</th>{rule.fields.map((field) => <th key={field.id}>{field.name || field.key}</th>)}</tr></thead><tbody>
+        {rows.slice(0, 1000).map((row, index) => <tr key={`${row.timestamp}-${index}`}><td className="data-original-timestamp">{row.timestamp}</td>{rule.fields.map((field) => <td key={field.id}>{String(row.values[field.name || field.key] ?? '')}</td>)}</tr>)}
+      </tbody></table></div>
+      <footer>
+        <span>{rows.length > 1000 ? '仅预览前 1000 行，下载/可视化可用全部保留行。' : `共 ${rows.length} 行。`}</span>
+        <div className="data-preview-footer-actions">
+          <button className="button secondary" onClick={() => setLivePlotRuleId(livePreviewRuleId)} title="用同一份实时数据画图；新数据进来图会跟着更新"><Activity size={14}/> 可视化</button>
+          <button className="button primary" onClick={() => props.onDownload({ rule, rows })}><Download size={14}/> 下载</button>
+        </div>
+      </footer>
+    </section></div>;
+  })()}
   {livePlotRuleId && (() => {
     const rule = props.candidates.find((item) => item.rule.id === livePlotRuleId)?.rule;
     const rows = props.liveProgress?.rows[livePlotRuleId] || [];

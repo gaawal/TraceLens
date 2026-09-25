@@ -69,6 +69,7 @@ import { afterPaint, type UiReceipt } from './assistant/workstation';
 import { saveTracePilotAgentContext } from './assistant/agentContext';
 import { setLiveMonitoring } from './services/liveMonitoring';
 import { useLiveCaptureProgress } from './services/liveCaptureProgress';
+import { listCaptureWatches } from './services/liveCaptureRestore';
 import { EventRestoreDialog } from './components/EventRestoreDialog';
 import { AtLogAnalysisPage } from './components/AtLogAnalysisPage';
 import { APP_VERSION } from './appConfig';
@@ -6773,6 +6774,98 @@ export default function App() {
   const collecting = dataExtractionDialog.phase === 'running'
     || (liveListening && liveCaptureRuleIds.size > 0);
 
+  /** 这一轮实时采集的起点：只用来给数据记录写「采了哪一段」。 */
+  const liveCaptureStartedAtRef = useRef<string>('');
+  useEffect(() => {
+    if (liveListening && liveCaptureRuleIds.size > 0) {
+      if (!liveCaptureStartedAtRef.current) liveCaptureStartedAtRef.current = new Date().toISOString();
+      return;
+    }
+    if (!liveListening) liveCaptureStartedAtRef.current = '';
+  }, [liveListening, liveCaptureRuleIds.size]);
+
+  /**
+   * 实时采集结束（关监听 / 停止采集）时把这一轮落成**数据记录**。
+   *
+   * 实时采集的行是浏览器按命中抽出来的，关掉弹窗或监听就没地方看了 ——
+   * 但命中本身由后端落库（LogWatchHit），所以记录里存下 watch 与规则快照，
+   * 「数据」页就能随时把当时的行还原出来，不需要重读日志。
+   */
+  async function persistLiveCaptureRecord(reason: 'stopped' | 'live_off') {
+    const rules = liveCaptureRules;
+    const counts = liveCaptureProgress.counts;
+    const rowsForRule = liveCaptureProgress.rows;
+    const captured = rules
+      .map((rule) => ({ rule, rows: rowsForRule[rule.id] || [], count: counts[rule.id] || 0 }))
+      .filter((item) => item.count > 0 || item.rows.length > 0);
+    if (!captured.length) return undefined;
+    let watches: Array<{ id: number; extraction_rule_id: string }> = [];
+    try {
+      watches = await listCaptureWatches();
+    } catch {
+      watches = [];
+    }
+    const now = new Date().toISOString();
+    const startedAt = liveCaptureStartedAtRef.current || now;
+    const totalRows = captured.reduce((sum, item) => sum + item.rows.length, 0);
+    const totalHits = captured.reduce((sum, item) => sum + item.count, 0);
+    const ruleNames = captured.map((item) => item.rule.name || item.rule.id).join('、');
+    const request = activeTask?.remoteRequest;
+    try {
+      const record = await createDataExtractionRecord({
+        name: `实时采集 · ${ruleNames} · ${startedAt.replace('T', ' ').slice(5, 16)}`,
+        environment: activeTask?.remoteEnvironmentId || null,
+        environment_name: resourceWorkspaceEnvironment?.name || '',
+        task_name: activeTask?.name || '',
+        // 实时采集的还原靠 watch 命中，不靠重读日志；这里把两者都记下来。
+        query_snapshot: {
+          ...(request ? {
+            start_time: request.start_time,
+            end_time: request.end_time,
+            source_categories: request.source_categories,
+            subsystems: request.subsystems || [],
+            fms: request.fms || [],
+            fm_targets: request.fm_targets,
+            keyword: request.keyword,
+          } : { subsystems: [], fms: [] }),
+          live_capture: {
+            mode: reason,
+            started_at: startedAt,
+            ended_at: now,
+            hits: liveCaptureProgress.hits,
+            rules: captured.map((item) => ({
+              rule_id: item.rule.id,
+              rule_name: item.rule.name,
+              row_count: item.rows.length,
+              watch_ids: watches.filter((watch) => watch.extraction_rule_id === item.rule.id).map((watch) => watch.id),
+            })),
+          },
+        },
+        rule_snapshots: captured.map((item) => item.rule) as unknown as Array<Record<string, unknown>>,
+        status: 'success',
+        matched_rule_count: captured.length,
+        row_count: totalRows,
+        result_summary: captured.map((item) => ({
+          rule_id: item.rule.id,
+          rule_name: item.rule.name,
+          row_count: item.rows.length,
+          hit_count: item.count,
+          fields: item.rule.fields.map((field) => field.name || field.key),
+          output_format: item.rule.outputFormat,
+        })),
+        finished_at: now,
+      } as Partial<DataExtractionRecord> & { name: string });
+      setDataExtractionDialog((current) => ({ ...current, recordId: record.id, recordSaved: true }));
+      setLiveCaptureSavedNote(`实时采集已保存到数据记录「${record.name}」（${totalRows.toLocaleString()} 行 / 命中 ${totalHits.toLocaleString()} 条），可在「数据」页查看。`);
+      return record;
+    } catch (error) {
+      setLiveCaptureSavedNote(`实时采集已结束，但保存数据记录失败：${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  const [liveCaptureSavedNote, setLiveCaptureSavedNote] = useState('');
+
   /**
    * 关掉实时监听时清空这一轮的采集项。
    *
@@ -6781,6 +6874,8 @@ export default function App() {
    * 用状态变化触发会把用户刚勾好的采集项悄悄抹掉 —— 实测踩过。
    */
   function clearLiveCaptureItems() {
+    // 先把这一轮采到的落成数据记录，再清空采集项 —— 关掉监听不等于丢掉数据。
+    void persistLiveCaptureRecord('live_off');
     setDataExtractionRules((current) => current.some((rule) => rule.liveCapture)
       ? current.map((rule) => rule.liveCapture ? { ...rule, liveCapture: false, updatedAt: Date.now() } : rule)
       : current);
@@ -6793,6 +6888,7 @@ export default function App() {
    * 采集项本来就是「这一轮要采什么」，和启动动作是同一件事。
    */
   function startLiveCollection(ruleIds: string[]): string | undefined {
+    setLiveCaptureSavedNote('');
     const wanted = new Set(ruleIds);
     setDataExtractionRules((current) => current.map((rule) => {
       const next = wanted.has(rule.id);
@@ -8913,6 +9009,7 @@ export default function App() {
           onStartLiveCollection={(ruleIds) => startLiveCollection(ruleIds)}
           liveCaptureIds={liveCaptureRuleIds}
           liveProgress={liveCaptureProgress}
+          liveSavedNote={liveCaptureSavedNote}
           liveActive={liveListening}
           batchAvailable={dataExtractionDialog.batchAvailable}
           onToggle={(id) => setDataExtractionDialog((current) => { const next = new Set(current.selectedIds); next.has(id) ? next.delete(id) : next.add(id); return { ...current, selectedIds: next }; })}
