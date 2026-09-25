@@ -128,7 +128,6 @@ interface Props {
 export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [zoom, setZoom] = useState(1);
-  const [offset, setOffset] = useState(0);
   const dragRef = useRef<{ pointerId: number; startX: number; origin: number }>();
   const [activeTraceId, setActiveTraceId] = useState<string>();
 
@@ -156,13 +155,15 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
   const maxDepth = rows.reduce((deepest, row) => Math.max(deepest, row.depth), 0);
   const labelWidth = LABEL_BASE + maxDepth * INDENT;
   const trackWidth = 1400;
-  const axisWidth = labelWidth + trackWidth + TRACK_PAD;
+  /** 轨道像素宽 = 基准宽 × 缩放；横向靠原生滚动，不再用 transform。 */
+  const trackPx = Math.round(trackWidth * zoom);
+  const axisWidth = labelWidth + trackPx + TRACK_PAD;
   const showDate = span ? new Date(Number(span.min) / 1_000_000).toDateString() !== new Date(Number(span.max) / 1_000_000).toDateString() : false;
 
   const timeToX = useCallback((ns?: bigint): number => {
     if (!span || ns === undefined || span.spanNs === 0n) return 0;
-    return (Number(ns - span.min) / Number(span.spanNs)) * trackWidth;
-  }, [span, trackWidth]);
+    return (Number(ns - span.min) / Number(span.spanNs)) * trackPx;
+  }, [span, trackPx]);
 
   const ticks = useMemo(() => {
     if (!span || span.spanMs <= 0) return [];
@@ -175,62 +176,52 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
     const count = Math.floor(span.spanMs / step);
     for (let index = 1; index <= count && result.length < 14; index += 1) {
       const value = index * step;
-      result.push({ x: (value / span.spanMs) * trackWidth, label: formatTick(base + value, showDate) });
+      result.push({ x: (value / span.spanMs) * trackPx, label: formatTick(base + value, showDate) });
     }
     // 起止两端始终标出来：跨度小于最小刻度时也要有东西可读。
     result.unshift({ x: 0, label: formatTick(base, showDate) });
-    if (span.spanMs > step) result.push({ x: trackWidth, label: formatTick(base + span.spanMs, showDate) });
+    if (span.spanMs > step) result.push({ x: trackPx, label: formatTick(base + span.spanMs, showDate) });
     return result;
-  }, [span, showDate, trackWidth]);
-
-  const clampOffset = useCallback((value: number) => {
-    const viewport = viewportRef.current;
-    if (!viewport) return value;
-    const visible = viewport.clientWidth;
-    const scaled = axisWidth * zoom;
-    // 内容比视口窄时靠左放；否则限制在 0..(内容宽 - 视口宽)，避免拖出空白。
-    const min = Math.min(0, visible - scaled);
-    return Math.min(0, Math.max(min, value));
-  }, [axisWidth, zoom]);
+  }, [span, showDate, trackPx]);
 
   const resetView = useCallback(() => {
     setZoom(1);
-    setOffset(0);
+    const viewport = viewportRef.current;
+    if (viewport) viewport.scrollLeft = 0;
   }, []);
 
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport || typeof ResizeObserver === 'undefined') return undefined;
-    const observer = new ResizeObserver(() => setOffset((current) => clampOffset(current)));
-    observer.observe(viewport);
-    return () => observer.disconnect();
-  }, [clampOffset]);
-
   function onWheel(event: React.WheelEvent<HTMLDivElement>) {
-    if (!event.shiftKey && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-      // 不按 Shift 时留给纵向滚动，横向缩放只在按住 Shift 或横向滚轮时触发。
-      if (!event.ctrlKey) return;
+    if (!event.shiftKey && !event.ctrlKey && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+      // 不按 Shift/Ctrl 时纵向滚轮留给纵向滚动，缩放只在按住修饰键或横向滚轮时触发。
+      return;
     }
     event.preventDefault();
     const viewport = viewportRef.current;
     if (!viewport) return;
     const rect = viewport.getBoundingClientRect();
-    const pointerX = event.clientX - rect.left;
+    const pointerX = event.clientX - rect.left + viewport.scrollLeft - labelWidth;
     const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * (event.deltaY < 0 || event.deltaX < 0 ? 1.15 : 0.87)));
-    setOffset(clampOffset(pointerX - ((pointerX - offset) / zoom) * next));
+    // 以光标为锚点缩放：改完轨道宽度后把同一个时间点挪回光标下面。
     setZoom(next);
+    window.requestAnimationFrame(() => {
+      viewport.scrollLeft = Math.max(0, (pointerX / zoom) * next - (event.clientX - rect.left - labelWidth));
+    });
   }
 
   function beginDrag(event: React.PointerEvent<HTMLDivElement>) {
     if ((event.target as HTMLElement).closest('button')) return;
-    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, origin: offset };
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, origin: viewport.scrollLeft };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function moveDrag(event: React.PointerEvent<HTMLDivElement>) {
     const state = dragRef.current;
-    if (!state || state.pointerId !== event.pointerId) return;
-    setOffset(clampOffset(state.origin + event.clientX - state.startX));
+    const viewport = viewportRef.current;
+    if (!state || !viewport || state.pointerId !== event.pointerId) return;
+    // 拖拽 = 反向滚横向滚动条。用滚动而不是 transform，左侧标签列才能靠 sticky 钉住。
+    viewport.scrollLeft = state.origin - (event.clientX - state.startX);
   }
 
   function endDrag() {
@@ -259,7 +250,7 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
           {traces.length > 1 && (
             <label className="time-tree-trace-picker">
               <span>调用链</span>
-              <select value={activeTrace?.id} onChange={(event) => { setActiveTraceId(event.target.value); setOffset(0); }}>
+              <select value={activeTrace?.id} onChange={(event) => { setActiveTraceId(event.target.value); const v = viewportRef.current; if (v) v.scrollLeft = 0; }}>
                 {traces.map((trace, index) => (
                   <option value={trace.id} key={trace.id}>{`${index + 1}. ${trace.firstFunctionName} · ${trace.components.join(' → ')}`}</option>
                 ))}
@@ -282,11 +273,11 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
       >
-        <div className="time-tree-canvas" style={{ width: axisWidth, transform: `translateX(${offset}px) scale(${zoom})` }}>
+        <div className="time-tree-canvas" style={{ width: axisWidth }}>
           {/* 时间轴：所有时间条的横坐标都以它为准。 */}
           <div className="time-tree-axis" style={{ '--time-tree-label-width': `${labelWidth}px`, height: 30 } as CSSProperties}>
             <div className="time-tree-axis-gutter"><span>时间</span></div>
-            <div className="time-tree-axis-track" style={{ width: trackWidth }}>
+            <div className="time-tree-axis-track" style={{ width: trackPx }}>
               {ticks.map((tick) => (
                 <span className="time-tree-tick" key={tick.x} style={{ left: tick.x }}>
                   <em>{tick.label}</em>
@@ -328,7 +319,7 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
                       </span>
                     </button>
                   </div>
-                  <div className="time-tree-track" style={{ width: trackWidth }}>
+                  <div className="time-tree-track" style={{ width: trackPx }}>
                     {ticks.map((tick) => <span className="time-tree-gridline" key={tick.x} style={{ left: tick.x }} />)}
                     <button
                       type="button"

@@ -529,6 +529,20 @@ const DEFAULT_RANGE_SECONDS = 7 * 24 * 60 * 60;
 const LOG_PAGE_SIZE_OPTIONS = [100, 250, 500, 1000, 2000, 3000, 5000] as const;
 /** Upper bound for every page-size entry point (select, shared scene URL, saved view). */
 const MAX_LOG_PAGE_SIZE = 5000;
+/**
+ * 实时监听期间前端保留的最大日志条数（滑动窗口，超出即丢最旧的）。
+ *
+ * 模拟日志源是每 0.5 秒一条、7×24 不停追加的，实时监听如果无脑
+ * `[...entries, entry]` 累加，浏览器堆内存会一直涨（一小时就是几千条，
+ * 挂一天就是几十万条），最终标签页卡死 —— 这正是"不要让日志不断追加
+ * 把内存撑爆"要防的事。8 小时 × 7200 条/小时 ≈ 5.7 万条，取 2 万条
+ * 兜住（≈ 2.7 小时，每条约 1KB 量级），够回溯也不会失控。
+ * 历史更长时用户本来就应该用「远程日志查询」按时间窗重新拉，而不是
+ * 靠实时流把整段历史攒在浏览器里。
+ */
+const LIVE_ENTRY_WINDOW = 20000;
+/** 实时监听期间保留的解析告警条数（同上，告警比日志稀疏得多）。 */
+const LIVE_ISSUE_WINDOW = 2000;
 const ERROR_RULE_STORAGE_KEY = 'tracelens.error-rules.v3';
 const LEGACY_ERROR_KEYWORD_STORAGE_KEY = 'tracelens.error-keywords.v2';
 const ErrorRuleContext = createContext<readonly ErrorMatchRule[]>(DEFAULT_ERROR_RULES);
@@ -3571,10 +3585,7 @@ function FlatLogView({
 
   return (
     <section className="trace-panel flat-panel">
-      <header className="trace-header" style={{ top: stickyTop }}>
-        <div><h3>{sortOrder === 'asc' ? '按时间升序的日志' : '按时间降序的日志'}</h3></div>
-        <div className="trace-meta"><span>{entries.length} 条</span></div>
-      </header>
+      {/* 这一行只复述了工具栏已有的排序开关和底部分页已有的条数，白占一行高度，去掉。 */}
       <div className="flat-list">
         {entries.map((entry) => (
           <LogRow
@@ -4010,9 +4021,15 @@ export default function App() {
         setTasks((current) => current.map((task) => {
           if (task.id !== taskId) return task;
           const timestampNs = entry.timestampNs;
+          // 滑动窗口：只留最近 LIVE_ENTRY_WINDOW 条，否则实时监听跑久了
+          // 这个数组会无限增长（见常量处的说明）。
+          const nextEntries = [...task.entries, entry];
+          if (nextEntries.length > LIVE_ENTRY_WINDOW) {
+            nextEntries.splice(0, nextEntries.length - LIVE_ENTRY_WINDOW);
+          }
           return {
             ...task,
-            entries: [...task.entries, entry],
+            entries: nextEntries,
             incrementalAddedCount: (task.incrementalAddedCount ?? 0) + 1,
             loadedEndNs: timestampNs !== undefined
               ? (task.loadedEndNs === undefined || timestampNs > task.loadedEndNs ? timestampNs : task.loadedEndNs)
@@ -4031,7 +4048,7 @@ export default function App() {
       if (issues.length > 0 && generation === liveRenderGenerationRef.current) {
         setTasks((current) => current.map((task) => task.id === taskId ? {
           ...task,
-          issues: [...task.issues, ...issues],
+          issues: [...task.issues, ...issues].slice(-LIVE_ISSUE_WINDOW),
         } : task));
       }
     });
@@ -8191,12 +8208,6 @@ export default function App() {
             {/* 左侧固定组：视图开关与三个窗口。它们决定「怎么看日志」，
                 和右侧那些「对日志做什么」的动作分开摆，位置固定不随手边的按钮增减而移动。 */}
             <div className="metric-strip-left" aria-label="日志视图工具">
-              <SwitchControl
-                checked={foldingEnabled}
-                label="函数折叠"
-                hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
-                onChange={(checked) => setFoldingEnabled(checked)}
-              />
             <button
               type="button"
               className={`button ghost metric-action-button ${callFlowDialogOpen ? 'active' : ''}`}
@@ -8249,6 +8260,12 @@ export default function App() {
             >
               <Clock size={14} /> 时间线
             </button>
+              <SwitchControl
+                checked={foldingEnabled}
+                label="函数折叠"
+                hint={foldingEnabled ? '按函数折叠调用日志，展开查看逐行' : '不折叠，逐行展示日志'}
+                onChange={(checked) => setFoldingEnabled(checked)}
+              />
             </div>
             <div className="error-navigation" aria-label="异常导航">
               <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === 0} onClick={() => jumpToAdjacentError(-1)} title="自动跳到上一条异常所在页并定位日志"><ArrowUp size={14}/> 上一异常</button>
