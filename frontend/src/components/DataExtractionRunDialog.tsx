@@ -92,9 +92,10 @@ export function DataExtractionRunDialog(props: Props) {
     setLiveMessage('');
     try {
       const message = await props.onStartLiveCollection(ids);
-      setLiveMessage(typeof message === 'string' && message
-        ? message
-        : `已开始实时采集 ${ids.length} 项；进度会随命中实时更新，点「绘图」可实时联动。`);
+      // 成功时不弹提示：「已开始实时采集 N 项…」只是复述刚点的按钮，
+      // 进度条本身就在跟着涨，多一行字反而是噪声。
+      // 只有需要用户做点什么（例如还没开实时监听）时才提示。
+      setLiveMessage(typeof message === 'string' ? message : '');
     } catch (error) {
       setLiveMessage(error instanceof Error ? error.message : String(error));
     } finally {
@@ -207,25 +208,6 @@ export function DataExtractionRunDialog(props: Props) {
             {liveMessage && <div className="data-live-capture-note">{liveMessage}</div>}
           </>}
         </>}
-
-        {props.phase === 'select' && props.liveActive && (props.liveCaptureIds?.size || 0) > 0 && (
-          <div className="data-extraction-live-summary">
-            <div className="data-extraction-live-summary-head">
-              <Radio size={13} />
-              <strong>实时采集进度</strong>
-              <span>
-                共采到 {Object.entries(props.liveProgress?.counts || {})
-                  .filter(([id]) => props.liveCaptureIds?.has(id))
-                  .reduce((total, [, value]) => total + value, 0)} 条
-                {props.liveProgress && props.liveProgress.hits > 0 ? ` · 命中 ${props.liveProgress.hits} 条日志` : ''}
-                {props.liveProgress && !props.liveProgress.connected ? ' · 通道未连接（服务端仍在采集）' : ''}
-              </span>
-            </div>
-            <p className="data-extraction-live-summary-hint">
-              实时采集在后台持续写入；结果请到「数据提取」页查看、绘图和下载。关闭实时监听会清空这一轮采集项。
-            </p>
-          </div>
-        )}
 
         {props.phase === 'running' && <>
           <div className="data-extraction-progress-card">

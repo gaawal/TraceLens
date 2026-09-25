@@ -15,8 +15,12 @@ drift into the other's surface.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+from uuid import uuid4
+
+from django.db import IntegrityError
 
 from apps.environments.models import Environment, ResourceSettings
 from apps.logsources.models import LogWatch, LogWatchLevel, LogWatchTriggerKind
@@ -183,12 +187,23 @@ def _upsert_watch(
     target_rows: int,
     stop_with_monitoring: bool,
 ) -> LogWatch:
-    name = f"{source.name_prefix}{compiled.name}"
+    base = f"{source.name_prefix}{compiled.name}"
+    # 消歧后缀取 id 的**尾段**：提取器 id 形如 `data-extractor-<uuid>`，
+    # 取前 8 位永远是 `data-ext`，两个同名规则的「消歧」名字还是同一个，照样撞唯一约束
+    # —— 这就是 sync-capture 报 500 的根因。
+    suffix = re.sub(r"[^0-9a-zA-Z]+", "", str(rule["id"]).rsplit("-", 1)[-1])[:8] or uuid4().hex[:8]
+    name = base
     if existing is None and name in names_in_use:
         # (environment, name) is unique. Two rules can legitimately share a display name, and
         # crashing the whole sync with an IntegrityError is not an acceptable answer — and
         # silently adopting the other rule's watch would be worse. Disambiguate instead.
-        name = f"{name} · {str(rule['id'])[:8]}"
+        name = f"{base} · {suffix}"
+        counter = 2
+        # 极端情况下连后缀都撞（同名规则被重复请求、或历史数据里已经占用了同一个后缀），
+        # 继续往后加序号 —— 名字丑一点远好过把 500 丢给用户。
+        while name in names_in_use:
+            name = f"{base} · {suffix}-{counter}"
+            counter += 1
     watch = existing or LogWatch(environment=environment, name=name)
     setattr(watch, source.watch_field, str(rule["id"]))
     watch.name = name
@@ -213,7 +228,18 @@ def _upsert_watch(
         "hourly_quota": int(previous.get("hourly_quota") or 0),
     }
     watch.enabled = True
-    watch.save()
+    try:
+        watch.save()
+    except IntegrityError:
+        # 兜底：名字分配逻辑万一漏了一种情况，也不该让整次同步 500 ——
+        # 换一个确定唯一的名字重试一次，问题记进日志。
+        fallback = f"{base} · {suffix}-{uuid4().hex[:4]}"
+        logger.warning(
+            "watch_capture.name_collision env=%s rule=%s used=%s retry=%s",
+            environment.id, rule.get("id"), name, fallback,
+        )
+        watch.name = fallback
+        watch.save()
     return watch
 
 
@@ -275,7 +301,7 @@ def sync_watches(
                 problems.append({"selector": rule.get("name") or rule_id, "reason": reason})
                 continue
             existing_watch = existing.get(rule_id)
-            _upsert_watch(
+            watch = _upsert_watch(
                 environment, source, rule, compiled,
                 existing=existing_watch,
                 names_in_use=names_in_use - ({existing_watch.name} if existing_watch else set()),
@@ -285,7 +311,9 @@ def sync_watches(
                 stop_with_monitoring=stop_with_monitoring,
             )
             active_ids.append(rule_id)
-            names_in_use.add(f"{source.name_prefix}{compiled.name}")
+            # 记实际生效的名字：之前加的是消歧**前**的名字，于是同一批里第二个同名规则
+            # 以为名字还没被占用 —— 消歧逻辑形同虚设。
+            names_in_use.add(watch.name)
 
     for rule_id, watch in existing.items():
         if watch.enabled and (not enable or rule_id not in active_ids):
