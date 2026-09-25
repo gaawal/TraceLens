@@ -65,6 +65,7 @@ import { EventRestoreDialog } from './EventRestoreDialog';
 import { AbnormalCaseAnalysisDialog } from './AbnormalCaseAnalysisDialog';
 import { AbnormalCaseEditorDialog } from './AbnormalCaseEditorDialog';
 import { HierarchyModuleSelect, splitTargetKey, targetKey, LogTypeSelect } from './RemoteLogQueryPanel';
+import { loadEvidenceMaxChars } from '../assistant/logEvidence';
 import { SmartDateTimeInput } from './SmartDateTimeInput';
 import { EnvironmentResourcePreview } from './EnvironmentResourcePage';
 import type { ContentSeverity, LogEntry, LogFormatParserRuleConfig, ProcessTimeline, ThreadTimeline, TraceTimeline } from '../types';
@@ -1823,7 +1824,8 @@ function CaseExpandedPanel({ item, formatRules, TimelineComponent, errorRules, o
         url: analysis.base_url,
         messages: compactAtLogDiagnosisMessages(collectedMessages),
         anomaly_rules: aiAnomalyRules,
-        case_context: diagnosisContext,
+        // 用例分析与日志分析共用同一档「日志证据长度上限」：没超过就直送原文。
+        case_context: { ...diagnosisContext, log_evidence_max_chars: loadEvidenceMaxChars() },
         force,
       });
       setAiJob(next); setAiEvents(next.events || []); lastSeqRef.current = next.last_seq || 0;

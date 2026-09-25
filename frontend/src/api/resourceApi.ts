@@ -2644,11 +2644,23 @@ export interface AtLogAnomalyRulePayload {
   enabled: boolean;
 }
 
+/**
+ * 用例分析传给后端的现场上下文。除整体透传外，只有「日志证据长度上限」是后端要读的：
+ * 没超过上限就直送原文，超过才压缩 —— 与日志分析共用同一档配置。
+ */
+export interface AtLogCaseContext {
+  case_id?: string;
+  case_name?: string;
+  case_description?: string;
+  log_evidence_max_chars?: number;
+  [key: string]: unknown;
+}
+
 export async function diagnoseAtLogCaseWithAi(payload: {
   url: string;
   messages?: AtLogCaseLogRow[];
   anomaly_rules?: AtLogAnomalyRulePayload[];
-  case_context?: { case_id?: string; case_name?: string; case_description?: string };
+  case_context?: AtLogCaseContext;
 }): Promise<AtLogAiDiagnosisResult> {
   return api<AtLogAiDiagnosisResult>('/atlog-analysis/ai-diagnose/', {
     method: 'POST',
@@ -2660,7 +2672,7 @@ export async function startAtLogAiDiagnosis(payload: {
   url: string;
   messages?: AtLogCaseLogRow[];
   anomaly_rules?: AtLogAnomalyRulePayload[];
-  case_context?: { case_id?: string; case_name?: string; case_description?: string };
+  case_context?: AtLogCaseContext;
   force?: boolean;
 }): Promise<AtLogAiDiagnosisJob> {
   return api<AtLogAiDiagnosisJob>('/atlog-analysis/ai-diagnose-start/', {

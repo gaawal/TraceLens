@@ -17585,3 +17585,26 @@ html.workstation-docked {
   .log-pagination-right .error-nav-button { padding: 0 6px; font-size: 0; }
   .log-pagination-right .error-nav-button svg { width: 15px; height: 15px; }
 }
+
+/* 托管结束后的复原：手机形态 → 原窗口，用更慢、末端带一点回弹的过渡“缓慢伸缩展开”，
+   而不是啪一下弹回去。只在这段时间里覆盖过渡，平时拖动/缩放不受影响。 */
+.ai-cockpit-panel.is-takeover-restoring {
+  transition:
+    left .86s cubic-bezier(.18, 1.06, .28, 1.01),
+    right .86s cubic-bezier(.18, 1.06, .28, 1.01),
+    top .86s cubic-bezier(.18, 1.06, .28, 1.01),
+    bottom .86s cubic-bezier(.18, 1.06, .28, 1.01),
+    width .9s cubic-bezier(.16, 1.14, .3, 1),
+    height .9s cubic-bezier(.16, 1.14, .3, 1),
+    border-radius .78s cubic-bezier(.2, .9, .3, 1),
+    box-shadow .5s ease,
+    opacity .3s ease !important;
+  transform-origin: 100% 100%;
+}
+/* 复原期间不要同时播「打开」的缩放动画：两个动画叠加会互相打架，看起来就是闪一下。 */
+.ai-cockpit-panel.is-takeover-restoring.is-opening {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-cockpit-panel.is-takeover-restoring { transition-duration: .18s !important; }
+}

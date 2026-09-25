@@ -1417,7 +1417,10 @@ TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         id="open_log_locator",
         name="打开日志定位",
-        description="切换到指定环境的日志定位页面，并可带入时间窗、关键字和模块选择。",
+        description="切换到指定环境的日志定位页面，并可带入时间窗、关键字和模块选择。只给用户点名的 component_name 时，会先按组件名解析成子系统/模块再下发，页面打开即自动选中该组件。",
+        use_when="用户要求「打开/查看/切到某个组件（模块、子系统、功能块）的日志」，或需要把页面切到某环境+组件+时间窗的日志视图时。用户只说了组件名就传 component_name，不要让用户自己去页面上再选一次。",
+        do_not_use_when="只需要日志结论、不需要改变页面选择时，优先用 query_environment_logs。",
+        validation_rules=("component_name 必须来自用户输入", "组件名匹配到多个日志目标时后端会返回候选，必须让用户选择，禁止擅自指定"),
         category="界面操作",
         handler=services.open_log_locator,
         input_schema=_object_schema({
@@ -1426,6 +1429,7 @@ TOOLS: tuple[ToolDefinition, ...] = (
             "end_time": {"type": "string"},
             "keyword": {"type": "string", "default": ""},
             "source_categories": {"type": "array", "items": {"type": "string"}, "default": []},
+            "component_name": {"type": "string", "default": "", "description": "用户点名的组件名；提供后自动解析为子系统/模块并在页面上选中。"},
             "fm_targets": _FM_TARGETS,
         }, ["environment_id"]),
         tags=("assistant", "ui", "logs", "navigation"),

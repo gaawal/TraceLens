@@ -248,6 +248,9 @@ TRACELENS_LOWER_TIME_SYNC_TOLERANCE_SECONDS = int(os.getenv("TRACELENS_LOWER_TIM
 # OpenAI-compatible LLM used by the ATLog LangGraph diagnosis agent.
 # Values mirror the provider block used by OpenCode/@ai-sdk/openai-compatible.
 TRACELENS_AI_PROVIDER = os.getenv("TRACELENS_AI_PROVIDER", "my-llm").strip()
+# AI 日志证据（异常锚点上下文）的长度上限：没超过就直送原文，超过才压缩。
+# 页面里也可以在 TracePilot 的模型菜单里覆盖这一档，这里给服务端默认值。
+TRACELENS_AI_EVIDENCE_MAX_CHARS = int(os.getenv("TRACELENS_AI_EVIDENCE_MAX_CHARS", "40000") or 40000)
 TRACELENS_AI_MODEL = os.getenv("TRACELENS_AI_MODEL", "GLM-4.7-XS").strip()
 TRACELENS_AI_BASE_URL = os.getenv("TRACELENS_AI_BASE_URL", "").strip().rstrip("/")
 TRACELENS_AI_API_KEY = os.getenv("TRACELENS_AI_API_KEY", "").strip()

@@ -49,6 +49,13 @@ import {
   type TraceLensCaseDraftResponse,
 } from '../api/resourceApi';
 import { executeUiAction } from '../assistant/workstation';
+import {
+  DEFAULT_EVIDENCE_MAX_CHARS,
+  EVIDENCE_MAX_CHARS_PRESETS,
+  formatEvidenceMaxChars,
+  loadEvidenceMaxChars,
+  saveEvidenceMaxChars,
+} from '../assistant/logEvidence';
 import { listAgentTasks, type AgentTaskSnapshot, removeAgentTask, saveAgentTask, updateAgentTask } from '../assistant/taskStore';
 import { selectNextQueuedTask } from '../assistant/taskQueue';
 
@@ -184,6 +191,8 @@ const TAKEOVER_LEAD_IN_MS = 620;
 const TAKEOVER_STEP_MS = 300;
 const TAKEOVER_HOLD_MS = 520;
 const TAKEOVER_ANIM_MS = 700;
+/** 复原（手机形态 → 原窗口）的过渡时长；比入场慢，且末端带回弹 = 缓慢伸缩展开。 */
+const TAKEOVER_RESTORE_MS = 1100;
 
 const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
@@ -1368,6 +1377,8 @@ export function AiAssistant() {
   const [executionPolicy, setExecutionPolicy] = useState<'confirm' | 'auto'>(() => (window.localStorage.getItem(AI_EXECUTION_POLICY_KEY) as 'confirm' | 'auto') || 'confirm');
   const [executionPolicyMenuOpen, setExecutionPolicyMenuOpen] = useState(false);
   const [modelChoice, setModelChoice] = useState<AiModelChoice>(loadModelChoice);
+  // 日志证据（异常锚点 ±100 行）原文的长度上限：没超过就直送模型，超过才压缩。
+  const [evidenceMaxChars, setEvidenceMaxChars] = useState<number>(loadEvidenceMaxChars);
   const [modelCatalog, setModelCatalog] = useState<TraceLensAiModelOption[]>([]);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -1377,6 +1388,9 @@ export function AiAssistant() {
   const [takeover, setTakeover] = useState('');
   // 托管动画类要比重启类早一拍加、晚一拍撤，两个方向都能平滑过渡。
   const [takeoverAnim, setTakeoverAnim] = useState(false);
+  // 复原方向单独用一套更慢、带轻微回弹的过渡：控制结束后面板是「慢慢伸展开」回原样，
+  // 而不是啪一下弹回去。
+  const [takeoverRestoring, setTakeoverRestoring] = useState(false);
   const [layoutMode, setLayoutMode] = useState<AssistantLayoutMode>(loadLayoutMode);
   const [dockFits, setDockFits] = useState<boolean>(() => assistantDockIsAvailable());
   const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
@@ -1863,9 +1877,12 @@ export function AiAssistant() {
     } finally {
       if (!aborted) await wait(TAKEOVER_HOLD_MS);
       setTakeover(''); setFocusTarget('');
+      // 面板一直在场（手机形态）才播缓慢展开；如果是被收起后重新挂载，
+      // 让它走正常的打开动画，别把两套动画叠在一起。
+      setTakeoverRestoring(!restoreOpen);
       if (restoreOpen) setOpen(true);
-      // Keep the transition class one beat longer so the panel animates back instead of snapping.
-      window.setTimeout(() => setTakeoverAnim(false), TAKEOVER_ANIM_MS);
+      // 复原态要活到过渡跑完；入场态顺手一起撤掉。
+      window.setTimeout(() => { setTakeoverAnim(false); setTakeoverRestoring(false); }, TAKEOVER_RESTORE_MS);
     }
   }
 
@@ -2096,7 +2113,8 @@ export function AiAssistant() {
     run.controller.abort();
     setTaskQueue([]);
     setTakeover('');
-    window.setTimeout(() => setTakeoverAnim(false), TAKEOVER_ANIM_MS);
+    setTakeoverRestoring(true);
+    window.setTimeout(() => { setTakeoverAnim(false); setTakeoverRestoring(false); }, TAKEOVER_RESTORE_MS);
     setFocusTarget('');
     activeRunRef.current = undefined;
     removeAgentTask(run.runId);
@@ -2675,7 +2693,7 @@ export function AiAssistant() {
         } as CSSProperties;
         return (
         <aside
-          className={`ai-assistant-panel ai-cockpit-panel layout-${layoutMode} ${takeover ? 'is-takeover' : ''} ${takeoverAnim ? 'is-takeover-anim' : ''} ${docked ? 'workstation-sidecar' : ''} ${docked && !dockFits ? 'dock-overlay' : ''} ${closing ? 'is-closing' : 'is-opening'}`}
+          className={`ai-assistant-panel ai-cockpit-panel layout-${layoutMode} ${takeover ? 'is-takeover' : ''} ${takeoverAnim ? 'is-takeover-anim' : ''} ${takeoverRestoring ? 'is-takeover-restoring' : ''} ${docked ? 'workstation-sidecar' : ''} ${docked && !dockFits ? 'dock-overlay' : ''} ${closing ? 'is-closing' : 'is-opening'}`}
           data-takeover={takeover || undefined}
           aria-label="TracePilot 智能工作台"
           style={panelStyle}
@@ -3094,6 +3112,24 @@ export function AiAssistant() {
                                 </div>
                               </>
                             )}
+                            <div className="ai-compose-menu-divider" />
+                            <div className="ai-compose-menu-title">日志证据长度上限</div>
+                            <div className="ai-compose-effort-row">
+                              {EVIDENCE_MAX_CHARS_PRESETS.map((preset) => (
+                                <button
+                                  key={preset}
+                                  type="button"
+                                  className={preset === evidenceMaxChars ? 'active' : ''}
+                                  title={preset === DEFAULT_EVIDENCE_MAX_CHARS
+                                    ? `${formatEvidenceMaxChars(preset)}（默认）：异常锚点上下文没超过就直送原文，超过才压缩`
+                                    : `异常锚点上下文没超过 ${formatEvidenceMaxChars(preset)} 就直送原文`}
+                                  onClick={() => setEvidenceMaxChars(saveEvidenceMaxChars(preset))}
+                                >{preset / 10000} 万</button>
+                              ))}
+                            </div>
+                            <div className="ai-compose-menu-empty">
+                              异常锚点（±100 行）上下文的原文没超过 {formatEvidenceMaxChars(evidenceMaxChars)} 就原样直送模型，超过才走字典 + 模板压缩；日志分析与案例/用例分析共用这一档。
+                            </div>
                             <div className="ai-compose-menu-divider" />
                             <button type="button" onClick={() => void listTraceLensAiModels(true).then((catalog) => setModelCatalog(catalog.models || [])).catch(() => undefined)}>
                               <span><strong>刷新模型列表</strong><small>重新从模型网关读取可用模型</small></span>

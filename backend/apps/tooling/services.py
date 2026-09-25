@@ -2298,4 +2298,39 @@ def open_log_locator(payload: dict[str, Any]) -> dict[str, Any]:
     for key in ("start_time", "end_time", "keyword", "source_categories", "fm_targets"):
         if payload.get(key) not in (None, "", []):
             action[key] = payload.get(key)
+
+    # 用户直接点名的组件（“看下 cpfr 的日志”）：页面只认 (subsystem, fm) 这种机器可读目标，
+    # 而模型通常只知道用户说的名字，所以这里先按组件名解析成目标再下发 —— 否则页面打开后
+    # 组件选择框还是空的，用户还得自己再选一次，等于 AI 并没有真的「操作」页面。
+    component_name = str(payload.get("component_name") or "").strip()
+    if component_name:
+        resolution = _component_target_rows(component_name)
+        targets = [
+            {"subsystem": item.get("subsystem"), "fm": item.get("fm"), "kind": item.get("kind") or "normal"}
+            for item in (resolution.get("targets") or [])
+            if item.get("subsystem") and item.get("fm")
+        ]
+        action["component_name"] = component_name
+        if not targets:
+            return {
+                "component_name": component_name,
+                "environment_id": environment.id,
+                "found": False,
+                "selection_required": False,
+                "message": f"组件「{component_name}」没有配置任何日志目标，无法自动选择；请让用户确认组件名。",
+            }
+        if resolution.get("selection_required") or resolution.get("ambiguous"):
+            # 多候选时绝不替用户决定：把候选交回模型，由模型问用户选哪个。
+            return {
+                "component_name": component_name,
+                "environment_id": environment.id,
+                "found": True,
+                "ambiguous": True,
+                "selection_required": True,
+                "candidates": targets[:8],
+                "message": f"组件「{component_name}」匹配到多个日志目标，需要用户选择其中一个。",
+            }
+        action["fm_targets"] = targets
+        action["resolved_targets"] = targets
     return {"ui_action": action}
+

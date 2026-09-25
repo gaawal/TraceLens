@@ -2,22 +2,25 @@ import type { LogEntry } from '../types';
 import { normalizeAbnormalMessage } from '../rendering/abnormalKnowledge';
 
 /**
- * 投喂给 AI 的日志证据：**异常锚点 ±N 行** + **确定性压缩**。
+ * 投喂给 AI 的日志证据：**异常锚点 ±N 行**，先看文本长度再决定压不压缩。
  *
  * 为什么不是「把当前页若干行原样丢给模型」
  * ----------------------------------------
  * 1. 单个异常行本身几乎无法解释原因 —— 根因通常在它前后几十行的状态变化里。
  *    所以每个异常行向外扩 N 行（默认 100），多个异常各自扩散后**合并重叠区间**：
  *    重叠部分只投喂一次，既不重复烧 token，也不会因为两次窗口拼接而错位。
- * 2. 扩完之后原文可能上千行，直接投喂 token 立刻爆。这里做确定性压缩，不调用模型：
+ * 2. **先量再压**：扩完之后量一下原文长度（含每个异常锚点自身），
+ *    没超过上限（默认 40000 字符，可配置）就**原样直送**——模型看到的是真实日志行，
+ *    没有任何模板占位符或代号，判断力最好；只有超过上限时才走下面的压缩。
+ *    这里刻意只比字符长度，不做 token 估算：日志基本都是 ASCII，数量级一致，
+ *    而估算器本身也会漂，反而不好解释「为什么这次压了、上次没压」。
+ * 3. 压缩是确定性的、不调用模型：
  *    - **字典抽取**：子系统/模块/来源文件/级别这些反复出现的值各给一个短代号
  *      （`c1=cpfr`、`E=ERROR`、`f1=cpfr.log`），正文里只写代号；
  *    - **模板归并**：把时间戳/进程号/十六进制/数字抽掉得到模板，**连续且同模板**的行
  *      合并成一条并标 `×N`；同类心跳、轮询、参数回显几百行会塌成一行；
- *    - **只保留区间内的行**，不做逐行描述。
- *    压缩是**无损语义**的：代号表在文首给出，模板里的可变段用 `<N>` 之类占位符标出，
- *    模型仍能看出「哪个模块、什么级别、按什么顺序、重复了多少次」。
- * 3. 输出用接近 YAML 的紧凑文本，而不是 JSON —— 同内容 JSON 的键名和引号要贵得多。
+ *    - 压缩是**无损语义**的：代号表在文首给出，模板里的可变段用 `<N>` 之类占位符标出。
+ * 4. 输出用接近 YAML 的紧凑文本，而不是 JSON —— 同内容 JSON 的键名和引号要贵得多。
  *
  * 返回结构化的 `windows`/`anchors`（供工具按行号回查原始日志）与 `text`（给模型读）。
  */
@@ -26,6 +29,14 @@ import { normalizeAbnormalMessage } from '../rendering/abnormalKnowledge';
 export const EVIDENCE_RADIUS = 100;
 /** 最多取多少个异常锚点：再多就应该先收敛筛选条件，而不是继续加 token。 */
 const MAX_ANCHORS = 12;
+
+/** 锚点上下文原文的长度上限：没超过就直送原文，超过才压缩。 */
+export const DEFAULT_EVIDENCE_MAX_CHARS = 40000;
+export const EVIDENCE_MAX_CHARS_KEY = 'tracelens-ai-evidence-max-chars-v1';
+export const EVIDENCE_MAX_CHARS_MIN = 4000;
+export const EVIDENCE_MAX_CHARS_MAX = 400000;
+/** 上限下拉里给的档位：够用就好，不鼓励把上下文塞满。 */
+export const EVIDENCE_MAX_CHARS_PRESETS = [20000, 40000, 80000, 160000] as const;
 
 export interface EvidenceAnchor {
   /** 在当前有序视图里的下标（0 基）。 */
@@ -39,12 +50,20 @@ export interface EvidenceAnchor {
 
 export interface LogEvidencePayload {
   radius: number;
+  /** raw = 原文直送（没超长度上限）；compressed = 走了字典 + 模板归并。 */
+  mode: 'raw' | 'compressed';
+  /** 这次判定用的原文长度上限（字符）。 */
+  max_chars: number;
+  /** 实际投喂文本的长度（字符）。 */
+  text_chars: number;
+  /** 锚点上下文原文的长度（字符，压缩模式下用它和上限比）。 */
+  raw_text_chars: number;
   anchors: EvidenceAnchor[];
   /** 合并后的行号区间（闭区间，1 基，按当前视图编号）。 */
   windows: Array<{ from: number; to: number }>;
   /** 区间内的行数（压缩前的规模）。 */
   window_lines: number;
-  /** 压缩后的分组条数。 */
+  /** raw 模式=原文行数；compressed 模式=归纳后的模板种数。 */
   groups: number;
   dict: Record<string, Record<string, string>>;
   text: string;
@@ -55,9 +74,51 @@ export interface LogEvidencePayload {
     ratio: number;
     anchors_total: number;
     anchors_used: number;
+    mode?: 'raw' | 'compressed';
+    max_chars?: number;
+    text_chars?: number;
+    raw_text_chars?: number;
+    /**
+     * 后端放行这段证据文本用的字符上限（= 用户配置的长度上限 + 头部余量）：
+     * 页面证据已经量过了，后端不能再按通用的 3000 字符上限二次切掉。
+     */
+    char_budget?: number;
   };
 }
 
+export function normalizeEvidenceMaxChars(value: unknown): number {
+  const parsed = Math.round(Number(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_EVIDENCE_MAX_CHARS;
+  return Math.min(EVIDENCE_MAX_CHARS_MAX, Math.max(EVIDENCE_MAX_CHARS_MIN, parsed));
+}
+
+/** 读取用户配置的证据长度上限；没配过 / 存坏了都退回默认 40000 字符。 */
+export function loadEvidenceMaxChars(): number {
+  if (typeof window === 'undefined') return DEFAULT_EVIDENCE_MAX_CHARS;
+  try {
+    const stored = window.localStorage.getItem(EVIDENCE_MAX_CHARS_KEY);
+    if (!stored) return DEFAULT_EVIDENCE_MAX_CHARS;
+    return normalizeEvidenceMaxChars(stored);
+  } catch {
+    return DEFAULT_EVIDENCE_MAX_CHARS;
+  }
+}
+
+export function saveEvidenceMaxChars(value: unknown): number {
+  const normalized = normalizeEvidenceMaxChars(value);
+  try {
+    window.localStorage.setItem(EVIDENCE_MAX_CHARS_KEY, String(normalized));
+  } catch {
+    // 存储不可用（隐私模式等）时仍然按本次选择生效，不阻断对话。
+  }
+  return normalized;
+}
+
+/** 把字符数说成人话：40000 → 4 万字符。 */
+export function formatEvidenceMaxChars(value: number): string {
+  if (value >= 10000) return `${Number((value / 10000).toFixed(value % 10000 === 0 ? 0 : 1))} 万字符`;
+  return `${value} 字符`;
+}
 function short(value: string, limit: number): string {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
@@ -118,11 +179,21 @@ class TokenDict {
 }
 
 /**
- * 构建「异常锚点 ±N 行」的压缩证据。
+ * 构建「异常锚点 ±N 行」的证据。
+ *
+ * 先量后压：锚点上下文原文的长度没超过 `maxChars` 就原样直送，
+ * 超过才做字典 + 模板归并（返回 payload 的 `mode` 说明走了哪条路）。
  *
  * @param entries 当前视图的**有序**日志（时间序），下标即视图行号。
+ * @param radius 锚点向外扩散的行数。
+ * @param maxChars 原文长度上限（字符）；默认读用户配置（没配过 = 40000）。
  */
-export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE_RADIUS): LogEvidencePayload | undefined {
+export function buildLogEvidence(
+  entries: readonly LogEntry[],
+  radius = EVIDENCE_RADIUS,
+  maxChars = loadEvidenceMaxChars(),
+): LogEvidencePayload | undefined {
+  const limit = normalizeEvidenceMaxChars(maxChars);
   if (!entries.length) return undefined;
 
   const anchors: EvidenceAnchor[] = [];
@@ -145,6 +216,69 @@ export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE
   )));
 
   const lineOf = (index: number) => entries[index]?.lineNumber ?? index + 1;
+
+  // ── 锚点上下文的原文（去重、按视图顺序）─────────────────────────────────
+  // 这份原文既是「直送 AI」的候选，也是决定要不要压缩的依据：
+  // 先看它的长度，超过上限才去构造压缩版本。
+  const rawMembers = new Set<string>();
+  const rawLines: string[] = [];
+  let rawChars = 0;
+  for (const [from, to] of windows) {
+    for (let index = from; index <= to; index += 1) {
+      const entry = entries[index];
+      if (!entry || rawMembers.has(entry.id)) continue;
+      rawMembers.add(entry.id);
+      const body = String(entry.raw || entry.message || '').replace(/\s+/g, ' ').trim();
+      rawChars += body.length;
+      const component = String(entry.component || entry.logModule || '').trim() || '-';
+      const level = String(entry.level || '').trim() || '-';
+      rawLines.push(`L${lineOf(index)} ${compactTime(entry.timestamp)} ${component} ${level} ${body}`);
+    }
+  }
+  const windowLines = rawMembers.size;
+
+  const rawHeader = [
+    `# 日志证据 · 异常锚点 ±${radius} 行（原文直送，未压缩）`,
+    `规模: 原文 ${windowLines} 行 / ${rawChars} 字符（上限 ${limit} 字符）`,
+    `区间(视图行号): ${windows.map(([from, to]) => `${from + 1}-${to + 1}`).join(', ')}`,
+    `锚点(${usedAnchors.length}${anchors.length > usedAnchors.length ? `/${anchors.length}` : ''}):`,
+    ...usedAnchors.map((anchor) => (
+      `- L${anchor.line} ${anchor.time} ${anchor.component} ${anchor.level} ${anchor.message}`
+    )),
+    '上下文原文（L=视图行号，逐行真实日志）:',
+  ].join('\n');
+  const rawText = `${rawHeader}\n${rawLines.join('\n')}`;
+  // 量的是**最终要投喂的那段文本**（含表头），不是逐条消息之和：判断和实际投喂一致。
+  const rawTextChars = rawText.length;
+
+  if (rawTextChars <= limit) {
+    return {
+      radius,
+      mode: 'raw',
+      max_chars: limit,
+      text_chars: rawTextChars,
+      raw_text_chars: rawTextChars,
+      anchors: usedAnchors,
+      windows: windows.map(([from, to]) => ({ from: from + 1, to: to + 1 })),
+      window_lines: windowLines,
+      groups: rawLines.length,
+      dict: {},
+      text: rawText,
+      stats: {
+        raw_chars: rawChars,
+        packed_chars: rawTextChars,
+        ratio: rawChars > 0 ? Number((rawTextChars / rawChars).toFixed(3)) : 1,
+        anchors_total: anchors.length,
+        anchors_used: usedAnchors.length,
+        mode: 'raw',
+        max_chars: limit,
+        text_chars: rawTextChars,
+        raw_text_chars: rawTextChars,
+        // 后端按这个上限放行文本，不headroom：留一点头部余量，避免差几个字符被切。
+        char_budget: limit + 512,
+      },
+    };
+  }
 
   /**
    * 先扫一遍区间内的 `key=value`，找出**取值很多**的键（wafer=W01…W08、target=…）。
@@ -180,14 +314,12 @@ export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE
   const sourceDict = new TokenDict('f');
   const members = new Set<string>();
   const groups: Array<{ from: number; to: number; count: number; comp: string; lvl: string; src: string; tmpl: string }> = [];
-  let rawChars = 0;
 
   for (const [from, to] of windows) {
     for (let index = from; index <= to; index += 1) {
       const entry = entries[index];
       if (!entry || members.has(entry.id)) continue;
       members.add(entry.id);
-      rawChars += String(entry.raw || entry.message || '').length;
 
       const component = String(entry.component || entry.logModule || '').trim() || '-';
       const level = levelCode(entry.level || '');
@@ -254,8 +386,8 @@ export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE
   const sourceNames = sourceDict.dump();
 
   const textLines = [
-    `# 日志证据 · 异常锚点 ±${radius} 行（重叠区间已合并，模板相同的连续行已归并）`,
-    `规模: 原文 ${members.size} 行 / ${rawChars} 字符 → 去重 ${groups.length} 段 → 归纳 ${totalGroups} 种`,
+    `# 日志证据 · 异常锚点 ±${radius} 行（原文 ${rawTextChars} 字符 > 上限 ${limit} 字符，已压缩：重叠区间合并 + 模板归并）`,
+    `规模: 原文 ${windowLines} 行 / ${rawChars} 字符 → 去重 ${groups.length} 段 → 归纳 ${totalGroups} 种`,
     `区间(视图行号): ${windows.map(([from, to]) => `${from + 1}-${to + 1}`).join(', ')}`,
     `可变键(取值≥3种，已归一化为 <V>): ${volatileKeys.size ? [...volatileKeys].join(' ') : '无'}`,
     `字典: ${[
@@ -278,11 +410,15 @@ export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE
 
   return {
     radius,
+    mode: 'compressed',
+    max_chars: limit,
+    text_chars: text.length,
+    raw_text_chars: rawTextChars,
     anchors: usedAnchors,
     // 用**视图行号**（1 基）而不是文件行号：合并区间常常横跨多个日志文件，
     // 而每个文件的行号都从 1 开始，直接报行号会看起来像「只有一个区间」。
     windows: windows.map(([from, to]) => ({ from: from + 1, to: to + 1 })),
-    window_lines: members.size,
+    window_lines: windowLines,
     groups: totalGroups,
     dict: { component: componentNames, level: levelNames, source: sourceNames },
     text,
@@ -292,6 +428,12 @@ export function buildLogEvidence(entries: readonly LogEntry[], radius = EVIDENCE
       ratio: rawChars > 0 ? Number((text.length / rawChars).toFixed(3)) : 1,
       anchors_total: anchors.length,
       anchors_used: usedAnchors.length,
+      mode: 'compressed',
+      max_chars: limit,
+      text_chars: text.length,
+      raw_text_chars: rawTextChars,
+      // 压缩后的文本本来就比上限小得多，这里给同样的放行额度即可。
+      char_budget: limit + 512,
     },
   };
 }

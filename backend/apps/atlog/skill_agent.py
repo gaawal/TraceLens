@@ -317,7 +317,14 @@ def diagnose_case_with_skill(
             continue
         seen_page_rows.add(key)
         page_rows.append(item)
-    page_compact = compact_log_rows_for_ai(page_rows, max_chars=10000, max_nodes=36, max_groups=22)
+    # 先量后压：异常/页面上下文的原文没超过长度上限就**原样直送**（模型看到真实日志行，
+    # 没有模板占位符），超过上限才走函数归属压缩。上限跟日志分析那一档共用。
+    from apps.tooling.log_context import evidence_max_chars, raw_log_rows_context
+
+    evidence_budget = evidence_max_chars(context)
+    page_compact = raw_log_rows_context(page_rows, max_chars=evidence_budget)
+    if page_compact is None:
+        page_compact = compact_log_rows_for_ai(page_rows, max_chars=10000, max_nodes=36, max_groups=22)
     report_rows = _page_report_rows(context)
     from apps.tooling.evidence import build_evidence_pack, structured_diagnosis
     evidence_pack = build_evidence_pack([*report_rows, *page_rows], max_chars=12000)
@@ -327,6 +334,13 @@ def diagnose_case_with_skill(
     case_id = _safe_text(context.get("case_id") or report_facts.get("case_id") or case_id_from_url(base_url), 255)
     case_name = _safe_text(context.get("case_name") or report_facts.get("case_name") or case_id, 255)
 
+    logger.info(
+        "atlog.skill.evidence mode=%s rows=%s chars=%s budget=%s",
+        page_compact.get("mode") or "compressed",
+        page_compact.get("source_row_count"),
+        page_compact.get("raw_chars") or len(str(page_compact.get("ai_context") or "")),
+        evidence_budget,
+    )
     logger.info(
         "atlog.skill.start case_url=%s case_id=%s case_name=%s page_rows=%s report_rows=%s selected_targets=%s start_time=%s end_time=%s",
         base_url[:1000], case_id, case_name, len(page_rows), len(report_rows),

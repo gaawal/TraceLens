@@ -58,6 +58,9 @@ _MAX_HISTORY_CHARS = 900
 _MAX_MEMORY_CHARS = 2600
 _MAX_TOOL_RESULT_CHARS = 12000
 _MAX_RUNTIME_CONTEXT_CHARS = 7000
+#: 日志证据原文的兜底放行上限：前端已按用户配置裁过（默认 4 万字符），
+#: 这里给一个更宽的硬上限，防止异常大的载荷把提示词撑爆。
+_EVIDENCE_MAX_PASSTHROUGH_CHARS = 400_000
 _MAX_AGENT_TOOLS = 16
 _MAX_TOOL_DESCRIPTION_CHARS = 520
 
@@ -312,6 +315,9 @@ def _runtime_context_text(context: dict[str, Any]) -> str:
     # environment_id is an internal Tool key and is deliberately omitted from the
     # semantic page snapshot so it cannot leak into user-facing prose.
     normalized_context = strip_internal_ids(context)
+    # 页面按长度上限放行的日志证据原文（见下方 log_evidence 的处理）。
+    evidence_text = ""
+    evidence_char_limit = _EVIDENCE_MAX_PASSTHROUGH_CHARS
 
     # The log page already owns the canonical function-fold tree.  Prefer that
     # compact structural view over dozens of raw rendered rows so the model sees
@@ -320,6 +326,23 @@ def _runtime_context_text(context: dict[str, Any]) -> str:
     if isinstance(normalized_context, dict):
         locator = normalized_context.get("log_locator")
         if isinstance(locator, dict):
+            # 浏览器已经按用户配置的长度上限做过「先量后压」：没超上限时 text 就是
+            # 锚点上下文的**原文**。这段文本必须原样进提示词 —— 通用压缩器会把超过
+            # 3000 字符的字符串切掉，整个「没超就直送」的决策就白做了。
+            # 所以把它从上下文里摘出来单独放行，只留元数据在 YAML 里。
+            evidence = locator.get("log_evidence") if isinstance(locator.get("log_evidence"), dict) else None
+            if evidence and str(evidence.get("text") or "").strip():
+                evidence = dict(evidence)
+                evidence_text = str(evidence.pop("text"))
+                try:
+                    declared = int(evidence.get("char_budget") or 0)
+                except (TypeError, ValueError):
+                    declared = 0
+                if declared > 0:
+                    evidence_char_limit = min(_EVIDENCE_MAX_PASSTHROUGH_CHARS, declared)
+                locator["log_evidence"] = evidence
+            else:
+                evidence_text = ""
             folds = [item for item in list(locator.get("function_fold_summary") or []) if isinstance(item, dict)]
             if folds:
                 fold_lines: list[str] = []
@@ -423,7 +446,15 @@ def _runtime_context_text(context: dict[str, Any]) -> str:
         text = ""
     if len(text) > _MAX_RUNTIME_CONTEXT_CHARS:
         text = text[:_MAX_RUNTIME_CONTEXT_CHARS] + "\n…页面上下文已截断"
-    return "当前页面运行上下文（来自浏览器实时状态，不是模型猜测）：\n" + (text or "未提供")
+    block = "当前页面运行上下文（来自浏览器实时状态，不是模型猜测）：\n" + (text or "未提供")
+    if evidence_text:
+        # 证据块已按用户配置的长度上限裁过（raw 模式就是原文），这里只兜一个略大的
+        # 安全上限，不再按通用字符串上限二次截断。
+        capped = evidence_text[:evidence_char_limit]
+        block += "\n\n" + capped
+        if len(capped) < len(evidence_text):
+            block += "\n…日志证据超过放行上限，已截断"
+    return block
 
 
 def _page_evidence_trace(context: dict[str, Any]) -> tuple[str, str]:

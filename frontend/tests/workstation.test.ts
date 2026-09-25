@@ -132,3 +132,81 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(pruneFoldInflux(influx, 1010 + 100), influx, '没过期时返回原对象，避免无意义重渲染');
   console.log('实时折叠动画差值检查通过');
 }
+
+// --- AI 日志证据：先量后压 + 组件名解析 -------------------------------------------
+{
+  const {
+    buildLogEvidence,
+    normalizeEvidenceMaxChars,
+    formatEvidenceMaxChars,
+    saveEvidenceMaxChars,
+    loadEvidenceMaxChars,
+    DEFAULT_EVIDENCE_MAX_CHARS,
+    EVIDENCE_MAX_CHARS_MIN,
+    EVIDENCE_MAX_CHARS_MAX,
+  } = await import('../src/assistant/logEvidence');
+  const { resolveComponentTargets } = await import('../src/components/RemoteLogQueryPanel');
+
+  const entry = (index: number, message: string) => ({
+    id: `e${index}`,
+    lineNumber: index + 1,
+    timestamp: `2026-09-25 10:00:${String(index % 60).padStart(2, '0')}`,
+    level: index === 5 ? 'ERROR' : 'INFO',
+    severity: index === 5 ? 'error' : 'info',
+    component: 'cpfr',
+    logModule: 'cpfr',
+    message,
+    raw: `[2026-09-25 10:00:00] [INFO] [CPFR] [25312] [30312] [cpfr] [normal] [cpfr:F:1] ${message}`,
+    source: { fileName: 'cpfr.log', lineNumber: index + 1 },
+    sourceFile: 'cpfr.log',
+  });
+
+  // 没超上限 → 原文直送：正文里必须是逐行真实日志，而不是模板占位符。
+  const small = [0, 1, 2, 3, 4, 5, 6, 7].map((index) => entry(index, `step ${index} reached nominal state`));
+  const raw = buildLogEvidence(small as never, 100, DEFAULT_EVIDENCE_MAX_CHARS);
+  assert.equal(raw?.mode, 'raw');
+  assert.equal(raw?.max_chars, DEFAULT_EVIDENCE_MAX_CHARS);
+  assert.equal(raw?.text_chars, raw?.text.length);
+  assert.ok(raw!.text.includes('step 2 reached nominal state'), 'raw 模式必须包含原始日志行');
+  assert.ok(!raw!.text.includes('×'), 'raw 模式不该出现模板归并记号');
+  assert.equal(raw?.stats.mode, 'raw');
+  assert.equal(raw?.stats.char_budget, DEFAULT_EVIDENCE_MAX_CHARS + 512);
+  assert.equal(raw?.text.length <= DEFAULT_EVIDENCE_MAX_CHARS, true);
+
+  // 超上限 → 走压缩：同一模板的连续行归并成一条并标 ×N，总长明显变小。
+  const noisy = Array.from({ length: 400 }, (_, index) => entry(index, `wafer=W${index % 9} thermal budget recalculated with a fairly long trailing description to inflate the payload`));
+  const compressed = buildLogEvidence(noisy as never, 100, 4000);
+  assert.equal(compressed?.mode, 'compressed');
+  assert.ok(compressed!.raw_text_chars > 4000, '压缩前必须确实超过上限');
+  assert.ok(compressed!.text_chars < compressed!.raw_text_chars);
+  assert.ok(compressed!.groups < 400, `模板归并应显著减少条目，实际 ${compressed!.groups}`);
+  assert.equal(compressed?.stats.max_chars, 4000);
+  assert.equal(compressed?.stats.token_budget, undefined, '已经不用 token 预算了');
+
+  // 上限本身：脏数据回退默认值，越界被夹住。
+  assert.equal(normalizeEvidenceMaxChars(0), DEFAULT_EVIDENCE_MAX_CHARS);
+  assert.equal(normalizeEvidenceMaxChars('not-a-number'), DEFAULT_EVIDENCE_MAX_CHARS);
+  assert.equal(normalizeEvidenceMaxChars(10), EVIDENCE_MAX_CHARS_MIN);
+  assert.equal(normalizeEvidenceMaxChars(9_999_999), EVIDENCE_MAX_CHARS_MAX);
+  assert.equal(formatEvidenceMaxChars(40000), '4 万字符');
+  // window 上的 storage 由本文件顶部注入；这里显式挂一次，验证真正写读回来的是同一个值。
+  Object.assign(window, { localStorage: storage });
+  assert.equal(saveEvidenceMaxChars(80000), 80000);
+  assert.equal(loadEvidenceMaxChars(), 80000);
+  assert.equal(saveEvidenceMaxChars(DEFAULT_EVIDENCE_MAX_CHARS), DEFAULT_EVIDENCE_MAX_CHARS);
+  assert.equal(loadEvidenceMaxChars(), DEFAULT_EVIDENCE_MAX_CHARS);
+
+  // 组件名 → 目录里的真实 (subsystem, fm)：大小写/显示名都要能对上。
+  const catalog = [
+    { id: 1, name: 'cpfr', display_name: '配方流量', effective_name: 'cpfr', enabled: true, sort_order: 1, description: '', fms: [{ id: 1, name: 'cpfr', display_name: '', effective_name: 'cpfr', kind: 'normal' }] },
+    { id: 3, name: 'mecore', display_name: '运动核心', effective_name: 'mecore', enabled: true, sort_order: 2, description: '', fms: [
+      { id: 5, name: 'cpcore', display_name: '', effective_name: 'cpcore', kind: 'normal' },
+      { id: 6, name: 'mecore', display_name: '', effective_name: 'mecore', kind: 'normal' },
+    ] },
+  ] as never;
+  assert.deepEqual(resolveComponentTargets('MECORE', catalog), ['mecore\u0000mecore\u0000normal'], '大小写不敏感地命中同名模块');
+  assert.deepEqual(resolveComponentTargets('配方流量', catalog), ['cpfr\u0000cpfr\u0000normal'], '显示名也要能命中');
+  assert.deepEqual(resolveComponentTargets('运动核心', catalog).length, 2, '子系统显示名命中时选中该子系统全部模块');
+  assert.deepEqual(resolveComponentTargets('nope', catalog), []);
+  console.log('AI 日志证据与组件名解析检查通过');
+}

@@ -185,3 +185,77 @@ def compact_log_rows_for_ai(
             if omitted else "当前受控证据窗口已覆盖全部匹配行。"
         ),
     }
+
+
+#: 原文直送时最多逐行列出多少条（超长上下文里再多的行也读不过来）。
+RAW_CONTEXT_MAX_ROWS = 4000
+
+
+def evidence_max_chars(payload: dict[str, Any] | None = None, default: int = 40000) -> int:
+    """页面证据的长度上限（字符）：请求里带了就用请求的，否则用配置默认值。
+
+    「先量后压」的判定全靠它：原文没超过这个上限就直送模型，超过才压缩。
+    """
+    from django.conf import settings
+
+    value = (payload or {}).get("log_evidence_max_chars") if isinstance(payload, dict) else None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 0
+    if parsed <= 0:
+        try:
+            parsed = int(getattr(settings, "TRACELENS_AI_EVIDENCE_MAX_CHARS", default))
+        except (TypeError, ValueError):
+            parsed = default
+    return max(4000, min(parsed, 400000))
+
+
+def raw_log_rows_context(rows: Iterable[dict[str, Any]] | None, *, max_chars: int) -> dict[str, Any] | None:
+    """原文直送：锚点/异常上下文的真实日志行，不做模板归并。
+
+    返回 ``None`` 表示原文已经超过上限，调用方应改用 ``compact_log_rows_for_ai`` 压缩。
+    逐行格式与页面一致（L 行号 + 时间 + 组件 + 级别 + 正文），模型能直接回链到原始日志。
+    """
+    values = [dict(item) for item in (rows or []) if isinstance(item, dict)]
+    if not values:
+        return None
+    lines: list[str] = []
+    used = 0
+    for row in values[:RAW_CONTEXT_MAX_ROWS]:
+        source = _text(row.get("source_path") or row.get("source") or "", 220)
+        line_no = row.get("line_number") or row.get("line")
+        prefix = f"L{line_no} " if line_no not in (None, "") else ""
+        body = _text(row.get("message") or row.get("raw") or "", 1000)
+        if not body:
+            continue
+        anomaly = list(row.get("matched_anomaly_rules") or [])
+        parts = [
+            prefix + str(row.get("time") or ""),
+            str(row.get("level") or "").upper(),
+            str(row.get("component") or ""),
+            f"({source})" if source else "",
+            body,
+            f"[命中异常规则: {'、'.join(str(item)[:40] for item in anomaly[:3])}]" if anomaly else "",
+        ]
+        line = " ".join(part for part in parts if part).strip()
+        used += len(line) + 1
+        if used > max_chars:
+            return None
+        lines.append(line)
+    if not lines:
+        return None
+    header = (
+        f"# 页面日志证据（原文直送，未压缩）：{len(lines)} 行 / 约 {used} 字符（上限 {max_chars} 字符）\n"
+        "L=原始日志行号；按页面顺序排列，末行为最新。\n"
+    )
+    if len(header) + used > max_chars:
+        return None
+    return {
+        "mode": "raw",
+        "max_chars": max_chars,
+        "raw_chars": len(header) + used,
+        "ai_context": header + "\n".join(lines),
+        "evidence_rows": values[: min(len(values), 200)],
+        "source_row_count": len(values),
+    }

@@ -6323,11 +6323,25 @@ export default function App() {
         if (!environment) throw new Error('目标环境不存在');
         rememberResourceWorkspace(environment);
         setPreferredRemoteEnvironmentId(environment.id);
-        const startTime = String(detail.start_time || '').trim();
-        const endTime = String(detail.end_time || '').trim();
+        const componentName = String(detail.component_name || '').trim();
+        let startTime = String(detail.start_time || '').trim();
+        let endTime = String(detail.end_time || '').trim();
         const fmTargets = Array.isArray(detail.fm_targets) ? detail.fm_targets as LogWindowRequest['fm_targets'] : [];
         const sourceCategories = Array.isArray(detail.source_categories) ? detail.source_categories.map(String) : [];
         const keyword = String(detail.keyword || '');
+        // 「看下某组件的日志」= 一次真正的查询，而不是只把页面打开、让用户自己再点一次。
+        // 模型只给了组件名/目标却没给时间窗时，用和面板一致的默认窗口（最近 1 小时，客户端时钟）补齐。
+        // 只有拿到具体子系统/模块目标才自动提交检索：空目标会被面板按「禁止全库扫描」拦下来。
+        // 只给了组件名时页面仍会按名字勾选组件、并填好默认时间窗，用户点一下查询即可。
+        const wantsQuery = (fmTargets?.length || 0) > 0 || sourceCategories.length > 0;
+        if ((wantsQuery || Boolean(componentName)) && (!startTime || !endTime)) {
+          const pad = (value: number) => String(value).padStart(2, '0');
+          const localStamp = (date: Date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+            + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+          const now = new Date();
+          startTime = startTime || localStamp(new Date(now.getTime() - 60 * 60 * 1000));
+          endTime = endTime || localStamp(now);
+        }
         const request = startTime && endTime ? {
           start_time: startTime,
           end_time: endTime,
@@ -6340,6 +6354,8 @@ export default function App() {
         setPreferredRemotePreset({
           token: `assistant-${environment.id}-${Date.now()}`,
           environmentId: environment.id,
+          componentName: componentName || undefined,
+          assistantDriven: true,
           startTime: startTime || undefined,
           endTime: endTime || undefined,
           taskName: `TracePilot 日志定位 · ${environment.name}`,
@@ -6347,14 +6363,25 @@ export default function App() {
         });
         setWorkspacePage('logs');
         selectLatestTaskForEnvironment(environment.id);
-        if (request && ((request.fm_targets?.length || 0) > 0 || (request.source_categories?.length || 0) > 0)) {
+        if (request && wantsQuery) {
           startRemoteLogSearch(environment, request, { taskName: `TracePilot 日志定位 · ${environment.name}`, force: true });
           if (detail.errors_only !== undefined) {
             setFilters((current) => ({ ...current, errorsOnly: Boolean(detail.errors_only), query: keyword }));
             setLogPage(1);
           }
         }
-        return { detail: request ? '已切换环境并提交日志检索；数据加载由日志任务展示' : '已打开日志定位' };
+        const targetText = fmTargets?.length
+          ? fmTargets.map((item) => `${item.subsystem}/${item.fm}`).join('、')
+          : '';
+        return {
+          detail: !request
+            ? '已打开日志定位'
+            : componentName
+              ? `已在日志定位页面选中组件「${componentName}」${targetText ? `（${targetText}）` : ''}${wantsQuery ? '并提交检索' : '，时间窗已填好，可直接查询'}`
+              : '已切换环境并提交日志检索；数据加载由日志任务展示',
+          component_name: componentName || undefined,
+          fm_targets: fmTargets || [],
+        };
       },
     });
 

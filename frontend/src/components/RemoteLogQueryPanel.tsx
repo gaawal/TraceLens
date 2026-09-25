@@ -34,10 +34,46 @@ export interface RemoteLogPreset {
   environmentId: number;
   subsystem?: string;
   module?: string;
+  /** 用户点名的组件名（AI 只会说人话里的名字），进页面后按目录解析成真实目标。 */
+  componentName?: string;
+  /** 助手下发的预设：即使当前已有日志任务，也要应用这次点名（用户本轮指令优先）。 */
+  assistantDriven?: boolean;
   startTime?: string;
   endTime?: string;
   taskName?: string;
   request?: LogWindowRequest;
+}
+
+/**
+ * 组件名 → 目录里的真实 (subsystem, fm)：AI 拿到的往往是「cpfr」这种人说的名字，
+ * 大小写、显示名、子系统名都可能和目录里的键不一致，直接塞进 selectedTargets 会
+ * 出现「选择框还是空的」。这里做一次宽松匹配：先按模块名，再按子系统名（整个子系统）。
+ */
+export function resolveComponentTargets(
+  name: string,
+  catalog: GlobalLogSubsystem[],
+): string[] {
+  const wanted = String(name || '').trim().toLowerCase();
+  if (!wanted) return [];
+  const names = (...values: Array<string | undefined>) => values.some((value) => String(value || '').trim().toLowerCase() === wanted);
+  const moduleMatches: string[] = [];
+  for (const subsystem of catalog) {
+    for (const fm of subsystem.fms || []) {
+      if (names(fm.name, fm.display_name, fm.effective_name)) {
+        // 键必须和 HierarchyModuleSelect 用的完全一致（子系统用 name，模块用 name）。
+        moduleMatches.push(targetKey(subsystem.name, fm.name, fm.kind === 'executor' ? 'executor' : 'normal'));
+      }
+    }
+  }
+  if (moduleMatches.length) return Array.from(new Set(moduleMatches));
+  const subsystemTargets: string[] = [];
+  for (const subsystem of catalog) {
+    if (!names(subsystem.name, subsystem.display_name, subsystem.effective_name)) continue;
+    for (const fm of subsystem.fms || []) {
+      subsystemTargets.push(targetKey(subsystem.name, fm.name, fm.kind === 'executor' ? 'executor' : 'normal'));
+    }
+  }
+  return Array.from(new Set(subsystemTargets));
 }
 
 
@@ -596,7 +632,8 @@ export function RemoteLogQueryPanel({
 
   useEffect(() => {
     if (activeTaskLocal) return;
-    if (activeTaskRequest) return;
+    // 已有任务时默认不让旧预设覆盖任务状态；但助手这一轮明确点名了组件，属于新指令，必须应用。
+    if (activeTaskRequest && !initialPreset?.assistantDriven) return;
     if (!initialPreset || appliedPresetRef.current === initialPreset.token) return;
     if (!environments.some((item) => item.id === initialPreset.environmentId)) return;
     setEnvironmentId(initialPreset.environmentId);
@@ -615,13 +652,32 @@ export function RemoteLogQueryPanel({
     if (presetRequest) {
       setSelectedSources(new Set(presetRequest.source_categories || []));
       onTaskQueryChange(presetRequest.keyword || '');
-      const targets = (presetRequest.fm_targets || []).map((item) => targetKey(item.subsystem, item.fm, item.kind ?? 'normal'));
+      let targets = (presetRequest.fm_targets || []).map((item) => targetKey(item.subsystem, item.fm, item.kind ?? 'normal'));
+      // AI 只说了组件名（或者给的子系统/模块名和目录大小写不一致）时，按目录里的真实
+      // 名字再解析一次 —— 否则选择框会是空的，用户会觉得 AI 根本没选中组件。
+      if (initialPreset.componentName && catalog.length > 0) {
+        const existing = new Set(targets.map((key) => key.toLowerCase()));
+        const resolved = resolveComponentTargets(initialPreset.componentName, catalog)
+          .filter((key) => !existing.has(key.toLowerCase()));
+        if (resolved.length) targets = [...targets, ...resolved];
+      }
       if (targets.length > 0 && catalog.length === 0) return;
       setSelectedTargets(new Set(targets));
       setPresetTaskName(initialPreset.taskName);
       appliedPresetRef.current = initialPreset.token;
       return;
     }
+
+    if (initialPreset.componentName && catalog.length > 0) {
+      const resolved = resolveComponentTargets(initialPreset.componentName, catalog);
+      if (resolved.length) {
+        setSelectedTargets(new Set(resolved));
+        setPresetTaskName(initialPreset.taskName);
+        appliedPresetRef.current = initialPreset.token;
+        return;
+      }
+    }
+    if (initialPreset.componentName && catalog.length === 0) return;
 
     if (initialPreset.subsystem && initialPreset.module && catalog.length > 0) {
       setSelectedTargets(new Set([targetKey(initialPreset.subsystem, initialPreset.module, 'normal')]));
