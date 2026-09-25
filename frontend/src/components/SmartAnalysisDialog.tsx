@@ -58,16 +58,16 @@ export function SmartAnalysisDialog(props: Props) {
 
   return (
     <div className="knowledge-dialog-backdrop" onMouseDown={onClose}>
-      <section className="knowledge-analysis-dialog smart-analysis-dialog" role="dialog" aria-modal="true" aria-label="智能分析" onMouseDown={(event) => event.stopPropagation()}>
+      <section className="knowledge-analysis-dialog smart-analysis-dialog" role="dialog" aria-modal="true" aria-label="案例" onMouseDown={(event) => event.stopPropagation()}>
         <header className="knowledge-dialog-header">
           <div>
-            <h2 id="smart-analysis-title"><Wand2 size={18} /> 智能分析</h2>
+            <h2 id="smart-analysis-title"><Wand2 size={18} /> 案例</h2>
             <p>{active.hint}</p>
           </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="关闭智能分析"><X size={18} /></button>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="关闭案例窗口"><X size={18} /></button>
         </header>
 
-        <nav className="smart-analysis-tabs" role="tablist" aria-label="智能分析功能">
+        <nav className="smart-analysis-tabs" role="tablist" aria-label="案例功能">
           {TABS.map((item) => (
             <button
               key={item.id}

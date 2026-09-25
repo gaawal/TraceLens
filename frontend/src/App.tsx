@@ -1,6 +1,6 @@
 import { registerPageContextReader } from './assistant/contextRegistry';
 import { createAbnormalEvidence } from './rendering/abnormalKnowledge';
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties } from 'react';
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertTriangle,
@@ -57,6 +57,7 @@ import { LogAuditPage } from './components/LogAuditPage';
 import { ExtractedDataPage } from './components/ExtractedDataPage';
 import { DataExtractionRunDialog, type DataExtractionCandidate, type DataExtractionResultView } from './components/DataExtractionRunDialog';
 import { FlowMapView } from './components/FlowMapView';
+import { TimeTreeView } from './components/TimeTreeView';
 import { SmartAnalysisDialog } from './components/SmartAnalysisDialog';
 import type { AbnormalCase, AbnormalCaseEvidence } from './api/resourceApi';
 import { KnowledgeBasePage } from './components/KnowledgeBasePage';
@@ -1712,6 +1713,8 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   onHiddenComponentsChange,
   restoredHiddenComponents,
   filterScopeKey,
+  headerActions,
+  dragHandleProps,
 }: {
   processes: ProcessTimeline[];
   selectedProcessId?: string;
@@ -1736,6 +1739,10 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   onHiddenComponentsChange?: (hiddenComponents: Set<string>) => void;
   restoredHiddenComponents?: Set<string>;
   filterScopeKey?: string;
+  /** 渲染在标题行右侧的按钮（悬浮窗的「固定 / 关闭」）；仅悬浮窗传。 */
+  headerActions?: ReactNode;
+  /** 悬浮模式下把标题行当拖动手柄：把 pointer 事件透传给窗口拖拽逻辑。 */
+  dragHandleProps?: React.HTMLAttributes<HTMLDivElement>;
 }) {
   const [expandedComponents, setExpandedComponents] = useState<Set<string>>(new Set());
   const [hiddenTimelineComponents, setHiddenTimelineComponents] = useState<Set<string>>(new Set());
@@ -2607,10 +2614,16 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
 
   return (
     <section className={classNames('process-gantt', !expanded && 'collapsed', navigationPending && 'navigation-pending')}>
-      <button type="button" className="process-gantt-header" onClick={onToggle} aria-expanded={expanded}>
-        <span className="process-gantt-title"><Clock size={15} /><strong>模块 / 进程 / Trace 时间分布</strong><small>{visibleTimelineComponentCount}/{componentGroups.length} 个模块 · {visibleProcessCount} 个进程 · {timelineRangeLabel}</small></span>
-        {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-      </button>
+      {/* 标题行同时是悬浮窗的拖动手柄和「固定/关闭」的落点。
+          之前在它上面还有一条独立的「时间线」标题栏，只为了放两个按钮和一句说明，
+          既占高度又和这一行重复，已经去掉。 */}
+      <div className="process-gantt-header" {...(dragHandleProps || {})}>
+        <button type="button" className="process-gantt-header-toggle" onClick={onToggle} aria-expanded={expanded}>
+          <span className="process-gantt-title"><Clock size={15} /><strong>模块 / 进程 / Trace 时间分布</strong><small>{visibleTimelineComponentCount}/{componentGroups.length} 个模块 · {visibleProcessCount} 个进程 · {timelineRangeLabel}</small></span>
+          {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </button>
+        {headerActions}
+      </div>
       {expanded && (
         <div className="process-gantt-content">
           <div className="process-gantt-tools">
@@ -3176,7 +3189,6 @@ function FunctionItem({
               </span>
               {severity === 'error' && <span className="severity-badge error">ERROR 链路</span>}
               {severity === 'warning' && <span className="severity-badge warning">WARN</span>}
-              {node.incomplete && <span className="status-badge warning">缺少出口</span>}
             </span>
           </span>
           <span className="function-stats">
@@ -3618,102 +3630,6 @@ function findFunctionPath(
     if (nested) return nested;
   }
   return undefined;
-}
-
-function CallGraphNode({
-  node,
-  depth = 0,
-  onSelect,
-}: {
-  node: FunctionNode;
-  depth?: number;
-  onSelect: (node: FunctionNode) => void;
-}) {
-  const children = functionChildren(node);
-  const severity = itemSeverity(node);
-  return (
-    <div className="call-graph-node-wrap" style={{ '--graph-depth': depth } as React.CSSProperties}>
-      <button
-        type="button"
-        className={classNames('call-graph-node', `severity-${severity}`)}
-        style={componentStyle(node.component)}
-        onClick={() => { if (!hasTextSelection()) onSelect(node); }}
-      >
-        <ComponentBadge component={node.component} compact />
-        <span className="call-graph-function">{node.name}</span>
-        <span className="call-graph-source" title={node.source.raw}>{node.source.raw}</span>
-        {node.incomplete && <span className="call-graph-state warning">缺少出口</span>}
-        {!node.incomplete && severity === 'error' && <span className="call-graph-state error">错误路径</span>}
-      </button>
-      {children.length > 0 && (
-        <div className="call-graph-children">
-          {children.map((child) => (
-            <CallGraphNode
-              key={child.id}
-              node={child}
-              depth={depth + 1}
-              onSelect={onSelect}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CallGraphPanel({
-  state,
-  onSelectNode,
-}: {
-  state?: CallGraphState;
-  onSelectNode: (trace: TraceTimeline, node: FunctionNode) => void;
-}) {
-  if (!state) {
-    return (
-      <div className="call-flow-graph-empty">
-        <GitBranch size={34} />
-        <strong>选择左侧进程或调用链</strong>
-        <span>调用关系会在这里展示；点击函数节点可回到主日志定位并展开。</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="call-graph-panel">
-      <header className="call-graph-panel-header">
-        <div>
-          <h3>{state.title}</h3>
-          <p>{state.subtitle} · 点击函数节点可在主日志区定位并展开</p>
-        </div>
-      </header>
-      <div className="call-graph-panel-body">
-        <div className="call-graph-tree-pane">
-          {state.traces.map((trace) => {
-            const roots = trace.items.filter((item): item is FunctionNode => item.kind === 'function');
-            return (
-              <section className="call-graph-lane" key={trace.id}>
-                <header>
-                  <strong>{trace.firstFunctionName}</strong>
-                  <span>{isZeroTrace(trace.traceKey) ? 'LOCAL' : compactTraceId(trace.rpc.traceId)}</span>
-                  <small>{trace.components.join(' → ')} · {compactEntryRange(trace.entries)}</small>
-                </header>
-                <div className="call-graph-tree">
-                  {roots.map((node) => (
-                    <CallGraphNode
-                      key={node.id}
-                      node={node}
-                      onSelect={(selectedNode) => onSelectNode(trace, selectedNode)}
-                    />
-                  ))}
-                  {roots.length === 0 && <div className="empty-inline">该调用链没有可识别的函数入口</div>}
-                </div>
-              </section>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function EntryInspector({ entry, onClose }: { entry: LogEntry; onClose: () => void }) {
@@ -5245,7 +5161,6 @@ export default function App() {
     const firstErrorOnPage = metricEntries.slice(pageStart, pageEnd).find((entry) => entry.severity === 'error');
     return firstErrorOnPage ? navigableErrorEntries.findIndex((entry) => entry.id === firstErrorOnPage.id) : -1;
   }, [focusedErrorIndex, focusedErrorPage, logPage, logPageSize, metricEntries, navigableErrorEntries]);
-  const selectedErrorPage = selectedErrorIndex >= 0 ? logPage : undefined;
   const highlightedEntryId = selectedEntry?.id ?? focusedEntryId;
   const currentSourceCount = useMemo(
     () => new Set(metricEntries.map((entry) => entry.sourceFileId)).size,
@@ -5451,8 +5366,8 @@ export default function App() {
       if (!rowsNode) return;
       // Summed explicitly rather than by subtraction: the stretchy parts (scroll shell, canvas)
       // absorb whatever space is left over, so "window minus rows" is not a constant.
-      const chrome = box('.floating-timeline-dragbar')
-        + box('.process-gantt-header')
+      // dragbar 已经并入 gantt 标题行，不能再算进 chrome，否则窗口会高出 34px。
+      const chrome = box('.process-gantt-header')
         + paddingY('.process-gantt-content')
         + box('.process-gantt-tools')
         + paddingY('.process-gantt-canvas')
@@ -5485,7 +5400,12 @@ export default function App() {
   }, [showTimeline, timelineDocked, liveListening, ganttProcesses, selectedProcessId]);
 
   function beginTimelineWindowDrag(event: React.PointerEvent<HTMLDivElement>) {
-    if ((event.target as HTMLElement).closest('button, input, select, a')) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('input, select, a, textarea')) return;
+    // 标题行整体是拖动手柄，而折叠开关本身是个 button：它是**唯一**允许从按钮上起拖的，
+    // 否则可拖区域只剩标题行几像素的内边距。固定/关闭按钮仍然只响应点击。
+    const button = target.closest('button');
+    if (button && !button.classList.contains('process-gantt-header-toggle')) return;
     const windowElement = event.currentTarget.closest('.floating-timeline-window') as HTMLElement | null;
     const rect = windowElement?.getBoundingClientRect();
     timelineWindowDragRef.current = {
@@ -8054,6 +7974,23 @@ export default function App() {
    * 时间线内容只有一份：悬浮窗口和「固定到日志区」共用同一个节点，
    * 差别只在 expanded / onToggle —— 固定后标题栏重新变成可折叠的（对应 URL 里的 pex）。
    */
+  /** 时间线标题行右侧的「固定 / 关闭」。两种模式共用一份，只有状态文案不同。 */
+  const timelineHeaderActions = (
+    <span className="timeline-window-actions">
+      <button
+        type="button"
+        className={timelineDocked ? 'active' : ''}
+        onClick={() => setTimelineDocked((value) => !value)}
+        aria-pressed={timelineDocked}
+        aria-label={timelineDocked ? '取消固定时间线' : '固定时间线到日志区'}
+        title={timelineDocked ? '取消固定，恢复为可拖动的悬浮窗口' : '固定到日志区上方（不再悬浮，日志区让出位置）'}
+      >
+        {timelineDocked ? <PinOff size={14} /> : <Pin size={14} />}
+      </button>
+      <button type="button" className="close" onClick={() => setShowTimeline(false)} aria-label="关闭时间线" title="关闭时间线"><X size={15} /></button>
+    </span>
+  );
+
   const timelineOverviewNode = (
     <>
       {/* 实时监听色带属于时间线的信息，固定后不能被藏起来。 */}
@@ -8082,6 +8019,13 @@ export default function App() {
         onHiddenComponentsChange={setTimelineHiddenComponents}
         restoredHiddenComponents={timelineHiddenComponents}
         filterScopeKey={activeTask?.id ?? 'logs'}
+        headerActions={timelineHeaderActions}
+        dragHandleProps={timelineDocked ? undefined : {
+          onPointerDown: beginTimelineWindowDrag,
+          onPointerMove: moveTimelineWindow,
+          onPointerUp: endTimelineWindowDrag,
+          onPointerCancel: endTimelineWindowDrag,
+        }}
       />
     </>
   );
@@ -8197,7 +8141,9 @@ export default function App() {
           <div className="metric-strip-actions">
             <div className="error-navigation" aria-label="异常导航">
               <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === 0} onClick={() => jumpToAdjacentError(-1)} title="自动跳到上一条异常所在页并定位日志"><ArrowUp size={14}/> 上一异常</button>
-              <span className="error-nav-position" title={`当前筛选范围共 ${navigableErrorEntries.length} 条异常`}>{selectedErrorIndex >= 0 ? selectedErrorIndex + 1 : 0} / {navigableErrorEntries.length}{selectedErrorPage ? <small>第 {selectedErrorPage} 页</small> : null}</span>
+              {/* 只报「第几个异常」。翻页是实现细节：点上一/下一异常会自动跳到它所在的页，
+    把页码写在这里反而让人以为要先自己翻页。 */}
+              <span className="error-nav-position" title={`当前筛选范围共 ${navigableErrorEntries.length} 条异常；跳转会自动翻页`}>{selectedErrorIndex >= 0 ? selectedErrorIndex + 1 : 0} / {navigableErrorEntries.length}</span>
               <button type="button" className="button ghost metric-action-button error-nav-button" disabled={!navigableErrorEntries.length || selectedErrorIndex === navigableErrorEntries.length - 1} onClick={() => jumpToAdjacentError(1)} title="自动跳到下一条异常所在页并定位日志">下一异常 <ArrowDown size={14}/></button>
             </div>
             <button
@@ -8356,9 +8302,9 @@ export default function App() {
                   className={`button ghost compact-button toolbar-icon-button ${smartAnalysisTab ? 'active' : ''}`}
                   disabled={navigableErrorEntries.length === 0}
                   onClick={() => setSmartAnalysisTab(smartAnalysisTab ? undefined : 'analysis')}
-                  title={navigableErrorEntries.length === 0 ? '先查询日志，智能分析会用当前异常日志匹配历史案例' : '智能分析：相似案例匹配 / 案例录入'}
+                  title={navigableErrorEntries.length === 0 ? '先查询日志，这里会用当前异常日志匹配历史案例' : '案例：相似案例匹配 / 案例录入'}
                 >
-                  <Wand2 size={14} /> 智能分析
+                  <Wand2 size={14} /> 案例
                 </button>
                 <button type="button" className="button ghost compact-button toolbar-icon-button" disabled={!activeTask.entries.length} onClick={downloadVisibleLogs} title="下载日志">
                   <Download size={14} /> 下载
@@ -8459,13 +8405,6 @@ export default function App() {
           <div className={classNames('log-viewer-shell', !activeTask && 'empty-log-viewer')}>
             {showTimeline && activeTask?.status === 'ready' && !rawLogMode && timelineDocked && (
               <section className="docked-timeline-window" aria-label="时间线（已固定到日志区）">
-                <div className="docked-timeline-bar">
-                  <span><Clock size={14}/><strong>时间线</strong><small>已固定 · 在日志区上方占位排版，不遮挡日志</small></span>
-                  <div className="docked-timeline-bar-actions">
-                    <button type="button" className="active" onClick={() => setTimelineDocked(false)} aria-pressed={true} title="取消固定，恢复为可拖动的悬浮窗口" aria-label="取消固定时间线"><PinOff size={14}/></button>
-                    <button type="button" onClick={() => setShowTimeline(false)} title="关闭时间线" aria-label="关闭时间线"><X size={15}/></button>
-                  </div>
-                </div>
                 <div className="docked-timeline-body">{timelineOverviewNode}</div>
               </section>
             )}
@@ -8556,19 +8495,6 @@ export default function App() {
             } as CSSProperties}
             aria-label="悬浮时间线"
           >
-            <div
-              className="floating-timeline-dragbar"
-              onPointerDown={beginTimelineWindowDrag}
-              onPointerMove={moveTimelineWindow}
-              onPointerUp={endTimelineWindowDrag}
-              onPointerCancel={endTimelineWindowDrag}
-            >
-              <span><Clock size={14}/><strong>时间线</strong><small>拖动窗口 · 日志区独立滚动</small></span>
-              <div className="floating-timeline-dragbar-actions">
-                <button type="button" className={timelineDocked ? 'active' : ''} onClick={() => setTimelineDocked(!timelineDocked)} aria-pressed={timelineDocked} aria-label="固定时间线到日志区" title="固定到日志区上方（不再悬浮，日志区让出位置）"><Pin size={14}/></button>
-                <button type="button" className="close" onClick={() => setShowTimeline(false)} aria-label="关闭时间线" title="关闭时间线"><X size={15}/></button>
-              </div>
-            </div>
             <div className="floating-timeline-body">{timelineOverviewNode}</div>
           </section>
         )}
@@ -8694,7 +8620,7 @@ export default function App() {
 
         {callFlowDialogOpen && createPortal(
           <div className="call-flow-dialog-backdrop" role="presentation" onMouseDown={() => setCallFlowDialogOpen(false)}>
-            <section className={`call-flow-dialog ${callFlowView === 'flowmap' ? 'is-flow-map' : ''}`} role="dialog" aria-modal="true" aria-labelledby="call-flow-dialog-title" onMouseDown={(event: React.MouseEvent<HTMLElement>) => event.stopPropagation()}>
+            <section className="call-flow-dialog is-flow-map" role="dialog" aria-modal="true" aria-labelledby="call-flow-dialog-title" onMouseDown={(event: React.MouseEvent<HTMLElement>) => event.stopPropagation()}>
               <header className="call-flow-dialog-header">
                 <div>
                   <h2 id="call-flow-dialog-title"><GitBranch size={17} /> 调用导航</h2>
@@ -8879,7 +8805,7 @@ export default function App() {
                     <button type="button" role="tab" aria-selected={callFlowView === 'flowmap'} className={callFlowView === 'flowmap' ? 'active' : ''} onClick={() => setCallFlowView('flowmap')} title="按标签和异常着色的横向流程地图，可缩放">
                       <Share2 size={13} /> 流程地图
                     </button>
-                    <button type="button" role="tab" aria-selected={callFlowView === 'tree'} className={callFlowView === 'tree' ? 'active' : ''} onClick={() => setCallFlowView('tree')} title="缩进树，逐层核对调用">
+                    <button type="button" role="tab" aria-selected={callFlowView === 'tree'} className={callFlowView === 'tree' ? 'active' : ''} onClick={() => setCallFlowView('tree')} title="时间轴缩进树：按时间铺开，保留嵌套层级">
                       <ListTree size={13} /> 缩进树
                     </button>
                   </div>
@@ -8892,7 +8818,7 @@ export default function App() {
                         onSelectEntry={(entry) => setSelectedEntry(entry)}
                         renderLogRow={(entry) => <LogRow entry={entry} selected={false} onSelect={setSelectedEntry} />}
                       />
-                    : <CallGraphPanel state={callGraphState} onSelectNode={focusFunctionFromGraph} />}
+                    : <TimeTreeView traces={callGraphState?.traces ?? []} rules={displayRules} onSelectNode={focusFunctionFromGraph} />}
                 </section>
               </div>
             </section>
