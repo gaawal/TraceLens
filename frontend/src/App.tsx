@@ -1,4 +1,5 @@
 import { registerPageContextReader } from './assistant/contextRegistry';
+import { buildLogEvidence } from './assistant/logEvidence';
 import { componentHue, componentStyle } from './rendering/componentColor';
 import { createAbnormalEvidence } from './rendering/abnormalKnowledge';
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties, type ReactNode } from 'react';
@@ -5080,6 +5081,12 @@ export default function App() {
               };
             }),
           displayed_entries: paginatedEntries.slice(0, 80).map((entry) => ({ id: entry.id, line_number: entry.lineNumber, source_file: entry.sourceFile, timestamp: entry.timestamp, trace_id: entry.rpc.traceId, component: entry.component })),
+          // 给 AI 的日志证据：每个异常行各自向外扩 100 行，重叠区间合并，再做确定性压缩。
+          // 只看当前页那十几条异常行解释不了根因 —— 状态变化在异常前后几十行里；
+          // 而扩完的原文上千行，所以必须压缩（字典 + 模板归并）。
+          // 用**时间序**而不是显示序：上下 100 行的语义是「时间上的前后」，
+          // 降序展示时显示序的「上」其实是时间上的「后」。
+          log_evidence: buildLogEvidence([...scopedFilteredEntries].sort(compareEntries)),
           folding_enabled: foldingEnabled,
           function_fold_summary: assistantFunctionFoldSummary,
           function_fold_summary_source: 'parsed-function-tree-boundaries',
