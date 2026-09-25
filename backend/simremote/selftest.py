@@ -32,6 +32,16 @@ EXIT_MARKER_REGEX = re.compile(r"<\s*\(\s*\)")
 #: 这类时间戳方括号不会被误认成函数名。
 BOUNDARY_NAME_REGEX = re.compile(r"\[([A-Za-z_~][\w:<>~.\-]*)]")
 
+#: 实时 tail 的等待窗口（秒）。
+#:
+#: 远端 ``tail -F`` 的 stdout 是**管道**不是 tty，stdio 走全缓冲，要攒满几 KB 才
+#: flush 一次；剧本是 5 条流交错、总体 1s 一行，单条流约 3s 才走一行，所以订阅后
+#: 头一行往往要等一分钟上下才冒出来。窗口开短了就会隔几次假失败一次 ——
+#: 真实机台也是这个行为，不是模拟器卡住了。
+LIVE_TAIL_WINDOW_SECONDS = 100
+#: 日志源没在跑时的探针模式窗口（自己写一行探针，不用等积攒）
+LIVE_TAIL_PROBE_WINDOW_SECONDS = 6
+
 
 def _record(name: str, ok: bool, detail: str = "") -> bool:
     _RESULTS.append((name, bool(ok), detail))
@@ -291,9 +301,18 @@ def check_line_formats() -> None:
         "debug": BUILTIN_RULE_DEFAULTS[("debug", "标准调试日志")],
         "run": BUILTIN_RULE_DEFAULTS[("run", "运行事件日志")],
     }
-    for category, relative in (("debug", "spwsp/spwsp.log"), ("run", "event.log")):
+    # 逐条查：wsp 是新组件、正文里还带 ``{ … }`` 花括号（转义写错会把整行打歪），
+    # 所以它不能只靠"和 spwsp 同格式"推断，得自己过一遍内置正则。
+    for category, relative in (
+        ("debug", "spwsp/spwsp.log"),
+        ("debug", "wsp/wsp.log"),
+        ("run", "event.log"),
+    ):
         root = fleet.UPPER.debug_root if category == "debug" else fleet.UPPER.run_root
         local = fleet.remote_to_local(fleet.UPPER, f"{root}/{relative}")
+        if not local.exists():
+            _record(f"{category} 日志行匹配内置正则 · {relative}", False, "文件不存在")
+            continue
         pattern = _compile(rules[category]["pattern"])
         matched = 0
         total = 0
@@ -304,7 +323,11 @@ def check_line_formats() -> None:
                 total += 1
                 if pattern.match(line.rstrip("\n")):
                     matched += 1
-        _record(f"{category} 日志行匹配内置正则", total > 0 and matched == total, f"{matched}/{total}")
+        _record(
+            f"{category} 日志行匹配内置正则 · {relative}",
+            total > 0 and matched == total,
+            f"{matched}/{total}",
+        )
 
     executor_root = fleet.UPPER.elog_root
     executor_files = sorted(
@@ -367,20 +390,24 @@ def _stream_running() -> bool:
 def check_live_tail() -> None:
     """实时监听：订阅点之后新产出的行应经 SSH ``tail -F`` 通道推过来。
 
+    对**每一条会被用户单独订阅的流**（``livesim.OBSERVER_KEYS``）各开一条保活
+    tail，但**共用同一个等待窗口** —— 所以总耗时和只探一条差不多。多探这几条的
+    意义在于："这条流能不能实时看到"是用户会亲手去点的事，光看剧本在刷不算数；
+    新增一条让人专门去看的流时，把它加进 OBSERVER_KEYS 就会自动被这里覆盖。
+
     实时日志源在跑时直接用它产出的行验证，既不写探针也不回滚 —— 并发写入下把
     文件截断回原长度，会把日志源这期间写的行一起削掉，还会让远端 tail 以为文件
     被截断而重读。日志源没跑时才退回"自己写一行探针、事后回滚"的老办法。
     """
     from . import livesim
 
-    probe = livesim.TARGETS[0]
-    target = probe.local_path
+    probes = [livesim._TARGET_BY_KEY[key] for key in livesim.OBSERVER_KEYS]
     running = _stream_running()
-    original_size = target.stat().st_size
     marker = f"selftest probe {time.time():.3f}"
+    sizes = {probe.key: probe.local_path.stat().st_size for probe in probes}
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    channel = None
+    opened: list[tuple[livesim.StreamTarget, paramiko.Channel]] = []
     try:
         client.connect(
             fleet.UPPER.host, port=fleet.UPPER.ssh_port, username=fleet.SIM_USERNAME,
@@ -388,42 +415,59 @@ def check_live_tail() -> None:
         )
         transport = client.get_transport()
         assert transport is not None
-        channel = transport.open_session()
-        channel.exec_command(f"LC_ALL=C exec tail -n 0 -F -- {probe.remote_path}")
+        for probe in probes:
+            channel = transport.open_session()
+            channel.exec_command(f"LC_ALL=C exec tail -n 0 -F -- {probe.remote_path}")
+            opened.append((probe, channel))
         time.sleep(0.6)
         if not running:
-            line = (
-                f"[{datetime.now():%Y-%m-%d %H:%M:%S}.000] [INFO] [SPWSP] [1] [2] [spwsp] "
-                f"[normal] [spwsp:selftest:1] {marker}\n"
-            )
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.flush()
+            for probe, _channel in opened:
+                line = (
+                    f"[{datetime.now():%Y-%m-%d %H:%M:%S}.000] [INFO] [{probe.subsystem.upper()}] "
+                    f"[1] [2] [{probe.module}] [normal] [{probe.module}:selftest:1] {marker}\n"
+                )
+                with probe.local_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                    handle.flush()
 
-        received = b""
-        # 窗口要按**产出速率**算，不能按 tail 的响应速度算：远端 ``tail -F`` 的 stdout
-        # 是管道而不是 tty，stdio 走全缓冲，一行约 150B，要攒满 ~4KB（≈27 行）才会
-        # flush 一次。日志源 0.5s/行时第一行要等 ~14s 才冒出来，窗口开太短会隔几次
-        # 就假失败一次 —— 真实机台也是这个行为，不是模拟器的问题。
-        # 现在默认 1s/行（间隔翻倍），窗口跟着翻倍，否则又回到隔几次假失败的老毛病。
-        deadline = time.time() + (60 if running else 5)
-        while time.time() < deadline:
-            if channel.recv_ready():
-                received += channel.recv(65536)
-                if not running and marker.encode() in received:
-                    break
-                if running and received.count(b"\n") >= 1:
-                    break
+        received: dict[str, bytes] = {probe.key: b"" for probe, _c in opened}
+        pending = {probe.key for probe, _c in opened}
+        window = LIVE_TAIL_WINDOW_SECONDS if running else LIVE_TAIL_PROBE_WINDOW_SECONDS
+        deadline = time.time() + window
+        while time.time() < deadline and pending:
+            for probe, channel in opened:
+                if probe.key not in pending or not channel.recv_ready():
+                    continue
+                received[probe.key] += channel.recv(65536)
+                blob = received[probe.key]
+                done = (
+                    blob.count(b"\n") >= 1 if running else marker.encode() in blob
+                )
+                if done:
+                    pending.discard(probe.key)
             time.sleep(0.1)
-        if running:
-            forwarded = [item for item in received.decode("utf-8", "replace").splitlines() if item.strip()]
-            _record("实时 tail 转发新增行", bool(forwarded), f"由实时日志源产出 {len(forwarded)} 行")
-        else:
-            _record("实时 tail 转发新增行", marker.encode() in received, f"探针模式，收到 {len(received)} 字节")
+
+        for probe, _channel in opened:
+            blob = received[probe.key]
+            if running:
+                rows = [item for item in blob.decode("utf-8", "replace").splitlines() if item.strip()]
+                _record(
+                    f"实时 tail 转发新增行 · {probe.module}",
+                    bool(rows),
+                    f"由实时日志源产出 {len(rows)} 行"
+                    if rows
+                    else f"{window}s 内没有新行（远端 tail 缓冲未 flush？）",
+                )
+            else:
+                _record(
+                    f"实时 tail 转发新增行 · {probe.module}",
+                    marker.encode() in blob,
+                    f"探针模式，收到 {len(blob)} 字节",
+                )
     except Exception as exc:  # noqa: BLE001
         _record("实时 tail 转发新增行", False, str(exc))
     finally:
-        if channel is not None:
+        for _probe, channel in opened:
             try:
                 channel.close()
             except Exception:  # noqa: BLE001
@@ -431,8 +475,9 @@ def check_live_tail() -> None:
         client.close()
         if not running:
             # 只有探针模式才回滚：这时没人并发写，截断是安全的
-            with target.open("r+b") as handle:
-                handle.truncate(original_size)
+            for probe, _channel in opened:
+                with probe.local_path.open("r+b") as handle:
+                    handle.truncate(sizes[probe.key])
 
 
 def check_live_stream() -> None:
@@ -482,7 +527,7 @@ def check_live_stream() -> None:
     _record("实时日志源行格式合规", bool(pool) and not bad, f"{len(pool)} 行，不合规 {len(bad)}")
 
     # 采样窗口：**整段**活动文件（上限 1000 行，本来就装得下一轮）+ 整段归档。
-    # 不能只取尾部几十行：一轮剧本会在 4 条流上各写十几行，窗口太小会恰好卡在
+    # 不能只取尾部几十行：一轮剧本会在 5 条流上各写十几行，窗口太小会恰好卡在
     # 两轮之间，"同一 trace 横跨几条流"这种跨轮判断就取不到完整样本；
     # 某个流刚轮转时活动段可能只有几行，靠归档段把这一轮剧本补齐。
     samples: dict[str, str] = {}
@@ -507,7 +552,10 @@ def check_live_stream() -> None:
         codes = sorted(set(re.findall(r"code=(ERR_[A-Z_]+)", joined)))
         causes = sorted(set(re.findall(r"cause=(ERR_[A-Z_]+)", joined)))
         levels = sorted({m.group("level") for line in sample_lines if (m := pattern.match(line))})
-        normal = sum(1 for line in sample_lines if "position error within tolerance" in line)
+        normal = sum(
+            1 for line in sample_lines
+            if any(marker in line for marker in livesim.NORMAL_BEAT_MARKERS)
+        )
         _record("实时日志源含正常节拍日志", normal > 0, f"{normal} 行 · 级别 {levels}")
         _record("实时日志源含 ≥3 类异常", len(codes) >= 3, "、".join(codes) or "未找到 code=ERR_*")
 
@@ -528,19 +576,28 @@ def check_live_stream() -> None:
             " → ".join(causes) or "未找到 cause=",
         )
 
-        # 4b) 单模块可验证：前端「实时监听」一次只盯一个模块，所以被观察的 spwsp
-        #     流自己就得凑齐「≥3 类异常 + 1 类正常节拍」，否则订阅单模块时凑不齐。
-        observer_lines = [line for line in samples.get("spwsp", "").splitlines() if line.strip()]
-        observer_codes = sorted(set(re.findall(r"code=(ERR_[A-Z_]+)", samples.get("spwsp", ""))))
-        observer_levels = sorted({
-            m.group("level") for line in observer_lines if (m := pattern.match(line))
-        })
-        observer_normal = sum(1 for line in observer_lines if "position error within tolerance" in line)
-        _record(
-            "实时日志源单模块含 ≥3 类异常 + 正常节拍",
-            len(observer_codes) >= 3 and observer_normal > 0,
-            f"spwsp 异常 {len(observer_codes)} 类 [{'、'.join(observer_codes)}] · 级别 {observer_levels} · 正常 {observer_normal} 行",
-        )
+        # 4b) 单模块可验证：前端「实时监听」一次只盯一个模块，所以**会被单独订阅的
+        #     流**（livesim.OBSERVER_KEYS：扫片观察位 spwsp、工件台点位 wsp）自己就得
+        #     凑齐「≥3 类异常 + 1 类正常节拍」，否则订阅单模块时凑不齐，
+        #     实时监听的过滤/告警效果也就没法验。
+        for observer_key in livesim.OBSERVER_KEYS:
+            spec = livesim._TARGET_BY_KEY[observer_key]
+            observer_text = samples.get(observer_key, "")
+            observer_lines = [line for line in observer_text.splitlines() if line.strip()]
+            observer_codes = sorted(set(re.findall(r"code=(ERR_[A-Z_]+)", observer_text)))
+            observer_levels = sorted({
+                m.group("level") for line in observer_lines if (m := pattern.match(line))
+            })
+            observer_normal = sum(
+                1 for line in observer_lines
+                if any(marker in line for marker in livesim.NORMAL_BEAT_MARKERS)
+            )
+            _record(
+                f"实时日志源单模块 {spec.module} 含 ≥3 类异常 + 正常节拍",
+                len(observer_codes) >= 3 and observer_normal > 0,
+                f"{spec.module} 异常 {len(observer_codes)} 类 [{'、'.join(observer_codes)}] · "
+                f"级别 {observer_levels} · 正常 {observer_normal} 行",
+            )
 
         # 4c) 日志内容规则：正文必须带 [函数名] >() / <() 调用链边界，
         #     前端折叠函数卡片认的就是这对方向符。
@@ -643,7 +700,7 @@ def check_live_rotation_cycle() -> None:
 
 def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器即可
     """校验一串 (函数, 相位, 正文) 是合法的调用栈轨迹，并回报结果。"""
-    from .loggen import PHASE_BODY, PHASE_ENTER, PHASE_LEAVE, keyword_of, log_message
+    from .loggen import PHASE_BODY, PHASE_ENTER, PHASE_LEAVE, body_text, keyword_of, log_message
 
     stack: list[str] = []
     problems: list[str] = []
@@ -658,7 +715,7 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
     for item in steps:
         function, phase, body = item[0], item[1], item[2]
         level = item[3] if len(item) > 3 else "INFO"
-        rendered = log_message(function, phase, body)
+        rendered = log_message(function, phase, body_text(body))
         keyword = keyword_of(function)
         if phase == PHASE_ENTER:
             match = ENTRY_MARKER_REGEX.search(rendered)
@@ -765,20 +822,28 @@ def check_log_call_chain() -> None:
     ``builtin-explicit-boundary``，关键字就是 ``> ()`` / ``< ()``）。名字不一致
     或嵌套顺序写反，前端就会画出错乱嵌套、把父函数标成「未闭合」。
 
-    这里直接校验两份剧本本身（批量 ``loggen._DEBUG_PROGRAM``、实时
-    ``livesim._SCRIPT`` 的每条流），不用等日志落盘，也不用等 1000 行轮转。
+    这里直接校验三份剧本本身（通用批量 ``loggen._DEBUG_PROGRAM``、各子系统专属
+    批量程序、实时 ``livesim._SCRIPT`` 的每条流），不用等日志落盘，也不用等
+    1000 行轮转。
     """
     from . import livesim, loggen
 
-    _validate_call_chain(
-        "批量日志",
-        [(fn, phase, body, level) for fn, phase, level, body in loggen._DEBUG_PROGRAM],
-    )
+    for label, program in loggen.ALL_PROGRAMS:
+        _validate_call_chain(
+            label,
+            [(fn, phase, body, level) for fn, phase, level, body in program],
+        )
     _validate_stage_frames(
         "批量日志",
         [(fn, phase) for fn, phase, _level, _body in loggen._DEBUG_PROGRAM],
         loggen.DEBUG_STAGE_CODES,
     )
+    for subsystem, program in loggen.SUBSYSTEM_PROGRAMS.items():
+        _validate_stage_frames(
+            f"批量日志 {subsystem}",
+            [(fn, phase) for fn, phase, _level, _body in program],
+            loggen.WSP_STAGE_CODES if subsystem == "wsp" else loggen.DEBUG_STAGE_CODES,
+        )
     for target in livesim.TARGETS:
         steps = [
             (function, phase, body, level)
@@ -794,11 +859,13 @@ def check_log_call_chain() -> None:
 
     # 关键字模板必须**全覆盖**：任何边界行函数没登记在 PHASE_KEYWORDS 里，就会
     # 退回函数名当关键字，用户看到的就不是「wafer scan start」而是「ScanWafer start」。
-    from .loggen import PHASE_BODY, log_message
+    # 各子系统专属程序也要一起过 —— 漏一个就会让 wsp 这种新组件的边界行退回函数名。
+    from .loggen import PHASE_BODY, body_text, log_message
 
     boundary_functions = {
         function
-        for function, phase, _level, _body in loggen._DEBUG_PROGRAM
+        for _label, program in loggen.ALL_PROGRAMS
+        for function, phase, _level, _body in program
         if phase != PHASE_BODY
     } | {
         function
@@ -816,21 +883,28 @@ def check_log_call_chain() -> None:
     # 日志正文必须**全英文**：真实机台的调试日志/执行器日志/运行事件日志都是英文，
     # 模拟器里混中文会一眼看穿是假数据。这条把"渲染出来的每一行"都过一遍，
     # 新增剧本时写错语言（或关键字表被改回中文）会立刻失败。
+    #
+    # 注意走 ``body_text``：移动点位正文里带 ``{ … }`` 花括号，模板里存的是转义过的
+    # ``{{ … }}``，直接看会看到 ``{{ x:0.003 }}``。校验要按**最终写进日志的样子**判。
     cjk_pattern = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
     offenders: list[str] = []
-    for function, phase, _level, body in loggen._DEBUG_PROGRAM:
-        rendered = log_message(function, phase, body)
-        if cjk_pattern.search(rendered):
-            offenders.append(f"批量/{function}")
+    rendered_total = 0
+    for label, program in loggen.ALL_PROGRAMS:
+        for function, phase, _level, body in program:
+            rendered = log_message(function, phase, body_text(body))
+            rendered_total += 1
+            if cjk_pattern.search(rendered):
+                offenders.append(f"{label}/{function}")
     for _key, _level, function, phase, body in livesim._SCRIPT:
-        rendered = log_message(function, phase, body)
+        rendered = log_message(function, phase, body_text(body))
+        rendered_total += 1
         if cjk_pattern.search(rendered):
             offenders.append(f"实时/{function}")
     _record(
         "日志正文全英文",
         not offenders,
         f"含中文的行 {sorted(set(offenders))}" if offenders
-        else f"{len(loggen._DEBUG_PROGRAM) + len(livesim._SCRIPT)} 行正文无中日韩字符",
+        else f"{rendered_total} 行正文无中日韩字符",
     )
 
     # 落盘抽查：活动文件里真的能看到方向符（剧本对不代表写出来的对）
@@ -847,6 +921,112 @@ def check_log_call_chain() -> None:
         "日志正文含调用链边界",
         entries > 0 and exits > 0 and named == len(lines),
         f"最近 {len(lines)} 行：入口 {entries} / 出口 {exits} / 带函数名 {named}",
+    )
+
+
+def check_wsp_move_points() -> None:
+    """``wsp``（工件台点位）组件：日志正文必须是固定格式的绝对移动点位。
+
+    形如::
+
+        move absolute { x:0.003, y:0.999, z:0.000, rz:0.0021, speed:120.0, mode:absolute, point:load_position, status:settled }
+
+    字段顺序、数值精度、点位名都固定（点位表在 ``loggen.WSP_MOVE_POINTS``），
+    这样才能当检索锚点用 —— 用户按 ``x:`` / ``point:load_position`` 就能捞出来。
+
+    三路都查，缺一路就可能"剧本对了但落盘不对"：
+
+    * **剧本层**：批量程序与实时剧本里每条点位正文要合格式，且 8 个点位一个不少；
+    * **落盘层**：真打开 ``wsp/wsp.log`` 与最新归档逐行扫 —— 花括号转义写错
+      （``{{`` 少写一个）在剧本层是看不出来的，只有落盘才会暴露成 ``KeyError``
+      或写出一行带双花括号的假日志；
+    * **挂载层**：``wsp`` 要真的登记成子系统、真的有一条实时流、真的有自己的
+      内容程序 —— 否则"加了组件但前端看不到"。
+    """
+    from . import livesim, loggen
+
+    pattern = re.compile(loggen.MOVE_POINT_PATTERN)
+
+    # 1) 剧本层：所有带 "move absolute" 的正文都必须合格式，且点位全覆盖
+    template_bad: list[str] = []
+    covered_points: set[str] = set()
+    point_templates = 0
+    for label, program in loggen.ALL_PROGRAMS:
+        for function, _phase, _level, body in program:
+            if "move absolute" not in body:
+                continue
+            point_templates += 1
+            text = loggen.body_text(body)
+            if not pattern.fullmatch(text):
+                template_bad.append(f"{label}/{function}: {text}")
+                continue
+            covered_points.add(text.split("point:", 1)[1].split(",", 1)[0])
+    for _key, _level, function, _phase, body in livesim._SCRIPT:
+        if "move absolute" not in body:
+            continue
+        point_templates += 1
+        text = loggen.body_text(body)
+        if not pattern.fullmatch(text):
+            template_bad.append(f"实时/{function}: {text}")
+            continue
+        covered_points.add(text.split("point:", 1)[1].split(",", 1)[0])
+
+    expected_points = {row[0] for row in loggen.WSP_MOVE_POINTS}
+    missing_points = sorted(expected_points - covered_points)
+    _record(
+        "wsp 点位正文格式（剧本层）",
+        point_templates > 0 and not template_bad and not missing_points,
+        f"不合格式 {'；'.join(template_bad[:2])}" if template_bad
+        else f"缺点位 {missing_points}" if missing_points
+        else f"{point_templates} 条点位行 · {len(covered_points)}/{len(expected_points)} 个点位全覆盖",
+    )
+
+    # 2) 落盘层：活动文件 + 最新归档（历史批量段与实时追加段都在这两个文件里）
+    target = livesim._TARGET_BY_KEY["wsp"]
+    state = livesim.load_state()
+    paths = [target.local_path]
+    slot = state.target("wsp")
+    if slot.archived and Path(slot.archived).exists():
+        paths.append(Path(slot.archived))
+    scanned = 0
+    landed: list[str] = []
+    malformed: list[str] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        scanned += 1
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            marker = "move absolute"
+            if marker not in line:
+                continue
+            landed.append(line)
+            tail = line[line.index(marker):]
+            if not pattern.fullmatch(tail):
+                malformed.append(tail[:90])
+    _record(
+        "wsp 点位正文格式（落盘层）",
+        bool(landed) and not malformed,
+        f"不合格式（含未转义花括号？）{malformed[:2]}" if malformed
+        else f"{len(landed)} 条点位行，扫过 {scanned} 个文件（当前段 + 最新归档）"
+        if landed
+        else f"{target.remote_path} 里没有点位行（先跑 scripts/sim.sh init）",
+    )
+
+    # 3) 挂载层：子系统 / 实时流 / 专属程序都得在
+    anchored = (
+        "wsp" in fleet.SUBSYSTEM_MODULES
+        and ("wsp", "wsp") in fleet.all_modules()
+        and "wsp" in livesim._TARGET_BY_KEY
+        and loggen.program_for("wsp") is not loggen._DEBUG_PROGRAM
+    )
+    _record(
+        "wsp 组件已挂载（子系统 / 实时流 / 专属程序）",
+        anchored,
+        "、".join([
+            f"子系统 {'在' if 'wsp' in fleet.SUBSYSTEM_MODULES else '缺'}",
+            f"实时流 {'在' if 'wsp' in livesim._TARGET_BY_KEY else '缺'}",
+            f"专属程序 {'在' if loggen.program_for('wsp') is not loggen._DEBUG_PROGRAM else '缺（仍在用通用扫片程序）'}",
+        ]),
     )
 
 
@@ -1419,16 +1599,26 @@ def run_all() -> int:
         _record("自动化部署检查", False, f"{type(exc).__name__}: {exc}")
 
     if _bootstrap_django():
-        check_line_formats()
-        check_backend_catalog()
-        check_cpd_assets()
-        check_cpd_backend_read()
-        check_atlog_report_site()
-        check_cpd_report_site()
-        check_report_file_analysis()
-        check_live_stream()
-        check_live_rotation_cycle()
-        check_log_call_chain()
+        # 逐条包住：任何一条检查抛异常（改代码改出来的 NameError / KeyError 之类）
+        # 以前会直接把整个自检打断，后面一百多条一条都不打印 —— 排查时只看到一个
+        # 栈，完全不知道其余部分是好是坏。现在记一条 FAIL 然后继续跑。
+        for check in (
+            check_line_formats,
+            check_backend_catalog,
+            check_cpd_assets,
+            check_cpd_backend_read,
+            check_atlog_report_site,
+            check_cpd_report_site,
+            check_report_file_analysis,
+            check_live_stream,
+            check_live_rotation_cycle,
+            check_log_call_chain,
+            check_wsp_move_points,
+        ):
+            try:
+                check()
+            except Exception as exc:  # noqa: BLE001
+                _record(f"{check.__name__} 执行失败", False, f"{type(exc).__name__}: {exc}")
 
     passed = sum(1 for _, ok, _detail in _RESULTS if ok)
     print("=" * 64)

@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp, Download, ExternalLink, LoaderCircle, Play, Sli
 import { API_BASE, buildApiHeaders } from '../api/resourceApi';
 import { loadDataExtractionRules, extractDataValues, type DataExtractionRule } from '../rendering/dataExtractionRules';
 import { executeUiAction } from '../assistant/workstation';
-import { subscribeLiveMonitoring } from '../services/liveMonitoring';
+import { subscribeLiveCaptureCount, subscribeLiveMonitoring } from '../services/liveMonitoring';
 import { primeSeq, subscribeWatchHits, subscribeWatchStatus, type WatchHitEvent } from '../services/watchRealtime';
 
 /** At most three collectors run at once so the panel (and the extraction work) stays legible. */
@@ -58,19 +58,34 @@ export function CapturePanel() {
   const [allRules, setAllRules] = useState<DataExtractionRule[]>([]);
   const [busy, setBusy] = useState('');
   const [actionError, setActionError] = useState('');
-  const lastCaptureTokenRef = useRef(0);
 
   useEffect(() => subscribeLiveMonitoring((next) => {
     setEnvironmentId(typeof next.environmentId === 'number' ? next.environmentId : undefined);
     // 停止监听后面板仍可保留（用来回看刚采到的数据），只把阶段切回准备态。
     setPhase(next.on ? 'running' : 'prep');
-    if (next.on) setOpen(true);
-    const request = next.captureRequest;
-    if (request && request.token !== lastCaptureTokenRef.current) {
-      lastCaptureTokenRef.current = request.token;
+  }), []);
+
+  /**
+   * 面板的显示完全由**实时采集清单**决定：
+   * 清单里有提取器就浮出来，一个都没有就不显示。
+   *
+   * 之前工具栏上有个「采集」按钮来开它，于是空清单也能开出一个空盒子，
+   * 而清单里真有东西时又得记得去点那个按钮。现在只有一个真相：
+   * 在「数据采集」里勾了「加入实时采集」，进度框就出现；取消勾选，它就消失。
+   */
+  const previousCountRef = useRef(0);
+  useEffect(() => subscribeLiveCaptureCount((count) => {
+    const increased = count > previousCountRef.current;
+    previousCountRef.current = count;
+    if (count <= 0) {
+      setOpen(false);
+      return;
+    }
+    // 只有「新加了采集项」才重新浮出来。手动关掉后计数没变，订阅不会再回调，
+    // 面板自然保持关闭 —— 不需要额外的 dismissed 状态。
+    if (increased) {
       setOpen(true);
       setCollapsed(false);
-      if (request.prep) setPhase('prep');
     }
   }), []);
 
@@ -278,7 +293,7 @@ export function CapturePanel() {
         <button type="button" onClick={() => setCollapsed((value) => !value)} title={collapsed ? '展开' : '收起'}>
           {collapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
         </button>
-        <button type="button" onClick={() => setOpen(false)} title="关闭（不停止监控）"><X size={14} /></button>
+        <button type="button" onClick={() => setOpen(false)} title="关闭面板（不停止采集；再加采集项时会重新浮出）"><X size={14} /></button>
       </header>
 
       {!collapsed && (

@@ -510,7 +510,7 @@ EOF
       "${upper%%:*}"
   fi
 
-  "$PY" - "$RUN_DIR/seed.out" <<'PY'
+  "$PY" - "$RUN_DIR/seed.out" "$BACKEND_DIR" <<'PY'
 import re, sys
 try:
     text = open(sys.argv[1], encoding="utf-8").read()
@@ -520,12 +520,28 @@ else:
     match = re.search(r"环境\s*:\s*(\S+)", text)
     print(f" 环境名：{match.group(1) if match else 'SIM-EUV-01'}")
 
-print("""
+# 流清单**从代码里取**，不写死在提示语里 —— 加一条流时这里自动跟着变，
+# 否则提示会让用户去订阅一个已经不存在的模块（或漏掉新模块）。
+sys.path.insert(0, sys.argv[2])
+try:
+    from simremote import livesim
+
+    keys = " / ".join(item.module for item in livesim.TARGETS)
+    count = len(livesim.TARGETS)
+    share = f"{count:g}"
+except Exception:  # noqa: BLE001 - 提示语而已，取不到就用兜底文案
+    keys, count, share = "spwsp / wsp / mecore / cpfr / sil", 5, "5"
+
+print(f"""
  怎么找日志：
    前端 → 环境资源 → 远程日志查询，时间窗口选「最近 3 小时」即可命中
-   实时日志：选 spwsp / mecore / cpfr / sil 任一模块后打开「实时监听」，
-             日志会一行行滚出来（总体 1s 一行；4 条流轮转，单条流约 4s 一行，
+   实时日志：选 {keys} 任一模块后打开「实时监听」，
+             日志会一行行滚出来（总体 1s 一行；{count} 条流轮转，单条流约 {share}s 一行，
              约 17 分钟写满 1000 行后自动轮转）
+             注意头一行要等约 1 分钟才出现：远端 tail -F 的 stdout 是管道（全缓冲），
+             要攒满几 KB 才 flush 一次。真实机台同样如此，不是模拟器卡住了。
+   点位日志：wsp 是工件台点位组件，日志正文是固定的
+             move absolute {{ x:…, y:… }} 点位行
    CPD 测校：环境资源 → CPD 测校报告，选子系统 / 模块
    用例分析：ATLog 用例分析页粘贴下面的用例 URL""")
 PY

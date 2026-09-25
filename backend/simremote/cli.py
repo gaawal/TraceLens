@@ -468,8 +468,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=livesim.DEFAULT_INTERVAL_SECONDS,
         help=(
             f"每行间隔秒数（默认 {livesim.DEFAULT_INTERVAL_SECONDS:g}）。"
-            "剧本是 4 条流交错，每 tick 只落一行，所以单条流约 4 倍间隔走一行；"
-            "要单条流 1 秒一行就给 0.25"
+            f"剧本是 {len(livesim.TARGETS)} 条流交错，每 tick 只落一行，"
+            f"所以单条流约 {len(livesim.TARGETS)} 倍间隔走一行；"
+            f"要单条流 1 秒一行就给 {1 / len(livesim.TARGETS):g}"
         ),
     )
     stream_parser.add_argument("--lines", type=int, default=None, help="产够 N 行后退出（默认一直跑）")

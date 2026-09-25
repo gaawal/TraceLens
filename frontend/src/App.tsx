@@ -66,7 +66,7 @@ import { ToolCenterPage } from './components/ToolCenterPage';
 import { createTracePilotActionRegistry } from './assistant/actionRegistry';
 import { afterPaint, type UiReceipt } from './assistant/workstation';
 import { saveTracePilotAgentContext } from './assistant/agentContext';
-import { requestCapturePanel, setLiveMonitoring } from './services/liveMonitoring';
+import { publishLiveCaptureCount, setLiveMonitoring } from './services/liveMonitoring';
 import { EventRestoreDialog } from './components/EventRestoreDialog';
 import { AtLogAnalysisPage } from './components/AtLogAnalysisPage';
 import { APP_VERSION } from './appConfig';
@@ -6495,6 +6495,11 @@ export default function App() {
     [dataExtractionRules],
   );
 
+  /** 把实时采集清单的长度广播给采集进度框：它是那个面板显示与否的唯一依据。 */
+  useEffect(() => {
+    publishLiveCaptureCount(liveCaptureRuleIds.size);
+  }, [liveCaptureRuleIds]);
+
   /**
    * 数据提取弹窗里的「加入实时采集」：直接写回提取器上的 liveCapture。
    *
@@ -8271,18 +8276,15 @@ export default function App() {
             </button>
             {activeTask && activeTask.status === 'ready' && (
               <div className="log-search-action-tools" aria-label="日志操作">
-                {/* 采集面板是「实时采集」的操作台：可以先在这里勾选数据项再开始，
-                    也可以中途打开看每个采集项采到多少。 */}
+                {/* 只有一个入口：数据采集。提取器在这里勾选、在这里加入实时采集，
+                    加进去之后采集进度框会自己浮出来（纯按清单内容决定，不再单独一个按钮）。 */}
                 <button
                   type="button"
                   className={`button ghost compact-button toolbar-icon-button ${liveListening ? 'active' : ''}`}
-                  onClick={() => requestCapturePanel(!liveListening)}
-                  title={liveListening ? '打开数据采集面板（查看/停止实时采集）' : '打开数据采集面板，勾选要实时采集的数据项'}
+                  onClick={() => void beginDataExtraction()}
+                  title="数据采集：勾选要提取的数据、把提取器加入实时采集"
                 >
-                  <Radio size={14} /> 采集
-                </button>
-                <button type="button" className="button ghost compact-button toolbar-icon-button" onClick={() => void beginDataExtraction()} title="提取数据">
-                  <Database size={14} /> 提取
+                  <Database size={14} /> 数据采集
                 </button>
                 {/* 案例录入与相似案例匹配合成一个窗口的两个标签页：同一条工作流的进出两端，
                     分成两个按钮只会让用户先猜哪个是自己要的。 */}

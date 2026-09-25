@@ -606,11 +606,16 @@ def _program_values(moment: datetime, seq: int, function: str, length: int) -> d
     """
     round_index = seq // max(1, length)
     elapsed = 6 + zlib.crc32(function.encode("utf-8")) % 180
+    # 批次也要有自己的追踪号：wsp 的点位异常链要写 ``trace=``，没有这个键就会
+    # ``KeyError: 'trace'``。同一轮里所有行同号，形状与实时源的 ``TR-0001-ABCD``
+    # 一致，前端按它检索时两种日志可以一起命中。
+    suffix = zlib.crc32(f"{moment:%Y%m%d}{round_index}".encode("utf-8")) % 0xFFFF
     return {
         "wafer": f"W{1 + round_index % 25:02d}",
         "lot": f"LOT-{moment:%Y%m%d}-{round_index % 24 + 1:02d}",
         "software": fleet.SOFTWARE_VERSION,
         "elapsed": f"{elapsed + (round_index % 7) * 4.3:.1f}ms",
+        "trace": f"TR-{round_index % 9999 + 1:04d}-{suffix:04X}",
     }
 
 

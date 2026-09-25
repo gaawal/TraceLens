@@ -7,38 +7,47 @@
  * running showed an empty ribbon forever — the "看不到变化" symptom. Subscribing replays the
  * current value, so a late mount is correct by construction.
  */
-export interface CapturePanelRequest {
-  /** Monotonic token: every request is a new token, so a repeated click still registers. */
-  token: number;
-  /** `prep` opens the panel to choose what to collect, before anything starts. */
-  prep: boolean;
-}
-
 export interface LiveMonitoringState {
   on: boolean;
   environmentId?: number;
-  captureRequest?: CapturePanelRequest;
 }
 
 let state: LiveMonitoringState = { on: false };
-let captureToken = 0;
 const listeners = new Set<(next: LiveMonitoringState) => void>();
+
+/**
+ * 实时采集清单里有几个提取器 —— 采集进度框的**唯一**显示依据。
+ *
+ * 以前工具栏上单独有个「采集」按钮来开这个面板，于是「清单是空的」也会开出一个空盒子，
+ * 而「清单里有东西」时又得记得去点它。现在改成：有提取器被加入实时采集就浮出来，
+ * 一个都没有就不显示。订阅会重放当前值，晚挂载的面板也能拿到正确状态。
+ */
+let liveCaptureCount = 0;
+const countListeners = new Set<(count: number) => void>();
+
+export function publishLiveCaptureCount(count: number): void {
+  const next = Math.max(0, Number(count) || 0);
+  if (next === liveCaptureCount) return;
+  liveCaptureCount = next;
+  countListeners.forEach((listener) => listener(liveCaptureCount));
+}
+
+export function getLiveCaptureCount(): number {
+  return liveCaptureCount;
+}
+
+/** Subscribe and immediately receive the current count. */
+export function subscribeLiveCaptureCount(listener: (count: number) => void): () => void {
+  countListeners.add(listener);
+  listener(liveCaptureCount);
+  return () => {
+    countListeners.delete(listener);
+  };
+}
 
 export function setLiveMonitoring(next: Pick<LiveMonitoringState, 'on' | 'environmentId'>): void {
   if (state.on === next.on && state.environmentId === next.environmentId) return;
   state = { ...state, ...next };
-  listeners.forEach((listener) => listener(state));
-}
-
-/**
- * Ask the collector panel to open without touching monitoring state.
- *
- * The panel used to appear only as a side effect of 实时监听, so there was no way to set up what
- * to collect *before* starting — the user had to start monitoring to see the panel at all.
- */
-export function requestCapturePanel(prep = false): void {
-  captureToken += 1;
-  state = { ...state, captureRequest: { token: captureToken, prep } };
   listeners.forEach((listener) => listener(state));
 }
 
