@@ -16974,7 +16974,7 @@ html.workstation-docked {
 .call-flow-view-switch button:hover { background: #eef3f9; color: #2c5ba5; }
 .call-flow-view-switch button.active { background: #eaf2ff; border-color: #cddffa; color: #1f5eaf; font-weight: 600; }
 
-.flow-map { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.flow-map { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; height: 100%; }
 .flow-map-head {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 8px 12px; border-bottom: 1px solid #e8eef4; background: #fff;
@@ -17156,4 +17156,30 @@ html.workstation-docked {
   width: min(1720px, calc(100vw - 40px));
   height: min(940px, calc(100vh - 48px));
 }
+/* 右侧面板是 flex 列容器：视图切换条固定，内容（流程地图 / 缩进树）吃掉剩余全部高度。
+   之前这里是块级容器，流程地图只能靠自己的 min-height 撑到 260px —— 
+   面板有 876px，浪费了 616px，图被压成一条。 */
+.call-flow-graph-pane { display: flex; flex-direction: column; }
+.call-flow-graph-pane > .call-flow-view-switch { flex: none; }
+.call-flow-graph-pane > .flow-map,
+.call-flow-graph-pane > .call-graph-panel { flex: 1 1 auto; min-height: 0; }
 .call-flow-dialog.is-flow-map .call-flow-graph-pane { min-width: 0; }
+
+/* 概览形态：14% 的时候文字只是噪点，索性只留色块 ——
+   这个缩放级别要回答的是「流程长什么样、异常在哪一段」，不是「这个节点叫什么」。
+   文字收起后，红/黄/灰的分布一眼就能看出来。 */
+.flow-map-canvas.is-overview .flow-map-node-main {
+  padding: 2px 4px; gap: 0;
+  background: #e3eaf2; border-color: #c6d3e0; border-width: 1px;
+  box-shadow: none; border-radius: 6px;
+}
+.flow-map-canvas.is-overview .flow-map-node.severity-warning .flow-map-node-main { background: #f1d79c; border-color: #d9b766; }
+.flow-map-canvas.is-overview .flow-map-node.severity-error .flow-map-node-main { background: #efa79e; border-color: #cf5145; }
+.flow-map-canvas.is-overview .flow-map-node-top,
+.flow-map-canvas.is-overview .flow-map-node-meta,
+.flow-map-canvas.is-overview .flow-map-node-semantic,
+.flow-map-canvas.is-overview .flow-map-node-labels { display: none; }
+/* 概览里几十个异常节点同时闪会变成一片噪声，改用饱和底色表达。 */
+.flow-map-canvas.is-overview .flow-map-node.severity-error.has-error-path .flow-map-node-main { animation: none; }
+.flow-map-canvas.is-overview .flow-map-edge { stroke-width: 1; }
+.flow-map-canvas.is-overview .flow-map-node-main:hover { transform: none; }

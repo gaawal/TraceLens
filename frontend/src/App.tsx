@@ -8162,7 +8162,7 @@ export default function App() {
               title={logSortOrder === 'asc' ? '当前按时间升序展示，点击切换为降序' : '当前按时间降序展示，点击切换为升序'}
             >
               {logSortOrder === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
-              {logSortOrder === 'asc' ? '时间升序' : '时间降序'}
+              {logSortOrder === 'asc' ? '升序' : '降序'}
             </button>
             <SwitchControl
               checked={Boolean(filters.errorsOnly)}

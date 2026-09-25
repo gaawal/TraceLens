@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import { AlertTriangle, CheckCircle2, Crosshair, Maximize2, Minus, Plus, Tag, ZoomIn, ZoomOut } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Crosshair, Fullscreen, Maximize2, Tag, ZoomIn, ZoomOut } from 'lucide-react';
 import type { ContentSeverity, FunctionNode, LogEntry, LogLeaf, TraceTimeline } from '../types';
 import {
   functionNodeEntries,
@@ -43,10 +43,12 @@ const NODE_HEIGHT = 74;
 const GAP_X = 92;
 const GAP_Y = 18;
 const PADDING = 48;
-const MIN_ZOOM = 0.25;
+// 全流程概览要能把整张图塞进视口：24 步 × 35 行的图缩到 0.21 才放得下，
+// 下限卡在 0.25 就会在纵向上溢出一点点，「整个流程可见」就不成立了。
+const MIN_ZOOM = 0.1;
+/** 低于这个缩放就切到「概览形态」：只留色块，把文字收起来。 */
+const OVERVIEW_ZOOM = 0.4;
 const MAX_ZOOM = 2.4;
-/** 低于这个缩放，节点里的文字就读不了了；「适应窗口」不会越过它。 */
-const READABLE_ZOOM = 0.55;
 
 interface LaidOutNode {
   node: FunctionNode;
@@ -404,28 +406,12 @@ export function FlowMapView({
   }, [zoom]);
 
   /**
-   * 「适应窗口」故意**不允许**缩到看不清。
+   * 默认就是**整条流程的全览**。
    *
-   * 一张 117 节点的图硬塞进 700px 高，每个节点只剩十几像素 —— 那不是全览，是噪点。
-   * 所以这里把缩放钳在可读下限，宁可让用户平移；真想看整体形状用下面的「缩略条」。
+   * 一开始做成「100% 停在流程起点」，打开看到的是两三个节点加一大片空白，
+   * 而这张图的用处恰恰是「先看清整条流程长什么样，再决定看哪一段」。
+   * 所以进入 / 换调用链时都铺满整图，需要细看再放大或用「异常定位」。
    */
-  const fitToViewport = useCallback(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const rect = viewport.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const fitted = Math.min((rect.width - 24) / canvas.width, (rect.height - 24) / canvas.height);
-    const nextZoom = Math.min(MAX_ZOOM, Math.max(READABLE_ZOOM, fitted));
-    const anchor = firstError ?? layout.positioned[0];
-    if (anchor) {
-      centerOn(anchor.x, anchor.y, nextZoom);
-      return;
-    }
-    setZoom(nextZoom);
-    setPan({ x: 12, y: 12 });
-  }, [canvas.height, canvas.width, centerOn, firstError, layout.positioned]);
-
-  /** 缩略条 / 全览：这是唯一允许缩到很小的入口，因为它的用途就是看形状。 */
   const fitOverview = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -439,16 +425,27 @@ export function FlowMapView({
     setPan({ x: 12, y: Math.max(12, (rect.height - canvas.height * nextZoom) / 2) });
   }, [canvas.height, canvas.width]);
 
-  // 换一条调用链时回到流程起点（或第一个异常），不要停在上一张图的位置。
+  // 打开 / 换调用链：直接给全览。
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      const anchor = layout.positioned[0];
-      if (anchor) centerOn(anchor.x, anchor.y, 1);
-    }, 30);
+    const timer = window.setTimeout(fitOverview, 30);
     return () => window.clearTimeout(timer);
-    // centerOn 依赖 zoom，跟着它会把每次缩放都变成「跳回起点」。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTrace?.id, layout.positioned.length]);
+  }, [activeTrace?.id, fitOverview]);
+
+  // 面板尺寸变化（切视图、改窗口）后重新铺满，避免留在半空的位置。
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || typeof ResizeObserver === 'undefined') return undefined;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitOverview);
+    });
+    observer.observe(viewport);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [fitOverview]);
 
   function onWheel(event: React.WheelEvent<HTMLDivElement>) {
     const viewport = viewportRef.current;
@@ -516,8 +513,8 @@ export function FlowMapView({
           </button>
           <button type="button" onClick={() => setZoom((value) => Math.min(MAX_ZOOM, value * 1.15))} title="放大"><ZoomIn size={14} /></button>
           <button type="button" onClick={() => setZoom((value) => Math.max(MIN_ZOOM, value * 0.87))} title="缩小"><ZoomOut size={14} /></button>
-          <button type="button" onClick={fitToViewport} title="适应窗口（不会缩到看不清，会定位到第一个异常）"><Maximize2 size={14} /></button>
-          <button type="button" onClick={fitOverview} title="全览：缩到能看见整张图的形状"><Minus size={14} /></button>
+          <button type="button" onClick={fitOverview} title="适应全流程：缩到能看见整张图的形状（默认就是这个视图）"><Maximize2 size={14} /></button>
+          <button type="button" onClick={() => { const first = layout.positioned[0]; if (first) centerOn(first.x, first.y, 1); }} title="回到 100% 并定位到流程起点"><Fullscreen size={14} /></button>
           <span className="flow-map-zoom">{Math.round(zoom * 100)}%</span>
         </div>
       </header>
@@ -592,7 +589,7 @@ export function FlowMapView({
         data-panning={dragRef.current ? 'true' : undefined}
       >
         <div
-          className="flow-map-canvas"
+          className={`flow-map-canvas ${zoom < OVERVIEW_ZOOM ? 'is-overview' : ''}`}
           style={{
             width: canvas.width,
             height: canvas.height,
