@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { API_BASE, buildApiHeaders } from '../api/resourceApi';
-import { extractDataValues, type DataExtractionRule } from '../rendering/dataExtractionRules';
+import { extractDataValues, type DataExtractionRule, type ExtractedDataRow } from '../rendering/dataExtractionRules';
 import { primeSeq, subscribeWatchHits, subscribeWatchStatus, type WatchHitEvent } from './watchRealtime';
 
 /**
@@ -13,11 +13,21 @@ import { primeSeq, subscribeWatchHits, subscribeWatchStatus, type WatchHitEvent 
 export interface LiveCaptureProgress {
   /** 每个提取器已采集到多少条（按当前提取器的字段定义从命中日志里抽出来的才算）。 */
   counts: Record<string, number>;
+  /**
+   * 每个提取器最近采到的**值**（保留最近 MAX_KEPT_ROWS 条）。
+   *
+   * 采集进度只需要条数，但「实时绘图联动」需要值本身 —— 面板里不再显示数据表格，
+   * 不代表数据可以不留：图就是拿这些行画的，而且新数据进来时图要跟着变。
+   */
+  rows: Record<string, ExtractedDataRow[]>;
   /** 本次会话累计命中多少条日志（用于区分「没命中」和「命中了但抽不出字段」）。 */
   hits: number;
   /** SSE 通道是否连着；断开时服务端仍在采集原始窗口。 */
   connected: boolean;
 }
+
+/** 每个提取器在内存里保留的最近行数：够画图和看趋势，又不会把页面撑爆。 */
+const MAX_KEPT_ROWS = 400;
 
 interface Options {
   /** 实时监听是否开着。关闭时清空计数，避免下次打开显示上一轮的残留。 */
@@ -96,9 +106,11 @@ export function useLiveCaptureProgress({ enabled, environmentId, rules }: Option
     };
   }, [enabled]);
 
-  const counts = useMemo(() => {
-    const result: Record<string, number> = {};
+  const collected = useMemo(() => {
+    const counts: Record<string, number> = {};
+    const rows: Record<string, ExtractedDataRow[]> = {};
     for (const rule of rules) {
+      const kept: ExtractedDataRow[] = [];
       let count = 0;
       for (const hit of hits) {
         if (rule.subsystems.length && hit.subsystem && !rule.subsystems.includes(hit.subsystem)) continue;
@@ -107,12 +119,21 @@ export function useLiveCaptureProgress({ enabled, environmentId, rules }: Option
         if (!message) continue;
         // 用抽取引擎判断「这条命中算不算这个提取器采到的一条」：
         // 命中数不等于采集数，配错字段的提取器会一直命中却一条都抽不出来。
-        if (extractDataValues(message, rule)) count += 1;
+        const values = extractDataValues(message, rule);
+        if (!values) continue;
+        count += 1;
+        kept.push({
+          timestamp: hit.matched_at,
+          sourceFile: `${hit.subsystem || ''}/${hit.fm || ''}`.replace(/^\//, ''),
+          lineNumber: 0,
+          values,
+        });
       }
-      result[rule.id] = count;
+      counts[rule.id] = count;
+      rows[rule.id] = kept.slice(-MAX_KEPT_ROWS);
     }
-    return result;
+    return { counts, rows };
   }, [hits, rules]);
 
-  return { counts, hits: hits.length, connected };
+  return { counts: collected.counts, rows: collected.rows, hits: hits.length, connected };
 }

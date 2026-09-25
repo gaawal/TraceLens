@@ -40,7 +40,11 @@ interface Props {
    * 之前这个开关只存在于「设置 → 日志规则 → 数据提取」和采集面板里，
    * 在本页面对着的日志上配置提取器时还得跳出去，现在就在这个窗口里完成。
    */
-  onSetLiveCapture?: (ruleIds: string[], enabled: boolean) => void | Promise<void>;
+  /**
+   * 「开始采集（实时采集）」：把勾选的采集项作为这一轮的实时采集清单。
+   * 返回一句话说明结果（例如「已加入，请打开实时监听」）。
+   */
+  onStartLiveCollection?: (ruleIds: string[]) => void | string | Promise<void | string>;
   /**
    * 当前**真正**在实时采集清单里的提取器 id。
    *
@@ -71,17 +75,26 @@ export function DataExtractionRunDialog(props: Props) {
   const resultSignature = matchedResults.map((item) => `${item.rule.id}:${item.rows.length}`).join('|');
   const [mergeSelectedIds, setMergeSelectedIds] = useState<Set<string>>(new Set());
   const [liveBusyId, setLiveBusyId] = useState('');
+  /**
+   * 正在实时绘图的采集项。
+   *
+   * 存的是 **id 而不是数据快照** —— 数据集每帧都从 props.liveProgress.rows 重新算，
+   * 新采到的点会自动出现在图上（signature 保持稳定，所以用户的图表配置不会被重置）。
+   */
+  const [livePlotRuleId, setLivePlotRuleId] = useState<string>();
   const [liveMessage, setLiveMessage] = useState('');
 
-  async function setLiveCapture(ruleIds: string[], enabled: boolean) {
-    if (!props.onSetLiveCapture || !ruleIds.length) return;
-    setLiveBusyId(enabled ? 'bulk' : ruleIds[0]);
+  /** 「开始采集（实时采集）」：把勾选项作为这一轮的实时采集项，并进入进度视图。 */
+  async function startLive() {
+    const ids = [...props.selectedIds];
+    if (!props.onStartLiveCollection || !ids.length) return;
+    setLiveBusyId('live');
     setLiveMessage('');
     try {
-      await props.onSetLiveCapture(ruleIds, enabled);
-      setLiveMessage(enabled
-        ? `已把 ${ruleIds.length} 个提取器加入实时采集清单，可在「采集」面板查看条数。`
-        : `已把 ${ruleIds.length} 个提取器移出实时采集清单。`);
+      const message = await props.onStartLiveCollection(ids);
+      setLiveMessage(typeof message === 'string' && message
+        ? message
+        : `已开始实时采集 ${ids.length} 项；进度会随命中实时更新，点「绘图」可实时联动。`);
     } catch (error) {
       setLiveMessage(error instanceof Error ? error.message : String(error));
     } finally {
@@ -125,7 +138,8 @@ export function DataExtractionRunDialog(props: Props) {
   const mergeRowCount = mergeResults.reduce((sum, item) => sum + item.rows.length, 0);
 
   return <>
-  <div className="data-extraction-dialog-backdrop" role="presentation" onMouseDown={() => props.phase === 'running' ? undefined : props.onClose()}>
+  {/* 只有右上角的 X 会关闭；点背景不关，也不压暗/虚化 —— 后面的日志要看得到、点得到。 */}
+  <div className="data-collection-backdrop" role="presentation">
     <section className="data-extraction-dialog" role="dialog" aria-modal="true" aria-label="提取数据" onMouseDown={(event) => event.stopPropagation()}>
       <header>
         <div>
@@ -176,18 +190,23 @@ export function DataExtractionRunDialog(props: Props) {
                       <i className={progressTarget ? '' : 'is-live'} style={progressTarget ? { width: `${Math.min(100, Math.round((liveCount / progressTarget) * 100))}%` } : undefined} />
                     </span>
                     <em>{liveCount}{progressTarget ? ` / ${progressTarget}` : ''} 条</em>
+                    {/* 按钮一直在：采到第一条之前点它只提示「还没数据」，而不是让按钮忽隐忽现。 */}
+                    <button
+                      type="button"
+                      className="data-extraction-live-plot"
+                      onClick={() => {
+                        if (!(props.liveProgress?.rows[rule.id] || []).length) {
+                          setLiveMessage('还没有采到数据；等第一条采到后就能实时绘图。');
+                          return;
+                        }
+                        setLivePlotRuleId(rule.id);
+                      }}
+                      title="用已采到的数据实时绘图：新数据进来图会跟着更新"
+                    ><Activity size={12}/> 绘图</button>
                   </span>
                 )}
-                {props.onSetLiveCapture && <button
-                  type="button"
-                  className={`data-live-capture-add ${inLiveCapture ? 'on' : ''}`}
-                  disabled={Boolean(liveBusyId)}
-                  onClick={() => void setLiveCapture([rule.id], !inLiveCapture)}
-                  title={inLiveCapture ? '从实时采集清单中移除这个提取器' : '把这个提取器加入实时采集清单'}
-                >
-                  {liveBusyId === rule.id ? <LoaderCircle className="spin" size={12}/> : inLiveCapture ? <Radio size={12}/> : <Plus size={12}/>}
-                  {inLiveCapture ? '已在实时采集' : '加入实时采集'}
-                </button>}
+                {/* 采集方式由底部的「开始采集（…）」决定，这里不再单独放加入/移出按钮。 */}
+                {inLiveCapture && !props.liveActive && <span className="data-extraction-rule-flag">实时采集中</span>}
               </div>;
               })}
             </div>
@@ -251,14 +270,25 @@ export function DataExtractionRunDialog(props: Props) {
       </div>
 
       <footer>
-        {props.phase === 'select' && <>{props.onSetLiveCapture && <button className="button secondary" disabled={props.selectedIds.size === 0 || Boolean(liveBusyId)} onClick={() => void setLiveCapture([...props.selectedIds], true)} title="把勾选的提取器一次性加入实时采集清单"><Radio size={14}/> 添加实时采集</button>}<span className="data-extraction-footer-spacer"/><button className="button ghost" onClick={props.onClose}>关闭</button><button
-                className="button primary"
-                disabled={!props.candidates.length || props.selectedIds.size === 0 || props.batchAvailable === false}
-                onClick={props.onStart}
-                title={props.batchAvailable === false
-                  ? '当前没有可批量采集的已解析日志（实时监听期间请用右侧开关做实时采集）'
-                  : '对当前日志批量采集选中的项'}
-              >开始采集（当前日志）</button></>}
+        {props.phase === 'select' && <>
+          <span className="data-extraction-footer-spacer"/>
+          <button className="button ghost" onClick={props.onClose}>关闭</button>
+          {/* 采集方式不再用「加入实时采集」这类按钮表达，直接写在开始按钮的括号里。 */}
+          <button
+            className="button secondary"
+            disabled={!props.candidates.length || props.selectedIds.size === 0 || !props.onStartLiveCollection}
+            onClick={() => void startLive()}
+            title="勾选项按实时采集运行：跟着实时监听持续采，进度实时更新，可实时绘图"
+          >{liveBusyId === 'live' ? <LoaderCircle className="spin" size={14}/> : <Radio size={14}/>} 开始采集（实时采集）</button>
+          <button
+            className="button primary"
+            disabled={!props.candidates.length || props.selectedIds.size === 0 || props.batchAvailable === false}
+            onClick={props.onStart}
+            title={props.batchAvailable === false
+              ? '当前没有可批量采集的已解析日志；实时监听期间请用左侧「开始采集（实时采集）」'
+              : '对当前日志一次性批量采集选中的项'}
+          >开始采集（当前日志）</button>
+        </>}
         {props.phase === 'running' && <button className="button danger" onClick={props.onCancel}><Square size={14}/> 停止提取</button>}
         {(props.phase === 'done' || props.phase === 'error') && <><button className="button secondary" onClick={props.onClose}>关闭</button>{props.recordSaved && <button className="button primary" onClick={props.onOpenData}>进入数据</button>}</>}
       </footer>
@@ -270,5 +300,22 @@ export function DataExtractionRunDialog(props: Props) {
     <footer><span>{previewResult.rows.length > 1000 ? '仅预览前 1000 行，下载可获取全部数据。' : `共 ${previewResult.rows.length} 行。`}</span><div className="data-preview-footer-actions"><button className="button secondary" onClick={() => openVisualization(previewResult)}><Activity size={14}/> 绘图</button><button className="button primary" onClick={() => props.onDownload(previewResult)}><Download size={14}/> 下载</button></div></footer>
   </section></div>}
   {visualization && <DataVisualizationDialog dataset={visualization} onClose={() => setVisualization(undefined)}/>}
+  {livePlotRuleId && (() => {
+    const rule = props.candidates.find((item) => item.rule.id === livePlotRuleId)?.rule;
+    const rows = props.liveProgress?.rows[livePlotRuleId] || [];
+    if (!rule || !rows.length) return null;
+    return (
+      <DataVisualizationDialog
+        dataset={{
+          name: `${rule.name} · 实时`,
+          // signature 固定 = 用户的图表配置不会被每一批新数据重置。
+          signature: `live:${livePlotRuleId}`,
+          fields: rule.fields.map((field) => field.name || field.key),
+          rows,
+        }}
+        onClose={() => setLivePlotRuleId(undefined)}
+      />
+    );
+  })()}
   </>;
 }

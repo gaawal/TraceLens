@@ -6530,6 +6530,24 @@ export default function App() {
   }
 
   /**
+   * 弹窗里的「开始采集（实时采集）」：勾选项**成为**这一轮的实时采集清单。
+   *
+   * 用「开始采集」表达采集方式，而不是让人先点一堆「加入实时采集」按钮 ——
+   * 采集项本来就是「这一轮要采什么」，和启动动作是同一件事。
+   */
+  function startLiveCollection(ruleIds: string[]): string | undefined {
+    const wanted = new Set(ruleIds);
+    setDataExtractionRules((current) => current.map((rule) => {
+      const next = wanted.has(rule.id);
+      return (rule.liveCapture === true) === next ? rule : { ...rule, liveCapture: next, updatedAt: Date.now() };
+    }));
+    if (!liveListening) {
+      return `已选中 ${ruleIds.length} 项作为实时采集项；打开工具栏的「实时监听」后进度会开始更新。`;
+    }
+    return undefined;
+  }
+
+  /**
    * 数据提取弹窗里的「加入实时采集」：直接写回提取器上的 liveCapture。
    *
    * 和采集面板的勾选是同一个字段、同一份规则列表，所以两边永远一致 ——
@@ -8630,7 +8648,7 @@ export default function App() {
           datasetName={activeTask?.name || '当前提取数据'}
           liveListening={liveListening}
           onStartLiveExtraction={() => { void startSelectedDataExtraction(); }}
-          onSetLiveCapture={(ruleIds, enabled) => setLiveCaptureForRules(ruleIds, enabled)}
+          onStartLiveCollection={(ruleIds) => startLiveCollection(ruleIds)}
           liveCaptureIds={liveCaptureRuleIds}
           liveProgress={liveCaptureProgress}
           liveActive={liveListening}
