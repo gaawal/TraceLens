@@ -7340,7 +7340,7 @@ body { font-size: 14px; }
 .data-preview-dialog h2 { margin: 3px 0 4px; font-size: 20px; }
 .data-extraction-dialog header p,
 .data-preview-dialog header p { margin: 0; color: #70808d; font-size: 13px; }
-.data-extraction-dialog-body { min-height: 220px; padding: 18px 20px; overflow: auto; }
+.data-extraction-dialog-body { min-height: 170px; padding: 14px 16px; overflow: auto; }
 .data-extraction-dialog > footer,
 .data-preview-dialog > footer { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 12px 20px; border-top: 1px solid #e6ebef; background: #fbfcfd; }
 .data-extraction-state,
@@ -7350,7 +7350,7 @@ body { font-size: 14px; }
 .data-extraction-empty.error strong { color: #a84550; }
 .data-extraction-select-head { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 10px; color: #657a89; }
 .data-extraction-select-head strong { color: #234a63; }
-.data-extraction-rule-options { display: grid; gap: 8px; }
+.data-extraction-rule-options { display: grid; gap: 6px; }
 .data-extraction-rule-options label { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 11px 12px; border: 1px solid #dfe6ec; border-radius: 9px; cursor: pointer; }
 .data-extraction-rule-options label.selected { border-color: #83bbdd; background: #f2f9fd; }
 .data-extraction-rule-options label > span { min-width: 0; }
@@ -16892,19 +16892,36 @@ html.workstation-docked {
 .data-extraction-rule-option {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
-  padding: 11px 12px;
+  /* 每个提取器一行：列表长了也不用滚，扫一眼就能比出哪个是自己要的。 */
+  padding: 4px 10px;
   border: 1px solid #dfe6ec;
-  border-radius: 9px;
+  border-radius: 8px;
   background: #fff;
 }
 .data-extraction-rule-option.selected { border-color: #83bbdd; background: #f2f9fd; }
-.data-extraction-rule-option > label { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto; gap: 10px; align-items: center; cursor: pointer; min-width: 0; }
+/* 注意 padding: 0：沿用上面 `.data-extraction-rule-options label` 的 11px 内边距
+   会让每一行凭空高出 22px，行高直接从 34 变成 58 —— 「一行展示」就白做了。 */
+.data-extraction-rule-option > label { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto auto; gap: 8px; align-items: center; cursor: pointer; min-width: 0; padding: 0; }
+/* 名称 + 说明 + 字段在同一行：名称与字段各占一个上限宽度，说明吃掉剩余空间，
+   任何一段过长都在自己的格子里省略，不会把行撑高。 */
+.data-extraction-rule-text { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.data-extraction-rule-text > strong,
+.data-extraction-rule-text > small,
+.data-extraction-rule-text > em {
+  display: block; margin: 0; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 名称是这一行的身份，先给足空间；挤不下时优先让说明让位，最后才截断名称。 */
+.data-extraction-rule-text > strong { flex: 0 1 auto; max-width: 54%; color: #1f3040; }
+.data-extraction-rule-text > small { flex: 1 1 auto; color: #82909c; }
+.data-extraction-rule-text > em { flex: 0 1 auto; max-width: 30%; color: #4d7187; font-style: normal; }
+.data-extraction-rule-option .data-extraction-rule-scope { margin: 0; white-space: nowrap; }
 .data-live-capture-add {
   flex: none;
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 5px 10px; border-radius: 7px;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 9px; border-radius: 6px;
   border: 1px solid #cfdce8; background: #f7fafc; color: #4a6480;
   font-size: 11.5px; white-space: nowrap; cursor: pointer;
 }

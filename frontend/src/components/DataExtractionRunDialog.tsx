@@ -128,9 +128,15 @@ export function DataExtractionRunDialog(props: Props) {
                 return <div key={rule.id} className={`data-extraction-rule-option ${props.selectedIds.has(rule.id) ? 'selected' : ''}`}>
                 <label>
                   <input type="checkbox" checked={props.selectedIds.has(rule.id)} onChange={() => props.onToggle(rule.id)}/>
-                  <span><strong>{rule.name}</strong><small>{rule.description || '数据提取能力'}</small><em>{rule.fields.map((field) => field.name || field.key).join(' / ')}</em></span>
+                  {/* 一行展示：名称 / 说明 / 字段 / 格式 / 范围。
+                      之前这三段各占一行，每个提取器就有三行高，列表稍长一点就得滚动。 */}
+                  <span className="data-extraction-rule-text">
+                    <strong>{rule.name || rule.matchKeyword || rule.id}</strong>
+                    <small>{rule.description || '数据提取能力'}</small>
+                    <em>{rule.fields.map((field) => field.name || field.key).join(' / ')}</em>
+                  </span>
                   <b>{rule.outputFormat === 'text' ? 'TXT' : 'CSV'}</b>
-                  <small>{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
+                  <small className="data-extraction-rule-scope">{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
                 </label>
                 {props.onSetLiveCapture && <button
                   type="button"
