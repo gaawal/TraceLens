@@ -82,6 +82,14 @@ import {
 import type { ImportProgress, ImportStrategy, LogStreamWorkerResponse, WorkerImportSource } from './workers/logStreamProtocol';
 import { buildCrossComponentTraces, buildProcessTimelines, durationNs, formatDuration, mergeRepeatedFunctionGroups } from './parser/treeBuilder';
 import {
+  diffFoldLogs,
+  mergeFoldInflux,
+  pruneFoldInflux,
+  scanFoldLogs,
+  type FoldInfluxLine,
+  type FoldLogScan,
+} from './parser/foldInflux';
+import {
   createCrossTraceScopeIndex,
   createProcessScopeIndex,
   scopeCrossTracesForWindow,
@@ -556,6 +564,14 @@ interface SemanticDisplayContextValue {
 }
 
 const SemanticDisplayContext = createContext<SemanticDisplayContextValue>({ enabled: false, rules: [] });
+
+/**
+ * 实时监听 + 函数折叠时，新日志被折进上方入口卡片的动画数据（按节点 id 索引）。
+ * 默认空对象，所以非实时场景里 FunctionItem 读取它是无副作用的。
+ */
+const EMPTY_FOLD_INFLUX: Record<string, FoldInfluxLine[]> = {};
+const EMPTY_FOLD_INFLUX_LINES: FoldInfluxLine[] = [];
+const FunctionFoldInfluxContext = createContext<Record<string, FoldInfluxLine[]>>(EMPTY_FOLD_INFLUX);
 
 function loadErrorRules(): ErrorMatchRule[] {
   if (typeof window === 'undefined') return DEFAULT_ERROR_RULES.map((rule) => ({ ...rule }));
@@ -3154,6 +3170,11 @@ function FunctionItem({
   const nestedFunctionCount = functionCount(children);
   const severity = itemSeverity(node);
   const semanticDisplay = useContext(SemanticDisplayContext);
+  // 实时监听时新折进来的日志行：只在卡片折叠着的时候播放「折进去」的动画 ——
+  // 展开状态下这些行本来就以真实日志行的形式出现，再叠一层动画只会打架。
+  const foldInflux = useContext(FunctionFoldInfluxContext);
+  const foldLines = expanded ? EMPTY_FOLD_INFLUX_LINES : (foldInflux[node.id] ?? EMPTY_FOLD_INFLUX_LINES);
+  const absorbing = foldLines.length > 0;
   // 函数规则配置入口不能依赖“语义展示”开关。规则始终匹配，展示层再决定是否显示语义。
   const configuredSemanticMatch = useMemo(
     () => matchDisplayRulesToFunction(semanticDisplay.rules, node),
@@ -3180,7 +3201,7 @@ function FunctionItem({
     >
       <div className="timeline-node-dot" />
       <div className="function-card-shell">
-        <button type="button" className="function-card" onClick={() => { if (!hasTextSelection()) onToggle(node.id); }}>
+        <button type="button" className={classNames('function-card', absorbing && 'is-absorbing')} onClick={() => { if (!hasTextSelection()) onToggle(node.id); }}>
           <span className="function-chevron">{expanded ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</span>
           <span className="function-main">
             <span className="function-title-row">
@@ -3233,6 +3254,27 @@ function FunctionItem({
           </button>
         )}
       </div>
+
+      {absorbing && (
+        // 折叠动画：新到的日志行从卡片下方升起、缩小、淡出 —— 也就是「折进上面那条入口日志」。
+        // 绝对定位 + pointer-events:none，所以它不占布局、不打断实时滚动的跟随。
+        <div className="function-fold-influx" aria-hidden="true">
+          {foldLines.map((line, index) => (
+            <div
+              key={line.id}
+              className={classNames('function-fold-line', `severity-${line.entry.severity}`, index === foldLines.length - 1 && 'is-newest')}
+              style={{
+                ...componentStyle(line.entry.component),
+                animationDelay: `${index * 70}ms`,
+              } as React.CSSProperties}
+            >
+              <span className="function-fold-line-time">{line.entry.timestamp}</span>
+              <span className={classNames('level-badge', `level-${line.entry.level.toLowerCase()}`)}>{line.entry.level}</span>
+              <span className="function-fold-line-text" title={line.entry.raw}>{line.entry.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       {expanded && (
         <div className="function-children">
@@ -4808,6 +4850,37 @@ export default function App() {
     if (timelineGroupingMode === 'merged') return mergedTimelineTraces;
     return visibleProcesses.flatMap((process) => process.threads.flatMap((thread) => thread.traces));
   }, [mergedTimelineTraces, selectedCrossTrace, selectedProcess, selectedThread, selectedTrace, timelineGroupingMode, visibleProcesses]);
+
+  // ── 折叠动画：实时监听时，新日志折进上方入口卡片的过程要看得见 ──────────────
+  // 只在「实时监听 + 开着函数折叠 + 不是原始日志视图」时统计；离开这三个条件立刻清空，
+  // 免得静态浏览历史日志时也去算差值。
+  const foldInfluxActive = liveListening && foldingEnabled && !rawLogMode;
+  const foldLogScanRef = useRef<FoldLogScan>(new Map());
+  const [foldInflux, setFoldInflux] = useState<Record<string, FoldInfluxLine[]>>(EMPTY_FOLD_INFLUX);
+  useEffect(() => {
+    if (!foldInfluxActive) {
+      foldLogScanRef.current = new Map();
+      setFoldInflux((current) => (Object.keys(current).length ? EMPTY_FOLD_INFLUX : current));
+      return;
+    }
+    const scan = scanFoldLogs(visibleTraces.flatMap((trace) => trace.items));
+    const previous = foldLogScanRef.current;
+    foldLogScanRef.current = scan;
+    // 第一帧只建立基线：刚打开实时监听时不能把已存在的日志当成「刚刚折进来」。
+    if (!previous.size) return;
+    const grown = diffFoldLogs(previous, scan);
+    if (grown.length) setFoldInflux((current) => mergeFoldInflux(current, grown, Date.now()));
+  }, [foldInfluxActive, visibleTraces]);
+
+  const hasFoldInflux = Object.keys(foldInflux).length > 0;
+  useEffect(() => {
+    if (!hasFoldInflux) return;
+    // 动画播完的行走期清理；pruneFoldInflux 无变化时返回原对象，所以这个定时器很轻。
+    const timer = window.setInterval(() => {
+      setFoldInflux((current) => pruneFoldInflux(current, Date.now()));
+    }, 240);
+    return () => window.clearInterval(timer);
+  }, [hasFoldInflux]);
 
   const flatEntries = useMemo(() => {
     const scoped = selectedCrossTrace
@@ -8486,7 +8559,8 @@ export default function App() {
               <RawLogView task={activeTask} live={liveListening} />
             ) : foldingEnabled ? (
               paginatedVisibleTraces.length > 0 ? (
-                timelineGroupingMode === 'merged' && !selectedProcess && !selectedThread && !selectedTrace && !selectedCrossTrace ? (
+                <FunctionFoldInfluxContext.Provider value={foldInflux}>
+                {timelineGroupingMode === 'merged' && !selectedProcess && !selectedThread && !selectedTrace && !selectedCrossTrace ? (
                   <MergedFmTimelineView
                     traces={paginatedVisibleTraces}
                     filters={renderFilters}
@@ -8506,7 +8580,8 @@ export default function App() {
                     onToggle={toggleExpanded}
                     onSelectEntry={(entry) => { setFocusedEntryId(entry.severity === 'error' ? entry.id : undefined); setSelectedEntry(entry); setShowIssues(false); }}
                   />
-                )
+                )}
+                </FunctionFoldInfluxContext.Provider>
               ) : (
                 <div className="empty-state large">
                   <GitBranch size={42} />

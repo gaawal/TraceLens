@@ -72,3 +72,63 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   seen.push({claimed:false,status:unowned.status,detail:unowned.detail});
   console.log('action claiming checks passed');
 }
+
+// --- 实时监听的折叠动画：差值检测 ----------------------------------------------
+// 只有「刚把新日志折进上方入口卡片」的那张卡片（及其祖先链）才该播动画；
+// 第一次扫描只当基线，不能让打开实时监听前就存在的日志全部动起来。
+{
+  const { scanFoldLogs, diffFoldLogs, mergeFoldInflux, pruneFoldInflux } = await import('../src/parser/foldInflux');
+  const log = (id: string, timestamp = `2026-09-25 10:00:0${id.slice(-1)}`) => ({
+    kind: 'log' as const,
+    id: `leaf-${id}`,
+    entry: { id, timestamp, message: `line ${id}`, level: 'INFO', severity: 'info', component: 'sil' },
+  } as unknown as import('../src/types').TimelineItem);
+  const fn = (id: string, children: unknown[]) => ({
+    kind: 'function' as const,
+    origin: 'consecutive' as const,
+    id,
+    name: `Func${id}`,
+    component: 'sil',
+    processId: 'p',
+    threadId: 't',
+    rpc: { traceId: 'tr', spanId: 'sp', parentSpanId: '0' },
+    source: { fileName: 'a.py', lineNumber: 1, raw: 'a.py:1' },
+    startEntry: (children[0] as { entry: unknown }).entry,
+    endEntry: (children[children.length - 1] as { entry: unknown }).entry,
+    children,
+    incomplete: false,
+  } as unknown as import('../src/types').TimelineItem);
+  type Tree = import('../src/types').TimelineItem[];
+
+  const tree1 = [fn('FnA', [log('a1')])] as Tree;
+  const base = scanFoldLogs(tree1);
+  assert.equal(diffFoldLogs(new Map(), base).length, 0, '首次扫描只建立基线，不产生动画');
+  assert.equal(diffFoldLogs(base, base).length, 0, '没有新日志时不动画');
+
+  const tree2 = [fn('FnA', [log('a1'), log('a2'), log('a3')])] as Tree;
+  const grown = diffFoldLogs(base, scanFoldLogs(tree2));
+  assert.equal(grown.length, 1, '只有真正变多的卡片才算「折进来」');
+  assert.deepEqual(grown[0].entries.map((entry) => entry.id), ['a2', 'a3']);
+  assert.deepEqual(grown[0].ids, ['FnA'], '顶层卡片没有祖先，只挂自己');
+
+  // 内层节点新增：动画要同时挂到祖先链上，否则父级折叠时根本渲染不出来。
+  const tree3 = [fn('FnOuter', [fn('FnInner', [log('b1')])])] as Tree;
+  const tree4 = [fn('FnOuter', [fn('FnInner', [log('b1'), log('b2')])])] as Tree;
+  const nested = diffFoldLogs(scanFoldLogs(tree3), scanFoldLogs(tree4));
+  assert.deepEqual(nested[0].ids, ['FnInner', 'FnOuter']);
+
+  // 状态合并：每张卡片最多留 3 行动画，节点数也有上限。
+  let influx = mergeFoldInflux({}, grown, 1000);
+  assert.deepEqual(Object.keys(influx), ['FnA']);
+  assert.equal(influx.FnA.length, 2);
+  influx = mergeFoldInflux(influx, [{ ids: ['FnA'], entries: [log('a4').entry, log('a5').entry, log('a6').entry] }], 1010);
+  assert.equal(influx.FnA.length, 3, '同时播放的行数有上限');
+  assert.equal(influx.FnA[2].id.includes('a6'), true, '保留的是最新的几行');
+  assert.equal(influx.FnA[0].id.includes('a4'), true);
+
+  // 到期清理：动画播完的行必须消失，否则实时高频追加会把 DOM 越堆越多。
+  const pruned = pruneFoldInflux(influx, 1010 + 2000);
+  assert.deepEqual(pruned, {});
+  assert.equal(pruneFoldInflux(influx, 1010 + 100), influx, '没过期时返回原对象，避免无意义重渲染');
+  console.log('实时折叠动画差值检查通过');
+}

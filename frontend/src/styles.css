@@ -17511,3 +17511,64 @@ html.workstation-docked {
     border-radius .42s ease,
     box-shadow .3s ease !important;
 }
+
+/* ── 实时监听的「折叠动画」 ────────────────────────────────────────────────
+   开着函数折叠时，新到的日志会立刻被收进上方那张入口卡片，条数从 8 变 9 ——
+   只看数字根本不知道刚才发生了什么。所以让刚被折进去的那几行真实日志从卡片
+   下方升起、缩小、淡出，看上去就是从下方被「折」进了上面那条入口日志。
+   绝对定位 + pointer-events:none：不占布局，也不会打断实时滚动的自动跟随。 */
+.function-fold-influx {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 6;
+  display: grid;
+  gap: 2px;
+  pointer-events: none;
+}
+.function-fold-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid #dbe6f4;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .96);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, .10);
+  font-size: 11px;
+  color: #475569;
+  opacity: 0;
+  transform-origin: 50% 100%;
+  will-change: transform, opacity;
+  animation: function-fold-absorb 1.02s cubic-bezier(.25, .75, .3, 1) both;
+}
+.function-fold-line-time { flex: none; color: #94a3b8; font: 10px "Cascadia Code", Consolas, monospace; }
+.function-fold-line-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.function-fold-line.is-newest { border-color: #93c5fd; box-shadow: 0 6px 18px rgba(37, 99, 235, .18); }
+.function-fold-line.severity-error { border-color: #fecaca; background: #fff1f2; color: #b91c1c; }
+.function-fold-line.severity-warning { border-color: #fed7aa; background: #fff7ed; color: #a16207; }
+
+@keyframes function-fold-absorb {
+  0% { opacity: 0; transform: translateY(22px) scale(.94); }
+  16% { opacity: 1; transform: translateY(0) scale(1); }
+  55% { opacity: 1; transform: translateY(-10px) scale(.86); }
+  100% { opacity: 0; transform: translateY(-34px) scale(.56); }
+}
+
+/* 同时让被折进去的那张卡片自己「吸一口气」，视线才跟得上折到了哪一条。 */
+.function-card.is-absorbing {
+  border-color: #93c5fd;
+  background: #f6fbff;
+  animation: function-fold-absorb-pulse 1.02s ease-out;
+}
+@keyframes function-fold-absorb-pulse {
+  0% { box-shadow: inset 3px 0 0 hsl(var(--component-hue) 66% 52%), 0 0 0 0 rgba(37, 99, 235, .28); }
+  40% { box-shadow: inset 3px 0 0 hsl(var(--component-hue) 66% 52%), 0 0 0 4px rgba(37, 99, 235, .10); }
+  100% { box-shadow: inset 3px 0 0 hsl(var(--component-hue) 66% 52%), 0 0 0 0 rgba(37, 99, 235, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .function-fold-line { animation-duration: .24s; }
+  .function-card.is-absorbing { animation: none; }
+}
