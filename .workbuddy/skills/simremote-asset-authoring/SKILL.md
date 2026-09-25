@@ -128,6 +128,17 @@ agent_created: true
   （`fm_targets.length !== 1` 直接拒绝），且必须已存在一个 `status === 'ready'` 的任务
   （只有环境/组件没有任务时是 0 源）。所以别把 3 类异常分散到 3 条流上就算完 ——
   那条会被订阅的流自己得凑齐「≥3 类异常 + 1 类正常」，否则单模块视图里只有 1 类。
+  这件事**必须登记**：`livesim.OBSERVER_KEYS` 是"会被用户单独盯住"的流的清单，
+  selftest 挨个查「≥3 类异常 + 正常节拍」并各开一条保活 tail 探真链路。
+  新增一条让人专门去看的流 → 加进 `OBSERVER_KEYS`，否则自检不会覆盖它。
+  配套的"正常节拍"判据在 `livesim.NORMAL_BEAT_MARKERS`（按标记串匹配，
+  因为不同流的正常行长什么样不一样：扫片流是 `position error within tolerance`，
+  点位流是 `status:settled`）。
+- **加一条流要同步三处提示文案，最好直接改成从代码取**：`sim.sh` 的"怎么找日志"、
+  `cli.py` 的 `--interval` 帮助、`livesim.DEFAULT_INTERVAL_SECONDS` 注释里都写过
+  "4 条流 / 单条流 4s 一行"。硬编码的话加流之后提示就在骗人（会让用户去订阅一个
+  已不存在的模块）。改成 `len(livesim.TARGETS)` / `' / '.join(t.module for t in TARGETS)`
+  自动跟着变。
 - CLI 要有 `stream` / `stream-status` / `stream-stop`，并**真的在** `scripts/sim.sh` 里启动
   （只写进 banner 提示不算 —— 实测早期版本曾经只在提示里提到日志源，没有启动块），
   另外接进 `sim.sh stop` / `sim.sh status` 的分支，否则每次验证都要手动起进程。
@@ -301,16 +312,90 @@ agent_created: true
   `Connected (version 2.0...)`；用 `_quiet_third_party_logs()` 把 `paramiko` / `tracelens`
   压到 WARNING，否则进度输出全被冲散。
 
+### 13. 给**某个子系统单独定制日志内容**（组件专属程序 + 专属实时流）
+
+典型诉求：「加一个组件 `wsp`，它的日志就是固定的 `move absolute { x:0.003, y:0.999 }` 点位行，
+而且要能实时打印」。默认情况下所有 fm 模块共用**同一套** `loggen._DEBUG_PROGRAM`
+（通用扫片调用链），所以"新加一个子系统"只会多出一份**一模一样的扫片日志** ——
+用户点开 `wsp.log` 看到的内容跟他期待的毫不相干。必须动三层：
+
+1. **登记子系统**：`fleet.SUBSYSTEM_MODULES["wsp"] = ("wsp",)`。
+   名字只许字母数字、不能有下划线（后端 `_is_discovery_catalog_name_allowed`），
+   否则永远发现不了。这一步会自动带来：批量日志树（`loggen.plan_machine`）、
+   executor 树（对每个子系统都生成，同一组件在调试/执行器两个视图里内容一致，
+   这是想要的）、部署报告里"子系统"一行、后端 catalog 里的新条目。
+2. **换掉内容程序**：`loggen.SUBSYSTEM_PROGRAMS["wsp"] = _WSP_PROGRAM`，
+   取用口径统一走 `loggen.program_for(subsystem)`。`debug_line` 与 `executor_line`
+   都只调这一个函数 —— 各写一份判断就会出现"调试视图有内容、执行器视图没有"。
+3. **加一条实时流**：`livesim.TARGETS` 加 `StreamTarget("wsp", "upper", "wsp", "wsp", "motion")`，
+   剧本行插进 `_ROUND_ROWS`，并把 key 加进 `livesim.OBSERVER_KEYS`（见第 8 节）。
+
+**「固定格式」的正确做法是让生成与校验共用一份定义。**
+`loggen` 里放三件套：`move_point()` 负责拼、`MOVE_POINT_PATTERN` 负责校、
+`WSP_MOVE_POINTS` 是点位表；`point_body(name)` 按表取一行。改格式时不可能只改一边。
+
+必踩的几个坑：
+
+- ⚠️ **正文里的 `{ … }` 必须转义成 `{{ … }}`**。剧本是要过 `str.format` 的
+  （`{trace}` / `{elapsed}` 占位符），裸花括号会被当占位符解析并抛
+  `KeyError` / `ValueError`。所以 `move_point()` 返回的是**已转义**的片段，
+  另配 `body_text()` 反解出"最终写进日志的样子"给校验用。
+  症状：不报错但写出来的是 `move absolute {{ x:0.003 }}`（双花括号）。
+  **只有落盘层校验能抓到** —— 剧本层看模板是"对"的。
+- **批次程序也可能用到 `{trace}`**：`_program_values()` 原来只有
+  `wafer/lot/software/elapsed`，加了带 `trace={trace}` 的点位异常行就会
+  `KeyError: 'trace'`。批次也要有自己的追踪号（形状与实时源一致：`TR-0001-ABCD`）。
+- **"第几轮"要按本程序长度算**：`_program_values` 的 `round_index = seq // length`
+  必须传**当前子系统的程序长度**；用通用程序的长度去除，短程序会每隔几行就跳一个批次号。
+- **`ERROR_STEP_INDEX` 是通用程序的索引**。ATLog 失败用例夹具要"把 ERROR 钉到故障时刻"，
+  引用子系统专属程序时必须调 `loggen.error_step_index(subsystem)`，
+  否则钉出来的是一条正常行，夹具失去样本。
+- **自检的遍历集合要用 `loggen.ALL_PROGRAMS`**，不要只写 `_DEBUG_PROGRAM`
+  （本次真实踩到：wsp 程序一开始压根没进"调用链 / 关键字模板 / 全英文"三项校验，
+  全绿是假的）。同理 `check_find`、`check_backend_catalog` 这类按
+  `fleet.all_modules()` 动态取的地方会自动跟上，不用改。
+- **`run_all()` 里每条检查都要包 try/except**：一个 `NameError`（本人踩到）
+  会把后面一百多条断言全部吞掉，只留一个栈 —— 看起来像"自检挂了"，
+  实际只是某一项写错。
+
+新增子系统的自检清单（本组件已落在 `check_wsp_move_points()`）：
+
+- 剧本层全格式 + **点位表全覆盖**（8 个点位一个不少）；
+- 落盘层扫「当前段 + 最新归档」，逐行 `fullmatch`（抓双花括号这类转义错）；
+- 挂载层：子系统 / 实时流 / 专属程序三样都在；
+- 真实查询路径：`awk` 窗口过滤在 wsp 上也要命中（服务端"搜索"走的就是这条）。
+
 ## 验证顺序
 
 ```bash
 cd backend && .venv/bin/python -m simremote.cli init          # 生成（会同时重建报告站夹具）
 .venv/bin/python -m simremote.cli stream --interval 1         # 实时日志源（改动后必须重启）
-.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 109/109）
-# 实时内容相关的断言需要日志源已跑满一整轮（76 行剧本 ≈ 76s @1s/行），刚重启时会报「跳过」
+.venv/bin/python -m simremote.cli selftest                     # 必须全绿（当前 124/124）
+# 实时内容相关的断言需要日志源已跑满一整轮（114 行剧本 ≈ 114s @1s/行），刚重启时会报「跳过」
 # 注意 selftest 只覆盖后端直连路径，还要过一遍真实 HTTP：
 curl -s -X POST http://127.0.0.1:8000/api/atlog-analysis/analyze-report/ \
   -H 'Content-Type: application/json' -d '{"url":"..."}'
+```
+
+新增/改动了**某个子系统的日志内容**时，除上面三步外还要各探一次：
+
+```bash
+# 1) 后端真的发现了它（子系统数 +1、模块数 +1）
+cd backend && .venv/bin/python -c "
+import os,django,sys; sys.path.insert(0,'.')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+from apps.environments.models import Environment
+from apps.logsources.services.remote_logs import scan_environment_logs
+env = Environment.objects.filter(upper_machine__host__isnull=False).first()
+r = scan_environment_logs(env, refresh=True)
+print(r['subsystems'])
+"
+# ⚠️ 别用 GET /api/environments/<id>/discover/ 判据 —— 它没有任务上下文时
+#    subsystems 返回空数组，看着像"没发现"，其实 catalog 是好的。
+
+# 2) 真实 SSH tail 能推它的新行（首行约 18s：远端 tail 走管道全缓冲，
+#    要攒够字节才 flush；别以为是没反应）
+#    前端「日志定位」页选 环境 = SIM-EUV-01 → 子系统/模块 = wsp → 3 小时 → 搜索
 ```
 
 与之配套的脚本入口（`scripts/sim.sh`）：
@@ -331,11 +416,12 @@ scripts/sim.sh deploy [--no-seed]       # 跑一遍部署（互信 + 分步日�
 ⚠️ 顺序必须是 **停 `stream` → `init` → `seed` → 起 `stream`**：不停流的话，旧进程会在
 `init` 重建文件之后**继续往新文件里追加旧格式的行**（实测残留 10~12 行旧语言）。
 
-⚠️ **`--interval` 是「每行间隔」，而剧本是 4 条流交错的一条扁平序列**，
-每 tick 只落一行 ⇒ 被观察的那条流实际 `4 × interval` 才走一行。
-`--interval 1` = 4 条流合计 1 行/秒、单条流约 4s 一行；
-要让自己盯的那条流 1 秒一行就给 `--interval 0.25`。改这个值记得同步
-`sim.sh` 的 `c_start_stream` 与 `selftest` 里那条 tail 等待窗口。
+⚠️ **`--interval` 是「每行间隔」，而剧本是 5 条流交错的一条扁平序列**，
+每 tick 只落一行 ⇒ 被观察的那条流实际 `5 × interval` 才走一行。
+`--interval 1` = 5 条流合计 1 行/秒、单条流约 5s 一行；
+要让自己盯的那条流 1 秒一行就给 `--interval 0.2`。改这个值记得同步
+`sim.sh` 的 `c_start_stream` 与 `selftest.LIVE_TAIL_WINDOW_SECONDS`。
+（`sim.sh` 的"怎么找日志"提示已经从代码里取流清单了，不用手改。）
 
 前端用 agent-browser 走一遍（`type` 会吞点号，用 `eval` + 原生 setter 写受控输入）。
 整页 reload 会静默复位页内开关（例如「实时监听」），现象像"开关自己关了"，别误判成 bug。

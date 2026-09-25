@@ -37,6 +37,30 @@
     是 PROTECT，旧环境不退绑旧机器就永远删不掉 → 前端出现两条同名 SIM-EUV-01、其一恒 error。
   - executor 树目录名跟随 `lower.host`（`elog/<IP>/<子系统>/`）；改地址后内容一样时
     用一次 `os.replace` **改名**旧目录，别指望 `prune_tree`（40 文件/轮）跑完。
+- **子系统清单**：`fleet.SUBSYSTEM_MODULES` = `spwsp` / **`wsp`** / `mecore` / `cpfr` / `sil` /
+  `hmi` / `swlib`（共 15 个 fm 模块）。目录名**只许字母数字、不能有下划线**，否则后端
+  `_is_discovery_catalog_name_allowed` 直接忽略。加子系统会自动带来批量日志树、executor 树、
+  部署报告的子系统行、后端 catalog 条目（`check_find` / `check_backend_catalog` 都按
+  `fleet.all_modules()` 动态取，不用改）。
+
+## 组件专属日志内容与 `wsp` 点位组件（2026-09-25 新增）
+- `wsp` = 工件台点位子系统，日志正文是**固定的绝对移动点位**：
+  `move absolute { x:0.003, y:0.999, z:0.000, rz:0.0021, speed:120.0, mode:absolute, point:load_position, status:settled }`
+- 默认所有 fm 模块共用**同一套** `loggen._DEBUG_PROGRAM`（通用扫片调用链）。要给某个子系统
+  换内容，登记 `loggen.SUBSYSTEM_PROGRAMS[<子系统>] = <程序>`，取用一律走
+  `loggen.program_for(subsystem)`（`debug_line` / `executor_line` 都只调它）。
+- **生成与校验共用一份定义**：`loggen.WSP_MOVE_POINTS`（点位表）+ `move_point()`（拼）+
+  `MOVE_POINT_PATTERN`（正则）+ `point_body(name)`。改格式时不可能只改一边。
+- 🔴 **正文里的 `{ … }` 必须转义成 `{{ … }}`**：剧本要过 `str.format`（有 `{trace}` / `{elapsed}`）。
+  裸花括号 → `KeyError`（报错位置很误导）；少转义一个 → 写出 `move absolute {{ x:0.003 }}` 且
+  **不报错**。所以 `move_point()` 返回已转义片段，`body_text()` 反解给校验用；
+  **只有「落盘层」校验能抓到双花括号**，剧本层看模板永远是对的。
+- `_program_values(moment, seq, function, length)`：`length` 必须是**当前子系统程序**的长度
+  （短程序用通用长度算"第几轮"会导致批次号每隔几行就跳）；并且要提供 `trace`（批次也有追踪号）。
+- `loggen.error_step_index(subsystem)`：ATLog 夹具钉 ERROR 行时要按**该系统自己的程序**取索引，
+  用通用程序的 `ERROR_STEP_INDEX` 会钉出一条正常行。
+- `loggen.ALL_PROGRAMS` 是"校验遍历集合"：调用链 / 关键字模板 / 全英文三项都要遍历它，
+  只遍历 `_DEBUG_PROGRAM` 会让专属程序**完全没被校验**（踩过，全绿是假的）。
 
 ## 自动化模拟部署与上下位机互信（2026-09-25 新增）
 - 入口：`scripts/sim.sh deploy [--no-seed]`（= `cd backend && .venv/bin/python -m simremote.cli deploy`）。
@@ -116,13 +140,25 @@
 - **约定：入口/出口行固定 INFO，异常级别只落在正文行** —— 别写 `[X] <() leave status=ok` 配 FATAL。
 - 线程号必须**按模块固定**（不能用 `seq % N` 逐行变），否则前端认不出同一条执行泳道，
   折叠与「×N 聚合」全部失效（`sameExecutionLane` 比 component/process/thread）。
+  `loggen` 里派生值一律用 `zlib.crc32`，**不要用内置 `hash()`** —— `hash()` 每进程带随机种子，
+  重新生成一次日志线程号就变，历史段与实时段会被当成两条泳道。
 - `rpc` 字段保持 `文件:函数:行` 形状，行号用 `loggen.source_line(函数名)` 固定。
 - 每个函数固定 mode（`loggen.call_mode`）：折叠聚合要求一次调用的入口/出口 mode 一致。
 
 ## 实时日志链路（前端）踩过的坑
 - 「实时监听」一次只盯**一个**模块（`fm_targets.length !== 1` 就拒绝）。所以被观察的那条流
-  自己必须凑齐「≥3 类异常 + 1 类正常」，否则单模块视图里只有 1 类异常。livesim 的 spwsp 因此
-  自带 WARN/ERROR/FATAL 三级升级。
+  自己必须凑齐「≥3 类异常 + 1 类正常」，否则单模块视图里只有 1 类异常。
+  **这份清单登记在 `livesim.OBSERVER_KEYS`**（当前 = `spwsp` / `wsp`）：
+  livesim 有 5 条流（`spwsp` / `wsp` / `encoder` / `coolant` / `interlock`），
+  但只有会被用户单独订阅的那些才需要自带完整异常谱（spwsp 走 WARN/ERROR/FATAL 三级升级，
+  wsp 自带 `ERR_WSP_POSITION_DEVIATION` → `ERR_WSP_SETTLE_TIMEOUT` → `ERR_WSP_SOFT_LIMIT_PROXIMITY`）。
+  正常节拍的判据是 `livesim.NORMAL_BEAT_MARKERS`（扫片流是 `position error within tolerance`，
+  点位流是 `status:settled`）。selftest 挨个查并各开一条保活 tail 探真链路。
+- **首行延迟是固有的，不是模拟器卡住**：远端 `tail -F` 的 stdout 是管道（全缓冲），
+  要攒够字节才 flush。实测订阅 wsp 后**首行约 18s** 才出现。自检窗口
+  `selftest.LIVE_TAIL_WINDOW_SECONDS = 100`。
+- 剧本是 5 条流交错的**一条扁平序列**，每 tick 只落一行 ⇒ 单条流约 `5 × interval` 才走一行；
+  想让盯住的那条流 1 秒一行就给 `--interval 0.2`。
 - 开启实时监听要求已有一个 `status==='ready'` 且带 `remoteEnvironmentId` + `remoteRequest` 的任务；
   只选环境/组件不加开关会得到 0 源。另外**整页 reload 会静默把 `liveListening` 复位**，
   看起来像"开关自己关了"，其实是页面重载。

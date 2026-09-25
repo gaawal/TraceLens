@@ -282,6 +282,26 @@ def check_awk_window(client: paramiko.SSHClient) -> None:
         f"{len(out.splitlines())} 行（当前段 spwsp.log + 最新归档）",
     )
 
+    # wsp 是新组件，正文还是"固定点位"格式 —— 单独过一遍**完全相同的查询路径**：
+    # 窗口里既要有行，而且这些行得真的能被解析成移动点位。只验证 spwsp 不够，
+    # 因为"前端能不能搜到 wsp"是用户会第一步就去做的事。
+    wsp_current = f"{fleet.UPPER.debug_root}/wsp/wsp.log"
+    command = (
+        "{ f=$(ls -1t "
+        f"{fleet.UPPER.debug_root}/wsp/wsp_*.log 2>/dev/null | head -1); "
+        f'[ -n "$f" ] && cat -- "$f"; cat -- {wsp_current}; }} | '
+        f"LC_ALL=C awk -v s='{window_start}' -v e='{end}' "
+        """'{ if (substr($0,1,1) != "[") next; ts=substr($0,2,19); if (ts < s) next; if (ts > e) exit; print $0 }'"""
+    )
+    out, _err, code = _exec(client, command)
+    wsp_rows = [item for item in out.decode("utf-8", "replace").splitlines() if item.strip()]
+    wsp_points = [item for item in wsp_rows if "move absolute" in item]
+    _record(
+        "awk 窗口过滤：最近 30 分钟命中 wsp 点位行",
+        code == 0 and len(wsp_points) >= 3,
+        f"{len(wsp_rows)} 行（其中点位行 {len(wsp_points)} 行，当前段 wsp.log + 最新归档）",
+    )
+
 
 def check_version_file(client: paramiko.SSHClient) -> None:
     out, err, code = _exec(client, "cat -- /home/tracepilot/SW/version")

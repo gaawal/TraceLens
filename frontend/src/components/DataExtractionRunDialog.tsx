@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Activity, CheckCircle2, Database, Download, Eye, LoaderCircle, Merge, Plus, Radio, Square, X } from 'lucide-react';
+import type { LiveCaptureProgress } from '../services/liveCaptureProgress';
 import type { DataExtractionRule, ExtractedDataRow } from '../rendering/dataExtractionRules';
 import type { ExtractionProgress } from '../rendering/dataExtractionRuntime';
 import { mergeTemporaryRuleData } from '../rendering/extractedDataStore';
@@ -48,6 +49,19 @@ interface Props {
    * 用户只能靠猜自己到底加没加上。
    */
   liveCaptureIds?: Set<string>;
+  /**
+   * 实时采集的进度。实时监听开着时，每个采集项都显示已采条数；
+   * 这就是「统一的进度展示」—— 和一次批量采集共用同一块进度区域。
+   */
+  liveProgress?: LiveCaptureProgress;
+  /** 实时监听是否开着；决定这块进度是在实时计数还是在跑批量采集。 */
+  liveActive?: boolean;
+  /**
+   * 当前有没有可做批量采集的已解析日志。
+   * 实时监听期间没有 —— 但**实时采集照常可用**，所以这里只禁用批量那一个按钮，
+   * 而不是像以前那样把整个弹窗变成「当前没有可提取的已解析日志」。
+   */
+  batchAvailable?: boolean;
 }
 
 export function DataExtractionRunDialog(props: Props) {
@@ -114,17 +128,34 @@ export function DataExtractionRunDialog(props: Props) {
   <div className="data-extraction-dialog-backdrop" role="presentation" onMouseDown={() => props.phase === 'running' ? undefined : props.onClose()}>
     <section className="data-extraction-dialog" role="dialog" aria-modal="true" aria-label="提取数据" onMouseDown={(event) => event.stopPropagation()}>
       <header>
-        <div><span className="eyebrow">DATA EXTRACTION</span><h2>提取数据</h2><p>数据只在当前浏览器内存中生成；后端仅记录本次提取过程，不保存实际数据。</p></div>
+        <div>
+          <span className="eyebrow">DATA COLLECTION</span>
+          <h2>数据采集</h2>
+          <p>
+            {props.liveActive
+              ? '实时监听进行中：采集项与实时进度一起展示，实时采集在后台持续写入。'
+              : '选择要对当前日志采集的数据项；打开右侧开关的采集项会在实时监听时持续采集。'}
+          </p>
+        </div>
         {props.phase !== 'running' && <button className="icon-button" onClick={props.onClose}><X size={18}/></button>}
       </header>
 
       <div className="data-extraction-dialog-body">
         {props.phase === 'select' && <>
           {!props.candidates.length ? <div className="data-extraction-empty"><Database size={30}/><strong>暂无可用的数据采集能力</strong><span>可以在“设置 → 日志规则 → 数据提取”中新增或启用数据提取器。</span></div> : <>
-            <div className="data-extraction-select-head"><strong>已有 {props.candidates.length} 项数据采集能力</strong><span>勾选本次要提取的数据；需要长期盯着的，用右侧「加入实时采集」放进实时采集清单。</span></div>
+            <div className="data-extraction-select-head">
+              <strong>已有 {props.candidates.length} 项数据采集能力</strong>
+              <span>
+                {props.liveActive
+                  ? '实时监听进行中：右侧开关决定这一项要不要边跑边采，进度条就是它当前采到的条数。'
+                  : '勾选本次要从当前日志采集的数据；想让某一项在实时监听时持续采，打开右侧开关。'}
+              </span>
+            </div>
             <div className="data-extraction-rule-options">
               {props.candidates.map(({ rule }) => {
                 const inLiveCapture = props.liveCaptureIds ? props.liveCaptureIds.has(rule.id) : rule.liveCapture === true;
+                const liveCount = props.liveProgress?.counts[rule.id] || 0;
+                const progressTarget = Number((rule as unknown as { liveTargetRows?: number }).liveTargetRows || 0);
                 return <div key={rule.id} className={`data-extraction-rule-option ${props.selectedIds.has(rule.id) ? 'selected' : ''}`}>
                 <label>
                   <input type="checkbox" checked={props.selectedIds.has(rule.id)} onChange={() => props.onToggle(rule.id)}/>
@@ -138,6 +169,15 @@ export function DataExtractionRunDialog(props: Props) {
                   <b>{rule.outputFormat === 'text' ? 'TXT' : 'CSV'}</b>
                   <small className="data-extraction-rule-scope">{rule.modules.length ? rule.modules.join(' / ') : '通用'}</small>
                 </label>
+                {/* 实时进度直接长在采集项上：不用再去别处对「这一项采到多少」。 */}
+                {inLiveCapture && props.liveProgress && (
+                  <span className="data-extraction-rule-progress" title={`已采集 ${liveCount} 条`}>
+                    <span className="data-extraction-rule-progress-track" aria-hidden="true">
+                      <i className={progressTarget ? '' : 'is-live'} style={progressTarget ? { width: `${Math.min(100, Math.round((liveCount / progressTarget) * 100))}%` } : undefined} />
+                    </span>
+                    <em>{liveCount}{progressTarget ? ` / ${progressTarget}` : ''} 条</em>
+                  </span>
+                )}
                 {props.onSetLiveCapture && <button
                   type="button"
                   className={`data-live-capture-add ${inLiveCapture ? 'on' : ''}`}
@@ -154,6 +194,25 @@ export function DataExtractionRunDialog(props: Props) {
             {liveMessage && <div className="data-live-capture-note">{liveMessage}</div>}
           </>}
         </>}
+
+        {props.phase === 'select' && props.liveActive && (props.liveCaptureIds?.size || 0) > 0 && (
+          <div className="data-extraction-live-summary">
+            <div className="data-extraction-live-summary-head">
+              <Radio size={13} />
+              <strong>实时采集进度</strong>
+              <span>
+                共采到 {Object.entries(props.liveProgress?.counts || {})
+                  .filter(([id]) => props.liveCaptureIds?.has(id))
+                  .reduce((total, [, value]) => total + value, 0)} 条
+                {props.liveProgress && props.liveProgress.hits > 0 ? ` · 命中 ${props.liveProgress.hits} 条日志` : ''}
+                {props.liveProgress && !props.liveProgress.connected ? ' · 通道未连接（服务端仍在采集）' : ''}
+              </span>
+            </div>
+            <p className="data-extraction-live-summary-hint">
+              实时采集在后台持续写入；结果请到「数据提取」页查看、绘图和下载。关闭实时监听会清空这一轮采集项。
+            </p>
+          </div>
+        )}
 
         {props.phase === 'running' && <>
           <div className="data-extraction-progress-card">
@@ -192,7 +251,14 @@ export function DataExtractionRunDialog(props: Props) {
       </div>
 
       <footer>
-        {props.phase === 'select' && <>{props.onSetLiveCapture && <button className="button secondary" disabled={props.selectedIds.size === 0 || Boolean(liveBusyId)} onClick={() => void setLiveCapture([...props.selectedIds], true)} title="把勾选的提取器一次性加入实时采集清单"><Radio size={14}/> 添加实时采集</button>}<span className="data-extraction-footer-spacer"/><button className="button ghost" onClick={props.onClose}>取消</button>{props.liveListening && <button className="button secondary" disabled={props.selectedIds.size === 0} onClick={props.onStartLiveExtraction}>实时提取</button>}<button className="button primary" disabled={!props.candidates.length || props.selectedIds.size === 0} onClick={props.onStart}>开始提取</button></>}
+        {props.phase === 'select' && <>{props.onSetLiveCapture && <button className="button secondary" disabled={props.selectedIds.size === 0 || Boolean(liveBusyId)} onClick={() => void setLiveCapture([...props.selectedIds], true)} title="把勾选的提取器一次性加入实时采集清单"><Radio size={14}/> 添加实时采集</button>}<span className="data-extraction-footer-spacer"/><button className="button ghost" onClick={props.onClose}>关闭</button><button
+                className="button primary"
+                disabled={!props.candidates.length || props.selectedIds.size === 0 || props.batchAvailable === false}
+                onClick={props.onStart}
+                title={props.batchAvailable === false
+                  ? '当前没有可批量采集的已解析日志（实时监听期间请用右侧开关做实时采集）'
+                  : '对当前日志批量采集选中的项'}
+              >开始采集（当前日志）</button></>}
         {props.phase === 'running' && <button className="button danger" onClick={props.onCancel}><Square size={14}/> 停止提取</button>}
         {(props.phase === 'done' || props.phase === 'error') && <><button className="button secondary" onClick={props.onClose}>关闭</button>{props.recordSaved && <button className="button primary" onClick={props.onOpenData}>进入数据</button>}</>}
       </footer>

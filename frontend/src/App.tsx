@@ -66,7 +66,8 @@ import { ToolCenterPage } from './components/ToolCenterPage';
 import { createTracePilotActionRegistry } from './assistant/actionRegistry';
 import { afterPaint, type UiReceipt } from './assistant/workstation';
 import { saveTracePilotAgentContext } from './assistant/agentContext';
-import { publishLiveCaptureCount, setLiveMonitoring } from './services/liveMonitoring';
+import { setLiveMonitoring } from './services/liveMonitoring';
+import { useLiveCaptureProgress } from './services/liveCaptureProgress';
 import { EventRestoreDialog } from './components/EventRestoreDialog';
 import { AtLogAnalysisPage } from './components/AtLogAnalysisPage';
 import { APP_VERSION } from './appConfig';
@@ -3956,6 +3957,8 @@ export default function App() {
     error?: string;
     recordId?: number;
     recordSaved?: boolean;
+    /** 当前有没有可做批量提取的已解析日志（实时监听期间没有，但实时采集仍可用）。 */
+    batchAvailable?: boolean;
   }>({ open: false, phase: 'select', candidates: [], selectedIds: new Set() });
   const dataExtractionAbortRef = useRef<AbortController>();
   const pendingAiExtractionRef = useRef<Record<string, unknown>>();
@@ -6123,6 +6126,7 @@ export default function App() {
         liveBoundTaskIdRef.current = undefined;
         setLiveMessage('');
         setLiveListening(false);
+        clearLiveCaptureItems();
         return { detail: '已停止实时采集' };
       },
       /**
@@ -6495,10 +6499,35 @@ export default function App() {
     [dataExtractionRules],
   );
 
-  /** 把实时采集清单的长度广播给采集进度框：它是那个面板显示与否的唯一依据。 */
-  useEffect(() => {
-    publishLiveCaptureCount(liveCaptureRuleIds.size);
-  }, [liveCaptureRuleIds]);
+  const liveCaptureRules = useMemo(
+    () => dataExtractionRules.filter((rule) => liveCaptureRuleIds.has(rule.id)),
+    [dataExtractionRules, liveCaptureRuleIds],
+  );
+  /**
+   * 实时采集进度 —— 弹窗里的进度条和工具栏的转圈图标读同一份，不各数一遍。
+   * 关闭实时监听时这个 hook 自己会把计数清空。
+   */
+  const liveCaptureProgress = useLiveCaptureProgress({
+    enabled: liveListening,
+    environmentId: activeTask?.remoteEnvironmentId,
+    rules: liveCaptureRules,
+  });
+  /** 正在采集：批量采集跑着，或者实时监听开着且确实有采集项。 */
+  const collecting = dataExtractionDialog.phase === 'running'
+    || (liveListening && liveCaptureRuleIds.size > 0);
+
+  /**
+   * 关掉实时监听时清空这一轮的采集项。
+   *
+   * 只在**用户主动关闭**（工具栏开关、助手停止采集）时调用，不监听 liveListening 的状态变化：
+   * 开始监听的过程本身会让 liveListening 短暂地真→假→真（任务切换），
+   * 用状态变化触发会把用户刚勾好的采集项悄悄抹掉 —— 实测踩过。
+   */
+  function clearLiveCaptureItems() {
+    setDataExtractionRules((current) => current.some((rule) => rule.liveCapture)
+      ? current.map((rule) => rule.liveCapture ? { ...rule, liveCapture: false, updatedAt: Date.now() } : rule)
+      : current);
+  }
 
   /**
    * 数据提取弹窗里的「加入实时采集」：直接写回提取器上的 liveCapture。
@@ -6514,17 +6543,18 @@ export default function App() {
   }
 
   function beginDataExtraction() {
-    if (!activeTask || activeTask.status !== 'ready' || !activeTask.entries.length) {
-      setDataExtractionDialog({ open: true, phase: 'select', candidates: [], selectedIds: new Set(), error: '当前没有可提取的已解析日志。' });
-      return;
-    }
     const enabledRules = dataExtractionRules.filter((rule) => rule.enabled);
+    // 实时监听期间当前任务没有已解析日志，但**实时采集照样要能配置**：
+    // 采集项的列表来自提取器本身，不依赖当前有没有日志。
+    // （之前这里直接返回「当前没有可提取的已解析日志」，于是开了实时监听就一条采集项都看不到。）
+    const hasBatchSource = Boolean(activeTask && activeTask.status === 'ready' && activeTask.entries.length);
     setDataExtractionDialog({
       open: true,
       phase: 'select',
       candidates: enabledRules.map((rule) => ({ rule })),
       selectedIds: new Set(),
-      error: undefined,
+      batchAvailable: hasBatchSource,
+      error: enabledRules.length ? undefined : '还没有启用的数据提取器；先到「设置 → 日志规则 → 数据提取」新建一个。',
       progress: undefined,
       results: undefined,
       recordId: undefined,
@@ -8204,6 +8234,8 @@ export default function App() {
                 liveBoundTaskIdRef.current = undefined;
                 setLiveMessage('');
                 setLiveListening(false);
+                // 实时日志开关关掉 → 彻底清除刚才实时采集的项。
+                clearLiveCaptureItems();
               }}
             />
             <SwitchControl
@@ -8280,11 +8312,11 @@ export default function App() {
                     加进去之后采集进度框会自己浮出来（纯按清单内容决定，不再单独一个按钮）。 */}
                 <button
                   type="button"
-                  className={`button ghost compact-button toolbar-icon-button ${liveListening ? 'active' : ''}`}
+                  className={`button ghost compact-button toolbar-icon-button ${collecting ? 'active' : ''}`}
                   onClick={() => void beginDataExtraction()}
-                  title="数据采集：勾选要提取的数据、把提取器加入实时采集"
+                  title={collecting ? '数据采集中（图标转圈即表示正在采集）· 点开查看每项进度' : '数据采集：勾选要对当前日志采集的数据项'}
                 >
-                  <Database size={14} /> 数据采集
+                  {collecting ? <LoaderCircle className="spin" size={14} /> : <Database size={14} />} 数据采集
                 </button>
                 {/* 案例录入与相似案例匹配合成一个窗口的两个标签页：同一条工作流的进出两端，
                     分成两个按钮只会让用户先猜哪个是自己要的。 */}
@@ -8600,6 +8632,9 @@ export default function App() {
           onStartLiveExtraction={() => { void startSelectedDataExtraction(); }}
           onSetLiveCapture={(ruleIds, enabled) => setLiveCaptureForRules(ruleIds, enabled)}
           liveCaptureIds={liveCaptureRuleIds}
+          liveProgress={liveCaptureProgress}
+          liveActive={liveListening}
+          batchAvailable={dataExtractionDialog.batchAvailable}
           onToggle={(id) => setDataExtractionDialog((current) => { const next = new Set(current.selectedIds); next.has(id) ? next.delete(id) : next.add(id); return { ...current, selectedIds: next }; })}
           onStart={() => void startSelectedDataExtraction()}
           onCancel={() => dataExtractionAbortRef.current?.abort()}

@@ -7361,14 +7361,16 @@ body { font-size: 14px; }
 
 .data-extraction-dialog-backdrop,
 .data-preview-backdrop { position: fixed; inset: 0; z-index: 1800; display: grid; place-items: center; padding: 24px; background: rgba(20, 34, 45, .44); backdrop-filter: blur(2px); }
-.data-extraction-dialog { width: min(820px, 94vw); max-height: 88vh; display: flex; flex-direction: column; border: 1px solid #d9e2e9; border-radius: 13px; background: #fff; box-shadow: 0 28px 80px rgba(20, 48, 66, .24); overflow: hidden; }
+/* 现在这个弹窗要同时装下「采集项 + 每项实时进度 + 批量进度 + 结果」，
+   820px 宽会把采集项挤成一行一条、进度条没地方放，所以整体放大。 */
+.data-extraction-dialog { width: min(1120px, 94vw); max-height: 90vh; display: flex; flex-direction: column; border: 1px solid #d9e2e9; border-radius: 13px; background: #fff; box-shadow: 0 28px 80px rgba(20, 48, 66, .24); overflow: hidden; }
 .data-extraction-dialog > header,
 .data-preview-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 17px 20px 14px; border-bottom: 1px solid #e6ebef; background: #fbfcfd; }
 .data-extraction-dialog h2,
 .data-preview-dialog h2 { margin: 3px 0 4px; font-size: 20px; }
 .data-extraction-dialog header p,
 .data-preview-dialog header p { margin: 0; color: #70808d; font-size: 13px; }
-.data-extraction-dialog-body { min-height: 170px; padding: 14px 16px; overflow: auto; }
+.data-extraction-dialog-body { min-height: 260px; padding: 16px 18px; overflow: auto; }
 .data-extraction-dialog > footer,
 .data-preview-dialog > footer { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 12px 20px; border-top: 1px solid #e6ebef; background: #fbfcfd; }
 .data-extraction-state,
@@ -17317,3 +17319,39 @@ html.workstation-docked {
   flex: none; padding: 6px 12px; border-top: 1px solid #edf1f6; background: #fbfcfe;
   font-size: 11px; color: #93a3b2;
 }
+
+/* ---- 数据采集弹窗：采集项 + 统一进度（实时计数 / 批量采集共用一块进度区） ---- */
+.data-extraction-rule-option {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+.data-extraction-rule-progress {
+  flex: none; display: inline-flex; align-items: center; gap: 7px;
+  min-width: 132px;
+}
+.data-extraction-rule-progress-track {
+  flex: 1 1 auto; height: 6px; min-width: 66px;
+  border-radius: 99px; background: #e6edf4; overflow: hidden;
+}
+.data-extraction-rule-progress-track > i {
+  display: block; height: 100%; border-radius: inherit;
+  background: linear-gradient(90deg, #4fa5d4, #2578ac);
+}
+/* 没有目标条数时用一条流动的条表示「持续采集中」，而不是假装有进度。 */
+.data-extraction-rule-progress-track > i.is-live { width: 36%; animation: data-capture-flow 1.4s ease-in-out infinite alternate; }
+@keyframes data-capture-flow { from { transform: translateX(-10%); } to { transform: translateX(180%); } }
+@media (prefers-reduced-motion: reduce) {
+  .data-extraction-rule-progress-track > i.is-live { animation: none; width: 100%; opacity: .5; }
+}
+.data-extraction-rule-progress em {
+  flex: none; font-style: normal; font-size: 11px; color: #2b6c96;
+  font-variant-numeric: tabular-nums; min-width: 54px; text-align: right;
+}
+
+.data-extraction-live-summary {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid #cfe6d9; border-radius: 9px; background: #f6fcf9;
+}
+.data-extraction-live-summary-head { display: flex; align-items: center; gap: 7px; color: #1f7a52; }
+.data-extraction-live-summary-head strong { font-size: 12.5px; }
+.data-extraction-live-summary-head span { font-size: 11.5px; color: #4b8a6c; }
+.data-extraction-live-summary-hint { margin: 6px 0 0; font-size: 11.5px; color: #6c8b7b; line-height: 1.5; }
