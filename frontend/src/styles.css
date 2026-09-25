@@ -17367,3 +17367,9 @@ html.workstation-docked {
   font-size: 10.5px; cursor: pointer;
 }
 .data-extraction-live-plot:hover { background: #eaf4fb; border-color: #a9c9e2; color: #1d5a80; }
+
+/* 数据采集弹窗：标题栏即拖拽手柄 */
+.data-extraction-dialog-dragbar { cursor: move; user-select: none; touch-action: none; }
+.data-extraction-dialog-dragbar button { cursor: pointer; }
+/* 拖过之后窗口是 fixed 定位，backdrop 的网格居中不再管它。 */
+.data-collection-backdrop .data-extraction-dialog[style*="position: fixed"] { max-height: 90vh; }

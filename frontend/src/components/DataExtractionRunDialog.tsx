@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, CheckCircle2, Database, Download, Eye, LoaderCircle, Merge, Plus, Radio, Square, X } from 'lucide-react';
 import type { LiveCaptureProgress } from '../services/liveCaptureProgress';
 import type { DataExtractionRule, ExtractedDataRow } from '../rendering/dataExtractionRules';
@@ -76,6 +76,47 @@ export function DataExtractionRunDialog(props: Props) {
   const [mergeSelectedIds, setMergeSelectedIds] = useState<Set<string>>(new Set());
   const [liveBusyId, setLiveBusyId] = useState('');
   /**
+   * 弹窗位置。未拖过时为 undefined —— 交给 CSS 默认摆放（右侧对齐），
+   * 拖过之后由这里接管，用户可以把它挪到不挡日志的地方。
+   */
+  const [dragPos, setDragPos] = useState<{ left: number; top: number }>();
+  const dragStateRef = useRef<{ pointerId: number; startX: number; startY: number; originLeft: number; originTop: number; width: number; height: number }>();
+
+  function beginDialogDrag(event: React.PointerEvent<HTMLElement>) {
+    // 头部里的按钮（关闭）照常点，不要顺手把窗口拖走。
+    if ((event.target as HTMLElement).closest('button, input, select, a, textarea')) return;
+    const dialog = event.currentTarget.closest('.data-extraction-dialog') as HTMLElement | null;
+    if (!dialog) return;
+    const rect = dialog.getBoundingClientRect();
+    dragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originLeft: rect.left,
+      originTop: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveDialog(event: React.PointerEvent<HTMLElement>) {
+    const state = dragStateRef.current;
+    if (!state || state.pointerId !== event.pointerId) return;
+    // 把**整个**窗口夹在视口内，而不是只留标题栏露头：
+    // 拖到只剩一条边的话，底部的「开始采集」就点不到了，用户还得先把它拖回来。
+    const maxLeft = Math.max(0, window.innerWidth - state.width);
+    const maxTop = Math.max(0, window.innerHeight - state.height);
+    setDragPos({
+      left: Math.min(maxLeft, Math.max(0, state.originLeft + event.clientX - state.startX)),
+      top: Math.min(maxTop, Math.max(0, state.originTop + event.clientY - state.startY)),
+    });
+  }
+
+  function endDialogDrag() {
+    dragStateRef.current = undefined;
+  }
+  /**
    * 正在实时绘图的采集项。
    *
    * 存的是 **id 而不是数据快照** —— 数据集每帧都从 props.liveProgress.rows 重新算，
@@ -141,8 +182,20 @@ export function DataExtractionRunDialog(props: Props) {
   return <>
   {/* 只有右上角的 X 会关闭；点背景不关，也不压暗/虚化 —— 后面的日志要看得到、点得到。 */}
   <div className="data-collection-backdrop" role="presentation">
-    <section className="data-extraction-dialog" role="dialog" aria-modal="true" aria-label="提取数据" onMouseDown={(event) => event.stopPropagation()}>
-      <header>
+    <section
+      className="data-extraction-dialog"
+      role="dialog"
+      aria-label="数据采集"
+      onMouseDown={(event) => event.stopPropagation()}
+      style={dragPos ? { position: 'fixed', left: dragPos.left, top: dragPos.top, margin: 0 } : undefined}
+    >
+      <header
+        className="data-extraction-dialog-dragbar"
+        onPointerDown={beginDialogDrag}
+        onPointerMove={moveDialog}
+        onPointerUp={endDialogDrag}
+        onPointerCancel={endDialogDrag}
+      >
         <div>
           <span className="eyebrow">DATA COLLECTION</span>
           <h2>数据采集</h2>

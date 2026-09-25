@@ -191,7 +191,10 @@ def _upsert_watch(
     # 消歧后缀取 id 的**尾段**：提取器 id 形如 `data-extractor-<uuid>`，
     # 取前 8 位永远是 `data-ext`，两个同名规则的「消歧」名字还是同一个，照样撞唯一约束
     # —— 这就是 sync-capture 报 500 的根因。
-    suffix = re.sub(r"[^0-9a-zA-Z]+", "", str(rule["id"]).rsplit("-", 1)[-1])[:8] or uuid4().hex[:8]
+    # 取 id 的**后 8 位**（而不是前 8 位）：提取器 id 都以 `data-extractor-` 开头，
+    # 前 8 位永远是 `data-ext`，两个同名规则的「消歧」名字还是同一个，照样撞唯一约束。
+    # 取尾段既唯一，又保留了「这个 watch 属于哪条规则」的可读线索（短 id 如 `sem-a` 原样保留）。
+    suffix = re.sub(r"[^0-9a-zA-Z-]+", "", str(rule["id"]))[-8:] or uuid4().hex[:8]
     name = base
     if existing is None and name in names_in_use:
         # (environment, name) is unique. Two rules can legitimately share a display name, and
