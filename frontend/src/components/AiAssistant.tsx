@@ -175,6 +175,18 @@ interface ComposerReference {
  */
 const TAKES_OVER_SCREEN_ACTIONS = new Set(['open_case_editor']);
 
+/**
+ * 托管动效的节奏。助手替用户操作页面时不应该“瞬间完成”：先把面板收成手机客户端
+ * 形态靠右停靠、整页亮起呼吸绿边，让用户看清“页面正在被托管”，再逐步执行操作，
+ * 每个动作之间留出让页面渲染 + 人眼跟上的间隔，最后停留一拍再还原原样式。
+ */
+const TAKEOVER_LEAD_IN_MS = 620;
+const TAKEOVER_STEP_MS = 300;
+const TAKEOVER_HOLD_MS = 520;
+const TAKEOVER_ANIM_MS = 700;
+
+const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
 const CONVERSATIONS_KEY = 'tracelens-ai-cockpit-conversations-v1';
 const ACTIVE_CONVERSATION_KEY = 'tracelens-ai-cockpit-active-v1';
 const LAYOUT_KEY = 'tracelens-ai-cockpit-layout-v2';
@@ -1363,6 +1375,8 @@ export function AiAssistant() {
   const [attachSelection, setAttachSelection] = useState<Record<string, unknown> | null>(null);
   const [traceOpen, setTraceOpen] = useState<Record<string, boolean>>({});
   const [takeover, setTakeover] = useState('');
+  // 托管动画类要比重启类早一拍加、晚一拍撤，两个方向都能平滑过渡。
+  const [takeoverAnim, setTakeoverAnim] = useState(false);
   const [layoutMode, setLayoutMode] = useState<AssistantLayoutMode>(loadLayoutMode);
   const [dockFits, setDockFits] = useState<boolean>(() => assistantDockIsAvailable());
   const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
@@ -1823,23 +1837,35 @@ export function AiAssistant() {
                 : '正在调控当前页面';
     // Actions that put a full dialog on screen take the user's attention with them. The panel
     // now floats above the modal layer (so it is reachable on every page), so leaving it open
-    // would cover the very window it just opened.
+    // would cover the very window it just opened. Every other action keeps the panel on screen
+    // in its narrow "phone" takeover form, so the user can watch the page being driven.
     const takesOverScreen = actions.some((action) => TAKES_OVER_SCREEN_ACTIONS.has(String(action.type || '')));
-    const restoreOpen = open && !takesOverScreen;
-    setOpen(false);
+    const restoreOpen = open && takesOverScreen;
+    if (restoreOpen) setOpen(false);
     setFocusTarget(focus);
+    setTakeoverAnim(true);
     setTakeover(label);
     const receipts = [];
+    let aborted = false;
     try {
+      // Let the panel finish sliding right and the page frame light up before anything moves.
+      await wait(TAKEOVER_LEAD_IN_MS);
       for (const action of actions) {
         signal?.throwIfAborted();
         receipts.push(await executeUiAction(action, signal));
         if (receipts[receipts.length - 1].status === 'failed') break;
+        await wait(TAKEOVER_STEP_MS);
       }
       return receipts[receipts.length - 1];
+    } catch (error) {
+      if ((error as { name?: string })?.name === 'AbortError') aborted = true;
+      throw error;
     } finally {
+      if (!aborted) await wait(TAKEOVER_HOLD_MS);
       setTakeover(''); setFocusTarget('');
       if (restoreOpen) setOpen(true);
+      // Keep the transition class one beat longer so the panel animates back instead of snapping.
+      window.setTimeout(() => setTakeoverAnim(false), TAKEOVER_ANIM_MS);
     }
   }
 
@@ -2070,6 +2096,7 @@ export function AiAssistant() {
     run.controller.abort();
     setTaskQueue([]);
     setTakeover('');
+    window.setTimeout(() => setTakeoverAnim(false), TAKEOVER_ANIM_MS);
     setFocusTarget('');
     activeRunRef.current = undefined;
     removeAgentTask(run.runId);
@@ -2612,8 +2639,12 @@ export function AiAssistant() {
   return (
     <>
       {takeover && (
-        <div className="ai-takeover-mask" aria-live="polite" style={{left:Math.max(8,Math.min(fabPosition.left-280,window.innerWidth-350)),top:Math.max(8,fabPosition.top-10)}}>
-          <div className="ai-takeover-status" aria-label="AI 接管"><AiAgentIcon className="ai-agent-icon" /><span>TracePilot 接管中</span><strong>{takeover}</strong></div>
+        <div className="ai-takeover-mask" aria-live="polite">
+          <div className="ai-takeover-status" aria-label="AI 接管">
+            <AiAgentIcon className="ai-agent-icon" />
+            <span className="ai-takeover-hint">页面正在被托管</span>
+            <strong>{takeover}</strong>
+          </div>
         </div>
       )}
 
@@ -2644,7 +2675,8 @@ export function AiAssistant() {
         } as CSSProperties;
         return (
         <aside
-          className={`ai-assistant-panel ai-cockpit-panel layout-${layoutMode} ${docked ? 'workstation-sidecar' : ''} ${docked && !dockFits ? 'dock-overlay' : ''} ${closing ? 'is-closing' : 'is-opening'}`}
+          className={`ai-assistant-panel ai-cockpit-panel layout-${layoutMode} ${takeover ? 'is-takeover' : ''} ${takeoverAnim ? 'is-takeover-anim' : ''} ${docked ? 'workstation-sidecar' : ''} ${docked && !dockFits ? 'dock-overlay' : ''} ${closing ? 'is-closing' : 'is-opening'}`}
+          data-takeover={takeover || undefined}
           aria-label="TracePilot 智能工作台"
           style={panelStyle}
         >

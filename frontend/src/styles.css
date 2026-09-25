@@ -17393,3 +17393,121 @@ html.workstation-docked {
   border-right: 1px solid #e6ecf2;
 }
 .metric-strip-left + * { margin-left: 2px; }
+
+/* ── 托管（takeover）：助手代操作页面时的动效 ────────────────────────────────
+   要点：① 整页外框一圈会呼吸的绿边，让用户随时知道“页面正在被托管”；
+   ② 助手面板不是消失，而是收窄成靠右下停靠的手机客户端形态（宽度/高度都走
+   .ai-cockpit-panel 已有的 transition，所以是滑过去而不是跳过去）；
+   ③ 全程 pointer-events:none，托管期间用户自己照样能点页面。 */
+@keyframes ai-takeover-breathe {
+  0%, 100% {
+    border-color: rgba(16, 163, 127, .30);
+    box-shadow: inset 0 0 0 0 rgba(16, 163, 127, 0), inset 0 0 40px rgba(16, 163, 127, .05);
+  }
+  50% {
+    border-color: rgba(16, 163, 127, .95);
+    box-shadow: inset 0 0 0 3px rgba(16, 163, 127, .12), inset 0 0 92px rgba(16, 163, 127, .20);
+  }
+}
+
+/* 盖住模态层（6700）和助手面板（6900）之上：托管框永远看得见，但不吃点击。 */
+.ai-takeover-mask {
+  position: fixed !important;
+  inset: 0 !important;
+  left: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: auto !important;
+  height: auto !important;
+  z-index: 6950 !important;
+  border: 3px solid rgba(16, 163, 127, .46) !important;
+  border-radius: 12px;
+  background: transparent !important;
+  backdrop-filter: none !important;
+  pointer-events: none !important;
+  animation: ai-takeover-breathe 1.5s ease-in-out infinite;
+}
+
+.ai-takeover-status {
+  position: fixed !important;
+  left: 50% !important;
+  top: 14px !important;
+  right: auto !important;
+  transform: translateX(-50%) !important;
+  display: inline-flex !important;
+  align-items: center;
+  gap: 9px;
+  max-width: min(600px, calc(100vw - 32px));
+  padding: 9px 16px !important;
+  border: 1px solid #6ee7b7 !important;
+  border-radius: 999px !important;
+  background: rgba(236, 253, 245, .98) !important;
+  color: #047857 !important;
+  font-size: 12.5px;
+  box-shadow: 0 10px 30px rgba(6, 78, 59, .18), 0 0 0 6px rgba(16, 163, 127, .08);
+  pointer-events: none;
+}
+.ai-takeover-status .ai-takeover-hint { font-weight: 800; letter-spacing: .3px; }
+.ai-takeover-status strong { color: #065f46 !important; font-weight: 600 !important; }
+.ai-takeover-status strong::before { content: '·'; margin-right: 6px; color: #34d399; }
+.ai-takeover-status .ai-agent-icon { animation: ai-takeover-icon-pulse 1.5s ease-in-out infinite; }
+@keyframes ai-takeover-icon-pulse {
+  0%, 100% { opacity: .72; transform: scale(.95); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+/* 手机客户端形态：靠右下停靠、窄、圆角更狠，并复用 layout-phone 的窄屏内边距。 */
+.ai-cockpit-panel.is-takeover,
+.ai-cockpit-panel.is-takeover.workstation-sidecar {
+  left: auto !important;
+  right: 14px !important;
+  top: auto !important;
+  bottom: 16px !important;
+  width: min(352px, calc(100vw - 28px)) !important;
+  min-width: 0 !important;
+  height: min(680px, calc(100vh - 132px)) !important;
+  max-height: none !important;
+  border: 2px solid rgba(16, 163, 127, .5) !important;
+  border-radius: 30px !important;
+  box-shadow: 0 20px 60px rgba(6, 78, 59, .26), 0 0 0 8px rgba(16, 163, 127, .06) !important;
+}
+.ai-cockpit-panel.is-takeover::before {
+  content: '';
+  position: absolute;
+  top: 9px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 76px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, .16);
+  z-index: 3;
+  pointer-events: none;
+}
+.ai-cockpit-panel.is-takeover .ai-cockpit-header { padding-top: 17px !important; }
+.ai-cockpit-panel.is-takeover .ai-cockpit-layout-switch { display: none !important; }
+.ai-cockpit-panel.is-takeover .ai-cockpit-body { grid-template-columns: minmax(0, 1fr) !important; }
+.ai-cockpit-panel.is-takeover .ai-cockpit-sidebar { display: none !important; }
+.ai-cockpit-panel.is-takeover .ai-assistant-messages { padding: 18px 14px 20px; }
+.ai-cockpit-panel.is-takeover .ai-assistant-input-wrap,
+.ai-cockpit-panel.is-takeover .ai-assistant-input-wrap.gpt-compose,
+.ai-cockpit-panel.is-takeover .ai-cockpit-context,
+.ai-cockpit-panel.is-takeover .ai-cockpit-next-actions,
+.ai-cockpit-panel.is-takeover .ai-assistant-footer,
+.ai-cockpit-panel.is-takeover .ai-voice-status {
+  margin-left: 12px !important;
+  margin-right: 12px !important;
+}
+/* 托管动画期间才允许 transform 参与过渡，避免拖动/缩放被拖慢。 */
+.ai-cockpit-panel.is-takeover-anim {
+  transition:
+    left .42s cubic-bezier(.22, 1, .36, 1),
+    top .42s cubic-bezier(.22, 1, .36, 1),
+    right .42s cubic-bezier(.22, 1, .36, 1),
+    bottom .42s cubic-bezier(.22, 1, .36, 1),
+    width .42s cubic-bezier(.22, 1, .36, 1),
+    height .42s cubic-bezier(.22, 1, .36, 1),
+    border-radius .42s ease,
+    box-shadow .3s ease !important;
+}
