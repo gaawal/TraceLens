@@ -16681,15 +16681,21 @@ html.workstation-docked {
 .resource-overview-stats strong.tone-run { color: #c2740b; }
 .resource-overview-stats strong.tone-favorite { color: #b8860b; }
 
+/* 命中区 30×30，图标仍是 15px：之前 24×24 时，点偏 2px 就会命中卡片本体而跳进详情页
+   —— 用户说的「点五角星结果进了详情」就是这么来的。 */
 .resource-card-favorite {
   flex: none;
   margin-left: auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 30px;
+  height: 30px;
   padding: 0;
+  /* 往卡片右边缘和头部上沿借一点空间，命中区变大但视觉位置不变。 */
+  margin-right: -5px;
+  margin-top: -3px;
+  margin-bottom: -3px;
   border: 0;
   border-radius: 7px;
   background: transparent;

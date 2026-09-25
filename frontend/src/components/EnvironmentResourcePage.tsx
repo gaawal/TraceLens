@@ -1118,7 +1118,17 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
     ];
     if (!statusItems.length) statusItems.push({ text: '正常', tone: 'healthy' });
     return (
-      <article className={`resource-overview-card status-${statusTone}`} key={environment.id} onClick={() => openResource(environment.id)}>
+      <article
+        className={`resource-overview-card status-${statusTone}`}
+        key={environment.id}
+        onClick={(event) => {
+          // 卡片里已经有勾选框和收藏星标，将来还会有别的控件。
+          // 只在「点到的不是控件」时才进入详情 —— 星标自己 stopPropagation 只是第一道防线，
+          // 真正的保证是这里：点任何控件都不会顺带把整张卡片当成一次点击。
+          if ((event.target as HTMLElement).closest('button, input, a, select, label, [role="checkbox"]')) return;
+          openResource(environment.id);
+        }}
+      >
         <header>
           <input className="row-check resource-card-check" type="checkbox" checked={selectedResources.has(environment.id)} onClick={(event) => event.stopPropagation()} onChange={() => toggleResourceSelection(environment.id)} aria-label={`选择资源 ${environment.name}`} />
           <div className="resource-card-title-block">
@@ -1132,6 +1142,8 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
             title={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
             aria-label={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
             aria-pressed={Boolean(environment.is_favorite)}
+            // 按住就拦住：有些容器用 pointerdown 触发导航，光拦截 click 来不及。
+            onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => { event.stopPropagation(); void toggleFavorite(environment); }}
           >
             <Star size={15} fill={environment.is_favorite ? 'currentColor' : 'none'} />
