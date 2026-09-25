@@ -48,6 +48,37 @@ const PADDING = 48;
 const MIN_ZOOM = 0.1;
 /** 低于这个缩放就切到「概览形态」：只留色块，把文字收起来。 */
 const OVERVIEW_ZOOM = 0.4;
+
+/**
+ * 视图状态存 sessionStorage。
+ *
+ * 调用导航是弹出窗口：关掉就卸载，组件内的 useState 全丢，
+ * 于是每次重新打开都会回到默认取景 —— 用户刚才放大到某一段、挪到某个位置全白费。
+ * 放在 sessionStorage 里，关窗再开、甚至刷新页面都还在（同一个标签页会话内）。
+ */
+const FLOW_MAP_VIEW_KEY = 'tracelens:flow-map-view-v1';
+
+interface SavedView {
+  traceId?: string;
+  zoom: number;
+  pan: { x: number; y: number };
+}
+
+function loadSavedView(): SavedView | undefined {
+  if (typeof window === 'undefined') return undefined;
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(FLOW_MAP_VIEW_KEY) || 'null');
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    const zoom = Number((parsed as SavedView).zoom);
+    const pan = (parsed as SavedView).pan;
+    if (!Number.isFinite(zoom) || zoom < MIN_ZOOM || zoom > MAX_ZOOM) return undefined;
+    if (!pan || !Number.isFinite(Number(pan.x)) || !Number.isFinite(Number(pan.y))) return undefined;
+    const traceId = (parsed as SavedView).traceId;
+    return { traceId: typeof traceId === 'string' ? traceId : undefined, zoom, pan: { x: Number(pan.x), y: Number(pan.y) } };
+  } catch {
+    return undefined;
+  }
+}
 const MAX_ZOOM = 2.4;
 
 interface LaidOutNode {
@@ -289,9 +320,15 @@ export function FlowMapView({
   onSelectEntry,
 }: FlowMapProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: PADDING, y: PADDING });
-  const [activeTraceId, setActiveTraceId] = useState<string>();
+  const savedViewRef = useRef<SavedView | undefined>(loadSavedView());
+  /**
+   * 用户是否已经自己调整过取景。调整过之后，面板尺寸变化就不该再自动重新取景 ——
+   * 那等于把用户刚调好的位置冲掉。
+   */
+  const userAdjustedRef = useRef(Boolean(savedViewRef.current));
+  const [zoom, setZoom] = useState(savedViewRef.current?.zoom ?? 1);
+  const [pan, setPan] = useState(savedViewRef.current?.pan ?? { x: PADDING, y: PADDING });
+  const [activeTraceId, setActiveTraceId] = useState<string | undefined>(savedViewRef.current?.traceId);
   const [activeLabel, setActiveLabel] = useState<string>();
   /**
    * 悬浮状态按**节点**记录，而不是按「被悬停的那个元素」。
@@ -312,6 +349,19 @@ export function FlowMapView({
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number }>();
 
   const activeTrace = traces.find((trace) => trace.id === activeTraceId) ?? traces[0];
+
+  useEffect(() => {
+    if (!Number.isFinite(zoom) || !Number.isFinite(pan.x) || !Number.isFinite(pan.y)) return;
+    try {
+      window.sessionStorage.setItem(FLOW_MAP_VIEW_KEY, JSON.stringify({
+        traceId: activeTrace?.id,
+        zoom,
+        pan: { x: pan.x, y: pan.y },
+      }));
+    } catch {
+      // 存不下就只是丢一次取景，不影响功能。
+    }
+  }, [activeTrace?.id, zoom, pan]);
 
   const layout = useMemo(
     () => (activeTrace ? layoutTrace(activeTrace, rules, semanticEnabled) : { positioned: [], roots: [] }),
@@ -397,6 +447,7 @@ export function FlowMapView({
   const centerOn = useCallback((x: number, y: number, nextZoom = zoom) => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    userAdjustedRef.current = true;
     const rect = viewport.getBoundingClientRect();
     setZoom(nextZoom);
     setPan({
@@ -405,6 +456,12 @@ export function FlowMapView({
     });
   }, [zoom]);
 
+  /** 缩放按钮 / 滚轮：同样算用户调整过。 */
+  const zoomBy = useCallback((factor: number) => {
+    userAdjustedRef.current = true;
+    setZoom((value) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value * factor)));
+  }, []);
+
   /**
    * 默认就是**整条流程的全览**。
    *
@@ -412,11 +469,12 @@ export function FlowMapView({
    * 而这张图的用处恰恰是「先看清整条流程长什么样，再决定看哪一段」。
    * 所以进入 / 换调用链时都铺满整图，需要细看再放大或用「异常定位」。
    */
-  const fitOverview = useCallback(() => {
+  const fitOverview = useCallback((markAdjusted = true) => {
     const viewport = viewportRef.current;
     if (!viewport) return;
     const rect = viewport.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
+    if (markAdjusted) userAdjustedRef.current = true;
     const nextZoom = Math.min(
       MAX_ZOOM,
       Math.max(MIN_ZOOM, Math.min((rect.width - 24) / canvas.width, (rect.height - 24) / canvas.height)),
@@ -425,20 +483,37 @@ export function FlowMapView({
     setPan({ x: 12, y: Math.max(12, (rect.height - canvas.height * nextZoom) / 2) });
   }, [canvas.height, canvas.width]);
 
-  // 打开 / 换调用链：直接给全览。
+  /**
+   * 只做一次的初始取景：恢复上次的视图，没存过才铺满整图。
+   *
+   * 必须用 ref 锁住「已经做过」。`fitOverview` 的 identity 跟着 canvas 变，
+   * 把它放进依赖里这个 effect 会重跑；重跑时 savedViewRef 已经被清空，
+   * 于是好好的 100% 又被铺成 14% —— 「缩放保留」就是这么失效的。
+   * 另外要等 layout 算出来再取景，否则量到的是空画布。
+   */
+  const initialViewDoneRef = useRef(false);
   useEffect(() => {
-    const timer = window.setTimeout(fitOverview, 30);
+    if (initialViewDoneRef.current) return undefined;
+    if (savedViewRef.current) {
+      initialViewDoneRef.current = true;
+      savedViewRef.current = undefined;
+      return undefined;
+    }
+    if (!layout.positioned.length) return undefined;
+    initialViewDoneRef.current = true;
+    const timer = window.setTimeout(() => fitOverview(false), 30);
     return () => window.clearTimeout(timer);
-  }, [activeTrace?.id, fitOverview]);
+  }, [fitOverview, layout.positioned.length]);
 
-  // 面板尺寸变化（切视图、改窗口）后重新铺满，避免留在半空的位置。
+  // 面板尺寸变化只在该重新取景时重新铺满：用户自己调过位置就别动他。
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport || typeof ResizeObserver === 'undefined') return undefined;
     let frame = 0;
     const observer = new ResizeObserver(() => {
+      if (userAdjustedRef.current) return;
       if (frame) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(fitOverview);
+      frame = requestAnimationFrame(() => fitOverview(false));
     });
     observer.observe(viewport);
     return () => {
@@ -451,6 +526,7 @@ export function FlowMapView({
     const viewport = viewportRef.current;
     if (!viewport) return;
     const rect = viewport.getBoundingClientRect();
+    userAdjustedRef.current = true;
     const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * (event.deltaY < 0 ? 1.12 : 0.89)));
     // 以光标为锚点缩放：缩小时不会把用户正在看的地方甩出屏幕。
     const pointerX = event.clientX - rect.left;
@@ -464,6 +540,7 @@ export function FlowMapView({
 
   function beginPan(event: React.PointerEvent<HTMLDivElement>) {
     if ((event.target as HTMLElement).closest('button')) return;
+    userAdjustedRef.current = true;
     dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, originX: pan.x, originY: pan.y };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -511,9 +588,9 @@ export function FlowMapView({
           >
             <Crosshair size={13} /> 异常定位
           </button>
-          <button type="button" onClick={() => setZoom((value) => Math.min(MAX_ZOOM, value * 1.15))} title="放大"><ZoomIn size={14} /></button>
-          <button type="button" onClick={() => setZoom((value) => Math.max(MIN_ZOOM, value * 0.87))} title="缩小"><ZoomOut size={14} /></button>
-          <button type="button" onClick={fitOverview} title="适应全流程：缩到能看见整张图的形状（默认就是这个视图）"><Maximize2 size={14} /></button>
+          <button type="button" onClick={() => zoomBy(1.15)} title="放大"><ZoomIn size={14} /></button>
+          <button type="button" onClick={() => zoomBy(0.87)} title="缩小"><ZoomOut size={14} /></button>
+          <button type="button" onClick={() => fitOverview()} title="适应全流程：缩到能看见整张图的形状"><Maximize2 size={14} /></button>
           <button type="button" onClick={() => { const first = layout.positioned[0]; if (first) centerOn(first.x, first.y, 1); }} title="回到 100% 并定位到流程起点"><Fullscreen size={14} /></button>
           <span className="flow-map-zoom">{Math.round(zoom * 100)}%</span>
         </div>
@@ -523,7 +600,21 @@ export function FlowMapView({
         {traces.length > 1 && (
           <label className="flow-map-trace-picker">
             <span>调用链</span>
-            <select value={activeTrace?.id} onChange={(event) => { setActiveTraceId(event.target.value); setActiveLabel(undefined); }}>
+            <select
+              value={activeTrace?.id}
+              onChange={(event) => {
+                setActiveTraceId(event.target.value);
+                setActiveLabel(undefined);
+                // 换调用链保留用户当前的缩放级别，只把新树的起点挪进视野 ——
+                // 直接重新全览会把「我刚才放大的倍率」也一起丢掉。
+                const next = traces.find((trace) => trace.id === event.target.value);
+                const first = next?.items.find((item): item is FunctionNode => item.kind === 'function');
+                if (first) {
+                  const target = layout.positioned.find((item) => item.node.id === first.id);
+                  if (target) centerOn(target.x, target.y, zoom);
+                }
+              }}
+            >
               {traces.map((trace, index) => (
                 <option value={trace.id} key={trace.id}>
                   {`${index + 1}. ${trace.firstFunctionName} · ${trace.components.join(' → ')}`}

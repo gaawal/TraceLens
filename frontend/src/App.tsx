@@ -7648,9 +7648,53 @@ export default function App() {
     if (firstCrossTrace) openTraceGraph(undefined, firstCrossTrace);
   }
 
+  /**
+   * 把悬浮时间线放到操作工具栏**下方**。
+   *
+   * 硬编码 offset（曾经是 86）会让窗口正好盖住触发它的那个按钮，
+   * 于是「打开了就关不掉」。程序化打开时间线的地方都要先经过这里。
+   */
+  function positionTimelineBelowToolbar() {
+    if (timelineDocked) return; // 固定模式下没有悬浮窗，位置无意义
+    const stack = document.querySelector('.analysis-sticky-stack');
+    const bottom = stack ? stack.getBoundingClientRect().bottom : 86;
+    setTimelineWindowPosition({ left: 8, top: Math.max(8, Math.round(bottom + 8)) });
+  }
+
+  /**
+   * 时间线只要被打开（按钮、调用导航定位、URL 场景恢复），就保证它不在工具栏**上方**。
+   *
+   * 悬浮窗盖住「调用导航」按钮时，用户关掉导航就再也打不开了 ——
+   * 位置在打开那一刻可能还量不准（日志页尚未渲染），所以这里统一在下一帧兜一次底，
+   * 并且只在自己确实压住工具栏时才动，平时不干扰用户拖到别处。
+   */
+  useEffect(() => {
+    if (!showTimeline || timelineDocked) return undefined;
+    const correct = () => {
+      const stack = document.querySelector('.analysis-sticky-stack');
+      // 还没渲染出来就等下一次重试：URL 场景恢复会在日志页就绪之前就把时间线打开，
+      // 只看第一帧会量不到工具栏，窗口就留在默认位置上压住按钮。
+      if (!stack) return false;
+      const bottom = stack.getBoundingClientRect().bottom;
+      setTimelineWindowPosition((current) => (
+        current.top < bottom + 4 ? { left: current.left, top: Math.round(bottom + 8) } : current
+      ));
+      return true;
+    };
+    const frame = window.requestAnimationFrame(() => { correct(); });
+    const timers = [120, 400, 900].map((delay) => window.setTimeout(() => { correct(); }, delay));
+    return () => {
+      window.cancelAnimationFrame(frame);
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [showTimeline, timelineDocked, activeTask?.status]);
+
   function focusFunctionFromGraph(trace: TraceTimeline, node: FunctionNode) {
     const expandedPath = findFunctionPath(trace.items, node.id) ?? [node.id];
     if (!itemMatches(node, filters)) setFilters(EMPTY_FILTERS);
+    // 从调用导航点过来时时间线会被打开：先把它挪到工具栏下方，
+    // 否则它会盖住「调用导航」按钮本身，用户关掉导航后就没法再打开。
+    positionTimelineBelowToolbar();
     setShowTimeline(true);
     setProcessTimelineExpanded(true);
     setSelectedEntry(undefined);
@@ -7675,8 +7719,9 @@ export default function App() {
 
     setPendingPageEntryId(node.startEntry.id);
     setPendingFunctionFocus({ nodeId: node.id, traceId: trace.id, expandedPath });
-    setCallGraphState(undefined);
-    setCallFlowDialogOpen(false);
+    // 故意**不关闭**导航窗口，也不清空 callGraphState：
+    // 在调用导航里点节点是「一边看流程一边定位日志」，关掉窗口等于每点一次就退出一次，
+    // 想接着看下一个函数还得重新打开。窗口由用户自己关（右上角 X 或点遮罩）。
   }
 
 
@@ -8277,13 +8322,7 @@ export default function App() {
               aria-pressed={showTimeline}
               onClick={() => {
                 const next = !showTimeline;
-                if (next) {
-                  // Open *below* the operation toolbar. A hard-coded offset covered the very
-                  // button that toggles it, so the window could never be closed from here.
-                  const stack = document.querySelector('.analysis-sticky-stack');
-                  const bottom = stack ? stack.getBoundingClientRect().bottom : 86;
-                  setTimelineWindowPosition({ left: 8, top: Math.max(8, Math.round(bottom + 8)) });
-                }
+                if (next) positionTimelineBelowToolbar();
                 setShowTimeline(next);
                 setProcessTimelineExpanded(true);
               }}
@@ -8691,7 +8730,7 @@ export default function App() {
               <button
               type="button"
               className="cross-method-group-row"
-              onClick={(event) => { const chevron = (event.target as HTMLElement).closest('.cross-method-chevron'); if (chevron || group.errorCount === 0) toggleCrossMethodGroup(group.id); else { jumpToFirstError(group.traces.flatMap((trace) => trace.entries)); setCallFlowDialogOpen(false); } }}
+              onClick={(event) => { const chevron = (event.target as HTMLElement).closest('.cross-method-chevron'); if (chevron || group.errorCount === 0) toggleCrossMethodGroup(group.id); else jumpToFirstError(group.traces.flatMap((trace) => trace.entries)); }}
               title={group.errorCount > 0 ? `${group.name} · 点击函数跳到首个异常；点击箭头展开` : group.name}
               >
               <span className="cross-method-chevron">{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
@@ -8778,7 +8817,7 @@ export default function App() {
               <button
               type="button"
               className="method-group-row"
-              onClick={(event) => { const chevron = (event.target as HTMLElement).closest('.method-group-chevron'); if (chevron || group.errorCount === 0) toggleMethodGroup(group.id); else { jumpToFirstError(group.members.flatMap(({ trace }) => trace.entries)); setCallFlowDialogOpen(false); } }}
+              onClick={(event) => { const chevron = (event.target as HTMLElement).closest('.method-group-chevron'); if (chevron || group.errorCount === 0) toggleMethodGroup(group.id); else jumpToFirstError(group.members.flatMap(({ trace }) => trace.entries)); }}
               title={group.errorCount > 0 ? `${group.name} · 点击函数跳到首个异常；点击箭头展开` : group.name}
               >
               <span className="method-group-chevron">{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
@@ -8850,8 +8889,8 @@ export default function App() {
                         rules={displayRules}
                         semanticEnabled={semanticLabelsEnabled}
                         onSelectNode={focusFunctionFromGraph}
-                        onSelectEntry={(entry) => { setSelectedEntry(entry); setCallFlowDialogOpen(false); }}
-                        renderLogRow={(entry) => <LogRow entry={entry} selected={false} onSelect={(selected) => { setSelectedEntry(selected); setCallFlowDialogOpen(false); }} />}
+                        onSelectEntry={(entry) => setSelectedEntry(entry)}
+                        renderLogRow={(entry) => <LogRow entry={entry} selected={false} onSelect={setSelectedEntry} />}
                       />
                     : <CallGraphPanel state={callGraphState} onSelectNode={focusFunctionFromGraph} />}
                 </section>
