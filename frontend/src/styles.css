@@ -17623,3 +17623,33 @@ html.workstation-docked {
   font-weight: 800;
   vertical-align: middle;
 }
+
+/* 对话区：内容随 AI 输出长高时自动跟到最后一行，但用户自己往上翻就停住，
+   右下角出现「回到最新」把他带回去。包裹层只负责给按钮定位，不参与滚动。 */
+.ai-assistant-messages-wrap {
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.ai-assistant-messages-wrap > .ai-assistant-messages { flex: 1 1 auto; }
+.ai-messages-jump-latest {
+  position: absolute;
+  right: 18px;
+  bottom: 14px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .96);
+  color: #334155;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, .16);
+}
+.ai-messages-jump-latest:hover { background: #f1f5f9; border-color: #94a3b8; }

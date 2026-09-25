@@ -1,5 +1,5 @@
 import { captureContextSnapshot, collectPageContext } from '../assistant/contextRegistry';
-import { Fragment, type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Activity,
@@ -1409,6 +1409,15 @@ export function AiAssistant() {
   const [voiceError, setVoiceError] = useState('');
   const [voiceAvailable, setVoiceAvailable] = useState(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 是否「吸附在底部」：只有用户自己往上翻时才松开。
+   *
+   * 为什么不能每帧重新量距离：流式输出时内容一次能长几十上百像素（一张 trace 卡片、
+   * 一段代码块），等 effect 跑起来时「距底部」早就超过阈值了，于是对话就呆在原处不动。
+   * 所以吸附状态只由**用户的滚动**改变（以及开面板/切会话/发消息时重新吸住）。
+   */
+  const stickToBottomRef = useRef(true);
+  const [pinnedToBottom, setPinnedToBottom] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder>();
   const voiceStreamRef = useRef<MediaStream>();
@@ -1683,20 +1692,66 @@ export function AiAssistant() {
     // Reopening the cockpit or switching conversations should resume from the
     // active end of the thread, never from the oldest stored message. Two paint
     // turns cover restored rich cards/traces whose height settles after mount.
+    stickToBottomRef.current = true;
+    setPinnedToBottom(true);
     requestAnimationFrame(() => requestAnimationFrame(() => {
       const node = scrollRef.current;
       if (node) node.scrollTop = node.scrollHeight;
     }));
   }, [open, activeConversationId]);
 
+  //: 主动滚动（跟随/回到最新）期间忽略 scroll 事件：否则「滚动事件比内容长高晚一点点」
+  //: 会被误判成用户上翻，从而把自动跟随关掉。
+  const programmaticScrollRef = useRef(false);
+  const stickToBottomNow = useCallback(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    programmaticScrollRef.current = true;
+    node.scrollTop = node.scrollHeight;
+    requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+  }, []);
+
+  /** 用户滚动：只有他自己往上翻时才松开吸附；滚回底部（48px 以内）自动重新吸住。 */
+  const handleMessagesScroll = useCallback(() => {
+    if (programmaticScrollRef.current) return;
+    const node = scrollRef.current;
+    if (!node) return;
+    const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const stick = distance < 48;
+    stickToBottomRef.current = stick;
+    setPinnedToBottom((current) => (current === stick ? current : stick));
+  }, []);
+
   useEffect(() => {
+    if (!stickToBottomRef.current) return;
     requestAnimationFrame(() => {
-      const node = scrollRef.current;
-      if (!node) return;
-      const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 60;
-      if (atBottom) node.scrollTop = node.scrollHeight;
+      if (stickToBottomRef.current) stickToBottomNow();
     });
-  }, [messages]);
+  }, [messages, stickToBottomNow]);
+
+  /**
+   * 流式输出/工具步骤/卡片展开都只改 DOM 高度，`messages` 的每一次 patch 也未必都
+   * 改到长度。这里盯住容器内的任何文本与节点变化：只要还吸附着，就把视口带到最新一行。
+   */
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node || !open) return undefined;
+    const observer = new MutationObserver(() => {
+      if (!stickToBottomRef.current) return;
+      stickToBottomNow();
+    });
+    observer.observe(node, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, [open, activeConversationId, stickToBottomNow]);
+
+  /** 发新消息时用户期望看着自己的问题出发，重新吸住底部。 */
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'user') return;
+    stickToBottomRef.current = true;
+    setPinnedToBottom(true);
+    requestAnimationFrame(() => stickToBottomNow());
+  }, [messages, stickToBottomNow]);
 
   /**
    * A case draft signal that changes on every meaningful draft transition.
@@ -1712,6 +1767,8 @@ export function AiAssistant() {
 
   useEffect(() => {
     if (!open || !caseDraftSignal) return;
+    stickToBottomRef.current = true;
+    setPinnedToBottom(true);
     requestAnimationFrame(() => requestAnimationFrame(() => {
       const node = scrollRef.current;
       if (node) node.scrollTop = node.scrollHeight;
@@ -2797,7 +2854,8 @@ export function AiAssistant() {
                   <ContextValue value={liveContext} />
                 </div>
               </details>
-              <div className="ai-assistant-messages" ref={scrollRef}>
+              <div className="ai-assistant-messages-wrap">
+              <div className="ai-assistant-messages" ref={scrollRef} onScroll={handleMessagesScroll}>
                 {!messages.length && (
                   <div className="ai-assistant-welcome">
                     <AiAgentIcon className="ai-assistant-welcome-icon" />
@@ -2875,6 +2933,22 @@ export function AiAssistant() {
                     ))}
                   </div>
                 ))}
+              </div>
+              {!pinnedToBottom && (
+                <button
+                  type="button"
+                  className="ai-messages-jump-latest"
+                  onClick={() => {
+                    // 用户主动回到最新：重新吸住底部并立刻跟到底。
+                    stickToBottomRef.current = true;
+                    setPinnedToBottom(true);
+                    stickToBottomNow();
+                  }}
+                  title="回到最新一条（你现在往上翻了，自动跟随已暂停）"
+                >
+                  <ChevronDown size={15} /> 回到最新
+                </button>
+              )}
               </div>
 
               <div className="ai-cockpit-compose">
