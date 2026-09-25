@@ -1,6 +1,14 @@
 /// <reference lib="webworker" />
 
-import { extractTimestampNsFromLogLine, parseLogLineByCategories } from '../parser/logParser';
+import {
+  appendLogContinuation,
+  extractTimestampNsFromLogLine,
+  isTimestampLikeLogLine,
+  logFormatIsKnown,
+  LOG_CONTINUATION_REASON,
+  looksLikeLogContinuation,
+  parseLogLineByCategories,
+} from '../parser/logParser';
 import type { LogEntry, ParseIssue } from '../types';
 import type {
   ImportProgress,
@@ -65,15 +73,26 @@ interface SourcePlan {
   skipped: boolean;
 }
 
-function flushBatch(taskId: string, batch: BatchBuffer): void {
+/**
+ * 刷一批给主线程。
+ *
+ * `force=false` 时**最后一条日志留在缓冲里**：它后面可能还有续行（多行日志），
+ * 刷出去以后 worker 再改也传不回去了（postMessage 是结构拷贝）。等下一行到来、
+ * 或者整份日志读完（`force=true`）再把它发出去。
+ */
+function flushBatch(taskId: string, batch: BatchBuffer, force = false): void {
   if (batch.entries.length === 0 && batch.issues.length === 0) return;
+  const holdTail = !force && batch.entries.length > 0;
+  const outgoingEntries = holdTail ? batch.entries.slice(0, -1) : batch.entries;
+  const held = holdTail ? batch.entries[batch.entries.length - 1] : undefined;
+  if (outgoingEntries.length === 0 && batch.issues.length === 0) return;
   post({
     type: 'IMPORT_BATCH',
     taskId,
-    entries: batch.entries,
+    entries: outgoingEntries,
     issues: batch.issues,
   });
-  batch.entries = [];
+  batch.entries = held ? [held] : [];
   batch.issues = [];
 }
 
@@ -154,6 +173,24 @@ function processLine(
     }
   }
   if (result.issue) {
+    // 解析不出来的行有两种可能：① 上一条日志的续行（堆栈、JSON dump、换行正文）；
+    // ② 真的是一条格式不支持的新记录。先按续行判定，不满足就维持原来的格式告警。
+    const previous = batch.entries[batch.entries.length - 1];
+    const sameSource = previous && previous.sourceFileId === source.id;
+    const knownFormat = logFormatIsKnown(counters.validCount, counters.issueCount);
+    if (sameSource && looksLikeLogContinuation(line, previous, { knownFormat })) {
+      appendLogContinuation(previous, line);
+      return;
+    }
+    // 一批（尤其是实时推送的分片）以续行开头时，上一条在更早的一批里：
+    // 这里只按「不像新记录」标记出来，主线程拿着任务里最后一条日志再决定要不要并回去
+    // （worker 看不到跨批的上一条，判定条件会过严，普通的一行续行会被漏掉）。
+    if (!previous && !isTimestampLikeLogLine(line)) {
+      batch.issues.push({ ...result.issue, reason: LOG_CONTINUATION_REASON });
+      counters.issueCount += 1;
+      if (batch.entries.length + batch.issues.length >= batchSize) flushBatch(taskId, batch);
+      return;
+    }
     batch.issues.push(result.issue);
     counters.issueCount += 1;
   }
@@ -575,7 +612,8 @@ async function importTask(message: Extract<LogStreamWorkerRequest, { type: 'IMPO
     }
 
     if (cancelledTasks.has(taskId)) return;
-    flushBatch(taskId, batch);
+    // 整份读完：缓冲里最后一条不会再等到续行了，强制刷出去。
+    flushBatch(taskId, batch, true);
     publishProgress(
       taskId,
       'finalizing',

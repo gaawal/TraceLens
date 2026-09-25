@@ -17608,3 +17608,18 @@ html.workstation-docked {
 @media (prefers-reduced-motion: reduce) {
   .ai-cockpit-panel.is-takeover-restoring { transition-duration: .18s !important; }
 }
+
+/* 多行日志：正文已经并入续行（堆栈/JSON/换行正文），这里只标出「还有 N 行」，
+   避免用户以为日志被截断了。 */
+.log-continuation-badge {
+  flex: none;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid #c7d2fe;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 9px;
+  font-weight: 800;
+  vertical-align: middle;
+}

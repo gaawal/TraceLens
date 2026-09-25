@@ -2262,6 +2262,8 @@ _DIRECT_BINARY_SEEK_MAX_PROBES = 28
 _DIRECT_BINARY_SEEK_SCAN_LINES = 64
 _DIRECT_BINARY_SEEK_SAFETY_BYTES = 128 * 1024
 _DIRECT_BINARY_SEEK_MAX_LINE_BYTES = 512 * 1024
+#: 反向读取时最多为一条记录攒多少行续行（多行日志的上限，防止异常文件吃内存）。
+_REVERSE_CONTINUATION_MAX_LINES = 500
 
 
 def _probe_timestamp_after_offset(handle, offset: int, size: int) -> tuple[int, datetime] | None:
@@ -2311,11 +2313,20 @@ def _find_direct_time_offset(handle, size: int, target: datetime) -> int | None:
     return max(0, best_before - _DIRECT_BINARY_SEEK_SAFETY_BYTES)
 
 
+def _line_bytes_with_newline(line) -> bytes:
+    line_bytes = line.encode("utf-8", errors="replace") if isinstance(line, str) else bytes(line)
+    return line_bytes if line_bytes.endswith(b"\n") else line_bytes + b"\n"
+
+
 def _stream_direct_forward_from_offset(handle, *, offset: int, start: datetime, end: datetime, operation_id: str) -> Iterator[bytes]:
     handle.seek(max(0, offset))
     if offset > 0:
         handle.readline(_DIRECT_BINARY_SEEK_MAX_LINE_BYTES)
     scanned = 0
+    #: 上一条时间戳行落在窗口内 → 后面没有时间戳的行属于它的**续行**（多行日志：
+    #: 一条记录打好几行才出现下一个时间戳），必须一起带上，否则正文被截断。
+    #: 窗口外记录的续行仍然跳过，行为和过去一致。
+    inside_record = False
     while True:
         line = handle.readline(_DIRECT_BINARY_SEEK_MAX_LINE_BYTES)
         if not line:
@@ -2324,12 +2335,17 @@ def _stream_direct_forward_from_offset(handle, *, offset: int, start: datetime, 
         if scanned == 1 or scanned % 1000 == 0:
             LogSearchProgressStore.raise_if_cancelled(operation_id)
         timestamp = parse_line_time(line)
-        if timestamp is None or timestamp < start:
+        if timestamp is None:
+            if inside_record:
+                yield _line_bytes_with_newline(line)
+            continue
+        if timestamp < start:
+            inside_record = False
             continue
         if timestamp > end:
             break
-        line_bytes = line.encode("utf-8", errors="replace") if isinstance(line, str) else bytes(line)
-        yield line_bytes if line_bytes.endswith(b"\n") else line_bytes + b"\n"
+        inside_record = True
+        yield _line_bytes_with_newline(line)
 
 
 def _stream_direct(machine, artifact: LogArtifact, start: datetime, end: datetime, operation_id: str = "-") -> Iterator[bytes]:
@@ -2355,14 +2371,22 @@ def _stream_direct(machine, artifact: LogArtifact, start: datetime, end: datetim
                     yield line
                 stop_reason = "after_end_time_or_eof"
             else:
+                pending_continuations: list[str] = []
                 for line in reverse_lines(handle):
                     scanned += 1
                     if scanned == 1 or scanned % 1000 == 0:
                         LogSearchProgressStore.raise_if_cancelled(operation_id)
                     timestamp = parse_line_time(line)
                     if timestamp is None:
+                        # 反向扫描时，一条多行记录的续行会**先于**它的时间戳行出现。
+                        # 先攒着，等碰到这条记录的头部再按文件顺序（头 → 续行）发出去，
+                        # 前端才能把续行并回正文。上限兜底，避免异常文件把内存吃满。
+                        if len(pending_continuations) < _REVERSE_CONTINUATION_MAX_LINES:
+                            pending_continuations.append(line if isinstance(line, str) else line.decode("utf-8", errors="replace"))
                         continue
                     if timestamp > end:
+                        # 窗口之后那条记录的续行同样不属于本次窗口。
+                        pending_continuations.clear()
                         continue
                     if timestamp < start:
                         stop_reason = "before_start_time"
@@ -2370,9 +2394,23 @@ def _stream_direct(machine, artifact: LogArtifact, start: datetime, end: datetim
                     matched += 1
                     if matched % 5000 == 0:
                         logger.info("log.read.direct.progress machine=%s path=%s scanned=%d matched=%d strategy=reverse_tail", machine.id, artifact.path, scanned, matched)
-                    line_bytes = line.encode("utf-8", errors="replace") if isinstance(line, str) else bytes(line)
-                    yield line_bytes if line_bytes.endswith(b"\n") else line_bytes + b"\n"
+                    yield _line_bytes_with_newline(line)
+                    for continuation in reversed(pending_continuations):
+                        yield _line_bytes_with_newline(continuation)
+                    pending_continuations.clear()
     logger.info("log.read.direct.finish machine=%s path=%s scanned=%d matched=%d stop=%s", machine.id, artifact.path, scanned, matched, stop_reason)
+
+#: 远端 awk 的窗口裁剪脚本，单独抽出来便于测试：
+#: 时间戳行落在窗口内 → 打印并置 keep；紧接着没有时间戳的行是这条记录的**续行**
+#: （多行日志：堆栈、JSON dump、换行正文），要一起打印，否则正文被截断；
+#: 窗口之前的时间戳行清 keep，窗口之后的第一条直接 exit。
+def _tar_window_awk_program() -> str:
+    return (
+        '{ if (substr($0,1,1) == "[") { ts=substr($0,2,19); '
+        'if (ts < s) { keep=0; next } if (ts > e) exit; print $0; keep=1; next } '
+        'if (keep) print $0 }'
+    )
+
 
 def _stream_tar_member(machine, artifact: LogArtifact, start: datetime, end: datetime, operation_id: str = "-") -> Iterator[bytes]:
     scanned = matched = 0
@@ -2380,7 +2418,7 @@ def _stream_tar_member(machine, artifact: LogArtifact, start: datetime, end: dat
     with ssh_session(machine) as lease:
         start_second = start.strftime("%Y-%m-%d %H:%M:%S")
         end_second = end.strftime("%Y-%m-%d %H:%M:%S")
-        awk_program = '{ if (substr($0,1,1) != "[") next; ts=substr($0,2,19); if (ts < s) next; if (ts > e) exit; print $0 }'
+        awk_program = _tar_window_awk_program()
         command = (
             f"{_tar_member_extract_pipeline(artifact.path, artifact.member_name)} | "
             f"LC_ALL=C awk -v s={shlex.quote(start_second)} -v e={shlex.quote(end_second)} {shlex.quote(awk_program)}"

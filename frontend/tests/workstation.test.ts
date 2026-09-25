@@ -210,3 +210,79 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.deepEqual(resolveComponentTargets('nope', catalog), []);
   console.log('AI 日志证据与组件名解析检查通过');
 }
+
+// --- 多行日志（续行）兼容 -------------------------------------------------------
+// 解析是按行的：一条记录打好几行才出现下一个时间戳时，过去的续行会被当成
+// 「不符合当前日志格式」丢掉，于是正文被截断。这里锁定「补全正文 + 不破坏原有解析」。
+{
+  const {
+    parseLogText,
+    looksLikeLogContinuation,
+    appendLogContinuation,
+    logFormatIsKnown,
+    LOG_CONTINUATION_MAX_LINES,
+  } = await import('../src/parser/logParser');
+
+  const head = (message: string) => `[2026-09-25 10:00:00.100] [ERROR] [CPFR] [25312] [30312] [cpfr] [normal] [cpfr:F:1] [F] ${message}`;
+
+  // ① 堆栈型多行记录：续行并进上一条，正文完整，且不再产生格式告警。
+  const traceback = [
+    head('coolant loop failed:'),
+    'Traceback (most recent call last):',
+    '  File "cpfr/coolant.py", line 430, in CoolantLoop',
+    '    raise CoolantError("flow below limit")',
+    'CoolantError: flow 3.8L/min below threshold 5.0L/min',
+    head('next record'),
+  ].join('\n');
+  const parsed = parseLogText(traceback);
+  assert.equal(parsed.entries.length, 2);
+  assert.equal(parsed.issues.length, 0, '续行不该再报「不符合当前日志格式」');
+  assert.equal(parsed.entries[0].continuationLines, 4);
+  assert.ok(parsed.entries[0].message.includes('coolant loop failed:'));
+  assert.ok(parsed.entries[0].message.includes('raise CoolantError'), '正文必须包含续行');
+  assert.ok(parsed.entries[0].raw.includes('Traceback (most recent call last):'), '原文必须完整');
+  assert.ok(!parsed.entries[0].message.includes('next record'), '下一条正常日志不能被吸进来');
+  assert.equal(parsed.entries[1].continuationLines, undefined);
+
+  // ② JSON dump 型（以 { 开头的续行）。
+  const dump = [
+    head('payload={'),
+    '  "wafer": "W09",',
+    '  "steps": [1, 2, 3]',
+    '}',
+  ].join('\n');
+  const dumpParsed = parseLogText(dump);
+  assert.equal(dumpParsed.entries.length, 1);
+  assert.equal(dumpParsed.issues.length, 0);
+  assert.equal(dumpParsed.entries[0].continuationLines, 3);
+  assert.ok(dumpParsed.entries[0].raw.includes('"steps": [1, 2, 3]'));
+
+  // ③ 未知格式（全都不解析不出来）维持原样：逐行告警，绝不合并成一条。
+  const unknown = parseLogText(['custom one', 'custom two', 'custom three'].join('\n'));
+  assert.equal(unknown.entries.length, 0);
+  assert.equal(unknown.issues.length, 3);
+
+  // ④ 行内带时间戳但格式不支持 → 是新记录，保持告警，不能当续行吞掉。
+  const foreign = parseLogText([
+    head('header ok'),
+    '2026-09-25T10:00:01.500Z other-service 42 - foreign format',
+    head('second'),
+  ].join('\n'));
+  assert.equal(foreign.entries.length, 2);
+  assert.equal(foreign.issues.length, 1);
+  assert.ok(!foreign.entries[0].message.includes('foreign format'));
+
+  // ⑤ 判定函数本身：无提示且格式未知时不乱认；正文末尾有开口提示时认。
+  assert.equal(looksLikeLogContinuation('  indented line'), true);
+  assert.equal(looksLikeLogContinuation('plain sentence with no cue'), false);
+  assert.equal(looksLikeLogContinuation('plain sentence with no cue', { message: 'x', raw: 'x' }, { knownFormat: true }), true);
+  assert.equal(looksLikeLogContinuation('2026-09-25 10:00:01 x', { message: 'a:', raw: 'a:' }), false);
+  assert.equal(looksLikeLogContinuation('continuation', { message: 'tail ends with:', raw: 'tail ends with:' }), true);
+  assert.equal(logFormatIsKnown(10, 2), true);
+  assert.equal(logFormatIsKnown(0, 5), false);
+  assert.equal(logFormatIsKnown(3, 9), false);
+  const capped = { message: 'm', raw: 'r', continuationLines: LOG_CONTINUATION_MAX_LINES };
+  assert.equal(looksLikeLogContinuation('  more', capped), false, '续行数到上限就退回原来的告警行为');
+  assert.equal(appendLogContinuation({ message: 'a', raw: 'a' }, '  b').message, 'a\n  b');
+  console.log('多行日志续行兼容检查通过');
+}

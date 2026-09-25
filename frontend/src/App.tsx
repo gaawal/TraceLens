@@ -74,9 +74,12 @@ import { AtLogAnalysisPage } from './components/AtLogAnalysisPage';
 import { APP_VERSION } from './appConfig';
 import { cancelLogSearch, createDataExtractionRecord, syncCaptureWatches, fetchLogWindow, fetchUrlLogImportContent, getEnvironmentRuntimeStatus, getGlobalLogCatalogTree, getResourceSettings, inspectUrlLogImports, listEnvironments, listRuntimeLogFormatRules, recognizeSemanticSourcesBatch, streamLiveLogWindow, updateDataExtractionRecord, updateLogAuditClientResult, updateResourceSettings, type DataExtractionRecord, type EnvironmentRuntimeStatus, type EnvironmentSummary, type LiveLogStreamEvent, type LogAuditRecord, type LogSearchProgress, type LogWindowRequest, type SemanticSourceResult, type UrlLogImportItem } from './api/resourceApi';
 import {
+  appendLogContinuation,
   DEFAULT_ERROR_RULES,
   createErrorMatchRule,
   detectSeverity,
+  LOG_CONTINUATION_REASON,
+  looksLikeLogContinuation,
   type ErrorMatchRule,
 } from './parser/logParser';
 import type { ImportProgress, ImportStrategy, LogStreamWorkerResponse, WorkerImportSource } from './workers/logStreamProtocol';
@@ -3093,6 +3096,12 @@ function LogRow({
       <span className={classNames('level-badge', `level-${entry.level.toLowerCase()}`)}>{entry.level}</span>
       <span className="log-summary" title={semanticMatch ? `${entry.message}\n用户语义 · ${semanticMatch.ruleName}: ${semanticMatch.text}${semanticMatch.supplementalText ? `\n补充说明：${semanticMatch.supplementalText}` : ''}` : entry.message}>
         <HighlightedText text={entry.message} />
+        {Boolean(entry.continuationLines) && (
+          <span
+            className="log-continuation-badge"
+            title={`这条日志是多行日志：正文已并入后面 ${entry.continuationLines} 行续行（堆栈/JSON/换行正文），悬停可看完整原文`}
+          >⏎{entry.continuationLines}</span>
+        )}
         {semanticMatch && <span className="log-inline-semantic" title={`用户语义 · ${semanticMatch.ruleName}\n${semanticMatch.text}${semanticMatch.supplementalText ? `\n补充说明：${semanticMatch.supplementalText}` : ''}`}>{semanticMatch.text}</span>}
       </span>
       <span className="log-row-meta">
@@ -4057,7 +4066,41 @@ export default function App() {
     generation: number,
   ): Promise<void> {
     const renderDelayMs = entries.length > 300 ? 6 : entries.length > 120 ? 10 : 20;
+    // 实时通道是**按行**推送的（后端每次 append 一行），所以一条多行日志必然被拆到
+    // 多个批次里。worker 在单批内能自己接续行，跨批的开头几行只能在这里并回去 ——
+    // 用任务里最后一条日志做判定，比 worker 手里没有上一条时准得多。
+    const continuationIssues = issues.filter((issue) => issue.reason === LOG_CONTINUATION_REASON);
+    const plainIssues = issues.filter((issue) => issue.reason !== LOG_CONTINUATION_REASON);
     const run = liveRenderQueueRef.current.then(async () => {
+      if (continuationIssues.length) {
+        // 判定、并回正文、以及「并不进去的如实报警」都在同一个 updater 里做：
+        // 这样读到的一定是任务此刻最新的最后一条日志，也不会和下面的逐条追加抢。
+        setTasks((current) => current.map((task) => {
+          if (task.id !== taskId) return task;
+          if (task.entries.length === 0) {
+            return { ...task, issues: [...task.issues, ...continuationIssues].slice(-LIVE_ISSUE_WINDOW) };
+          }
+          const nextEntries = task.entries.slice();
+          const last = { ...nextEntries[nextEntries.length - 1] };
+          const leftovers: ParseIssue[] = [];
+          let absorbing = true;
+          for (const issue of continuationIssues) {
+            // 只吃开头连续的续行：遇到一条真的像新记录的（行内带时间戳）就停手。
+            if (absorbing && looksLikeLogContinuation(issue.raw, last, { knownFormat: true })) {
+              appendLogContinuation(last, issue.raw);
+              continue;
+            }
+            absorbing = false;
+            leftovers.push(issue);
+          }
+          nextEntries[nextEntries.length - 1] = last;
+          return {
+            ...task,
+            entries: nextEntries,
+            issues: leftovers.length ? [...task.issues, ...leftovers].slice(-LIVE_ISSUE_WINDOW) : task.issues,
+          };
+        }));
+      }
       for (let index = 0; index < entries.length; index += 1) {
         if (generation !== liveRenderGenerationRef.current) return;
         if (index > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, renderDelayMs));
@@ -4091,12 +4134,13 @@ export default function App() {
           };
         }));
       }
-      if (issues.length > 0 && generation === liveRenderGenerationRef.current) {
+      if (plainIssues.length > 0 && generation === liveRenderGenerationRef.current) {
         setTasks((current) => current.map((task) => task.id === taskId ? {
           ...task,
-          issues: [...task.issues, ...issues].slice(-LIVE_ISSUE_WINDOW),
+          issues: [...task.issues, ...plainIssues].slice(-LIVE_ISSUE_WINDOW),
         } : task));
       }
+
     });
     liveRenderQueueRef.current = run.catch(() => undefined);
     return run;

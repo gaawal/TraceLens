@@ -77,6 +77,12 @@ export interface LogEntry {
   severity: ContentSeverity;
   summary: string;
   raw: string;
+  /**
+   * 这条日志后面还跟了几个**续行**（多行日志：一条记录跨多个物理行，
+   * 例如堆栈、JSON dump、被换行拆开的正文）。续行已经并进 `message`/`raw`，
+   * 这里只记数量，供 UI 标注「正文还有 N 行」。
+   */
+  continuationLines?: number;
   /** 日志类别与实际解析器。 */
   logCategory?: string;
   parserProfile?: string;

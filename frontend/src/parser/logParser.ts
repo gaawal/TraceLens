@@ -24,6 +24,81 @@ const END_MARKER_REGEX = /<\s*\(\s*\)/;
 export const DEFAULT_ERROR_KEYWORDS = ['ERROR', 'ERRORS', 'errors', 'EXCEPTION', 'exception', 'FAILED', 'failed', 'FATAL'] as const;
 export const DEFAULT_WARNING_KEYWORDS = ['WARN', 'WARNING', 'WRAN'] as const;
 
+/**
+ * 多行日志（一条记录跨多个物理行）的续行支持。
+ *
+ * 背景：解析是**按行**做的 —— 一行必须自己带时间戳（或命中某个日志格式）才算一条新日志。
+ * 但真实日志里一条记录常常打好几行才出现下一个时间戳：Python 堆栈、JSON/XML dump、
+ * 被换行拆开的正文、ASCII 表格……过去这些行解析不出来，就被当成「不符合当前日志格式」
+ * 的告警丢掉，于是**日志正文被截断**，只剩第一行。
+ *
+ * 这里只做加法，不改任何已有解析结果：
+ * - 只有「按所有格式都解析不出来」的行才会走到续行判定；
+ * - 看起来像新记录（行内出现时间戳样式）的行绝不并进上一条，维持原来的告警行为；
+ * - 未知格式的文件（解析成功率很低）不启用「无提示续行」，仍然逐行报格式告警；
+ * - 续行有上限，超过就退回原来的告警，不会把整份文件吞进一条日志。
+ */
+export const LOG_CONTINUATION_REASON = '多行日志续行';
+export const LOG_CONTINUATION_MAX_LINES = 200;
+export const LOG_CONTINUATION_MAX_CHARS = 64 * 1024;
+
+/** 行内是否出现“像时间戳”的片段：出现就说明这更可能是一条（暂不支持的）新记录。 */
+const TIMESTAMP_LIKE_REGEX = /(\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2})|(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})|(\[\s*\d{4}[-/]\d{1,2}[-/]\d{1,2})|(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*$)/;
+/** 续行的典型开头：缩进、闭合符号、列表符号、堆栈/异常关键字、JSON/XML 片段。 */
+const CONTINUATION_PREFIX_REGEX = /^(\s|\)|\]|\}|>|\||\+|#|\*|-|~|\.{3}|at\s+\S|File\s+"|Traceback|Caused by|During handling|Exception|Stack trace|Caused:|\.\.\.|"|\{|'|<)/;
+/** 上一条正文的结尾在提示“还没写完”。 */
+const OPEN_TAIL_REGEX = /[:\\,{(=\[<]|\.{3}$|\b(and|or|with|from|to|for|of|in|by|at|via|using|expected|actual|because|while|when|if|then|the)\s*$/i;
+
+/** 行内是否出现“像时间戳”的片段：出现就说明这更可能是一条（暂不支持的）新记录。 */
+export function isTimestampLikeLogLine(line: string): boolean {
+  return TIMESTAMP_LIKE_REGEX.test(String(line || ''));
+}
+
+export interface LogContinuationTarget {
+  message: string;
+  raw: string;
+  continuationLines?: number;
+}
+
+/**
+ * 这一行是不是上一条日志的续行？
+ *
+ * @param knownFormat 同一批里已经有日志解析成功、且失败行不多时传 true：格式已知，
+ *   那么解析不出来的行几乎必然是续行（哪怕没有缩进提示）。
+ */
+export function looksLikeLogContinuation(
+  line: string,
+  previous?: LogContinuationTarget,
+  options?: { knownFormat?: boolean },
+): boolean {
+  if (!line.trim()) return false;
+  if (isTimestampLikeLogLine(line)) return false;
+  const continued = Number(previous?.continuationLines || 0);
+  if (continued >= LOG_CONTINUATION_MAX_LINES) return false;
+  if (previous && String(previous.raw || previous.message || '').length > LOG_CONTINUATION_MAX_CHARS) return false;
+  if (CONTINUATION_PREFIX_REGEX.test(line)) return true;
+  if (continued > 0) return true;
+  if (previous) {
+    const tail = String(previous.message || previous.raw || '').trimEnd();
+    if (tail && OPEN_TAIL_REGEX.test(tail)) return true;
+  }
+  return Boolean(options?.knownFormat);
+}
+
+/** 把一行续行并进上一条日志：正文与原文都补全，并记录续行数量。 */
+export function appendLogContinuation<T extends LogContinuationTarget>(entry: T, line: string): T {
+  const text = line.replace(/\r$/, '');
+  entry.message = entry.message ? `${entry.message}\n${text}` : text;
+  entry.raw = entry.raw ? `${entry.raw}\n${text}` : text;
+  entry.continuationLines = Number(entry.continuationLines || 0) + 1;
+  return entry;
+}
+
+/** 判断一批解析结果算不算“格式已知”：有成功的、且失败的不占多数。 */
+export function logFormatIsKnown(validCount: number, issueCount: number): boolean {
+  return validCount > 0 && issueCount <= validCount;
+}
+
 export interface ErrorMatchRule {
   id: string;
   keyword: string;
@@ -427,7 +502,19 @@ export function parseLogDocument(document: LogDocument): ParseResult {
       lineNumber: index + 1,
       idPrefix,
     });
-    if (result.entry) entries.push(result.entry);
+    if (result.entry) {
+      entries.push(result.entry);
+      return;
+    }
+    // 解析不出来的行先按「多行日志续行」试着并进上一条（堆栈、JSON dump、换行正文），
+    // 并回去就不算格式告警；不满足续行条件时行为与过去完全一致。
+    const previous = entries[entries.length - 1];
+    if (result.issue && previous && looksLikeLogContinuation(rawLine, previous, {
+      knownFormat: logFormatIsKnown(entries.length, issues.length),
+    })) {
+      appendLogContinuation(previous, rawLine);
+      return;
+    }
     if (result.issue) issues.push(result.issue);
   });
 
