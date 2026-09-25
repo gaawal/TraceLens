@@ -887,6 +887,8 @@ const TIMELINE_MAX_ADAPTIVE_ZOOM = 240;
 // 不能直接拿整个滚动容器的 2/3，否则 Brush 会看起来越出当前屏幕。
 const TIMELINE_AUTO_VISIBLE_TRACK_RATIO = 2 / 3;
 const TIMELINE_MIN_AUTO_RANGE_SPAN_NS = 250_000_000n;
+/** 实时时间线的最小可视跨度：刚开监听时也要有一段像样的“磁带”，不跟着秒数抖。 */
+const LIVE_TIMELINE_MIN_SPAN_NS = 60n * 1_000_000_000n;
 
 function timelineAutoTargetRatio(viewportWidth: number, labelWidth: number): number {
   const safeViewportWidth = Math.max(1, viewportWidth);
@@ -1723,6 +1725,9 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   timeSelectionDisabled,
   incrementalLoading,
   incrementalMessage,
+  live,
+  liveStartNs,
+  liveAnchorNs,
   expanded,
   navigationPending,
   onToggle,
@@ -1749,6 +1754,12 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   timeSelectionDisabled?: boolean;
   incrementalLoading?: boolean;
   incrementalMessage?: string;
+  /** 实时监听中：时间线按「录音」方式呈现 —— 从开监听那一刻起不断往右长，锚点跟着最新日志走。 */
+  live?: boolean;
+  /** 实时起点（开监听这一刻最新的日志时间）。 */
+  liveStartNs?: bigint;
+  /** 实时锚点（当前最新一条日志的时间），会随新日志不断右移。 */
+  liveAnchorNs?: bigint;
   expanded: boolean;
   navigationPending: boolean;
   onToggle: () => void;
@@ -1779,6 +1790,13 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   // useLayoutEffect below measures the actual container before paint.
   const [timelineViewportWidth, setTimelineViewportWidth] = useState(() => filterScopeKey?.startsWith('atlog:') ? 1 : 940);
   const [viewportRange, setViewportRange] = useState<TimeRangeFilter>();
+  //: 实时跟随被用户手动缩放/拖动打断后暂停，点「跟随实时」恢复。
+  const [liveFollowPaused, setLiveFollowPaused] = useState(false);
+  const liveFollowActive = Boolean(live) && !liveFollowPaused && liveAnchorNs !== undefined;
+  const pauseLiveFollow = useCallback(() => {
+    if (!live) return;
+    setLiveFollowPaused(true);
+  }, [live]);
   const [labelWidth, setLabelWidth] = useState(320);
   const [brushDraft, setBrushDraft] = useState<{ start: number; end: number }>();
   const [timeCursorNs, setTimeCursorNs] = useState<bigint>();
@@ -1901,6 +1919,34 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
     const viewEnd = viewportRange?.endNs ?? explorerEnd;
     const viewSpan = viewEnd > viewStart ? viewEnd - viewStart : 1n;
 
+    // 实时监听：像录音一样从起点铺到锚点，锚点随新日志不断右移。
+    // 起步阶段给一个最小跨度，避免刚开监听时标尺在几秒里疯狂抖动。
+    if (liveFollowActive && liveAnchorNs !== undefined) {
+      const anchor = liveAnchorNs;
+      const start = liveStartNs !== undefined && liveStartNs <= anchor ? liveStartNs : (actualDataStart ?? anchor);
+      const covered = anchor > start ? anchor - start : 0n;
+      const headroom = covered / 12n > LIVE_TIMELINE_MIN_SPAN_NS / 6n ? covered / 12n : LIVE_TIMELINE_MIN_SPAN_NS / 6n;
+      const liveEnd = anchor + headroom;
+      const liveStart = start;
+      const liveEndClamped = liveEnd > liveStart + LIVE_TIMELINE_MIN_SPAN_NS ? liveEnd : liveStart + LIVE_TIMELINE_MIN_SPAN_NS;
+      const liveSpan = liveEndClamped > liveStart ? liveEndClamped - liveStart : 1n;
+      return {
+        globalStartRow,
+        globalEndRow,
+        actualDataStart,
+        actualDataEnd,
+        loadedStart,
+        loadedEnd,
+        loadedSpan,
+        explorerPadding,
+        explorerStart,
+        explorerEnd,
+        viewStart: liveStart,
+        viewEnd: liveEndClamped,
+        viewSpan: liveSpan,
+      };
+    }
+
     return {
       globalStartRow,
       globalEndRow,
@@ -2004,6 +2050,11 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
     if (!restoredHiddenComponents) return;
     setHiddenTimelineComponents(new Set(restoredHiddenComponents));
   }, [restoredHiddenComponents]);
+
+  useEffect(() => {
+    if (live) return;
+    setLiveFollowPaused(false);
+  }, [live]);
 
   useEffect(() => {
     // 远端日志任务的时间轴需要始终保留“已加载区”两侧的探索空间，
@@ -2507,6 +2558,7 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
   }
 
   function beginBrush(event: React.PointerEvent<HTMLDivElement>) {
+    pauseLiveFollow();
     if (event.button !== 0 || incrementalLoading || timeSelectionDisabled) return;
     const percent = pointerPercent(event);
     event.preventDefault();
@@ -2637,13 +2689,13 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
       : '当前范围无日志';
 
   return (
-    <section className={classNames('process-gantt', !expanded && 'collapsed', navigationPending && 'navigation-pending')}>
+    <section className={classNames('process-gantt', !expanded && 'collapsed', navigationPending && 'navigation-pending', live && 'is-live', liveFollowActive && 'is-live-following')}>
       {/* 标题行同时是悬浮窗的拖动手柄和「固定/关闭」的落点。
           之前在它上面还有一条独立的「时间线」标题栏，只为了放两个按钮和一句说明，
           既占高度又和这一行重复，已经去掉。 */}
       <div className="process-gantt-header" {...(dragHandleProps || {})}>
         <button type="button" className="process-gantt-header-toggle" onClick={onToggle} aria-expanded={expanded}>
-          <span className="process-gantt-title"><Clock size={15} /><strong>模块 / 进程 / Trace 时间分布</strong><small>{visibleTimelineComponentCount}/{componentGroups.length} 个模块 · {visibleProcessCount} 个进程 · {timelineRangeLabel}</small></span>
+          <span className="process-gantt-title"><Clock size={15} /><strong>模块 / 进程 / Trace 时间分布</strong><small>{live ? '实时录制中 · ' : ''}{visibleTimelineComponentCount}/{componentGroups.length} 个模块 · {visibleProcessCount} 个进程 · {timelineRangeLabel}</small></span>
           {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
         </button>
         {headerActions}
@@ -2651,6 +2703,22 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
       {expanded && (
         <div className="process-gantt-content">
           <div className="process-gantt-tools">
+            {live && (
+              <span className={classNames('process-gantt-live-status', liveFollowActive ? 'recording' : 'paused')}>
+                <span className="process-gantt-live-dot" aria-hidden="true" />
+                {liveFollowActive
+                  ? `实时录制中${liveAnchorNs !== undefined ? ` · 锚点 ${formatNsTick(liveAnchorNs, !sameDate, true)}` : ''}`
+                  : '已暂停跟随实时'}
+                {!liveFollowActive && (
+                  <button
+                    type="button"
+                    className="process-gantt-live-resume"
+                    onClick={() => setLiveFollowPaused(false)}
+                    title="回到实时锚点并按最新日志继续跟随"
+                  >跟随实时</button>
+                )}
+              </span>
+            )}
             {incrementalMessage && <span className={classNames('process-gantt-incremental-status', incrementalLoading && 'loading')}>{incrementalLoading && <LoaderCircle className="spin" size={11} />}{incrementalMessage}</span>}
             {selectedTimeRange && (
               <span className="process-gantt-selected-range">
@@ -2659,16 +2727,16 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
               </span>
             )}
             <div className="process-gantt-zoom" aria-label="时间轴缩放">
-              <button type="button" disabled={timelineZoom <= 1} onClick={() => changeTimelineZoom(nextTimelineZoom(-1))} title="缩小时间轴（保持当前时间标尺位置不变）"><ZoomOut size={13} /></button>
+              <button type="button" disabled={timelineZoom <= 1} onClick={() => { pauseLiveFollow(); changeTimelineZoom(nextTimelineZoom(-1)); }} title="缩小时间轴（保持当前时间标尺位置不变）"><ZoomOut size={13} /></button>
               <span>{Math.round(timelineZoom * 100).toLocaleString()}%</span>
-              <button type="button" disabled={timelineZoom >= maxTimelineZoom} onClick={() => changeTimelineZoom(nextTimelineZoom(1))} title="放大时间轴（保持当前时间标尺位置不变，可持续放大至时间精度/绘制极限）"><ZoomIn size={13} /></button>
-              <button type="button" className="fit-button" disabled={timelineZoom === 1} onClick={() => changeTimelineZoom(1)}>适配</button>
+              <button type="button" disabled={timelineZoom >= maxTimelineZoom} onClick={() => { pauseLiveFollow(); changeTimelineZoom(nextTimelineZoom(1)); }} title="放大时间轴（保持当前时间标尺位置不变，可持续放大至时间精度/绘制极限）"><ZoomIn size={13} /></button>
+              <button type="button" className="fit-button" disabled={timelineZoom === 1} onClick={() => { pauseLiveFollow(); changeTimelineZoom(1); }}>适配</button>
               <button type="button" className="fit-button" disabled={!viewportRange} onClick={() => { captureTimelineZoomAnchor(); setViewportRange(undefined); setZoom(1); }} title="恢复查看任务完整时间轴，保留当前时间标尺位置与日志筛选">还原全局</button>
             </div>
           </div>
 
           <div className="process-gantt-scroll-shell" ref={timelineShellRef} style={{ '--gantt-label-width': `${labelWidth}px` } as React.CSSProperties}>
-            <div className="process-gantt-scroll" ref={timelineScrollRef} onWheel={handleTimelineWheel}>
+            <div className="process-gantt-scroll" ref={timelineScrollRef} onWheel={(event) => { pauseLiveFollow(); handleTimelineWheel(event); }}>
               <div
                 className={classNames('process-gantt-canvas', loadedTimeRange && 'remote-time-explorer')}
                 style={{
@@ -2750,6 +2818,18 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
                 </div>
                 <span className="process-gantt-brush-range">{selectedTimeRange ? compactRangeDuration(selectedTimeRange.endNs - selectedTimeRange.startNs) : '拖拽选择'}</span>
               </div>
+
+              {live && liveAnchorNs !== undefined && (
+                // 录制头：竖线 + 呼吸的点，位置就是当前最新一条日志的时间。
+                <div
+                  className={classNames('process-gantt-live-playhead', !liveFollowActive && 'paused')}
+                  style={{ left: `${Math.max(0, Math.min(100, rangePercent(liveAnchorNs, viewStart, viewSpan)))}%` }}
+                  aria-hidden="true"
+                  data-live-anchor={liveAnchorNs.toString()}
+                >
+                  <span className="process-gantt-live-playhead-dot" />
+                </div>
+              )}
 
               <div className="process-gantt-rows">
                 {displayGroups.length === 0 && (
@@ -3953,6 +4033,8 @@ export default function App() {
   }, [liveListening, preferredRemoteEnvironmentId]);
 
   const [liveAddedCount, setLiveAddedCount] = useState(0);
+  /** 实时时间线的起点：开监听这一刻最新的那条日志，之后只在没值时兜底。 */
+  const [liveTimelineStartNs, setLiveTimelineStartNs] = useState<bigint | undefined>(undefined);
   const [liveMessage, setLiveMessage] = useState('');
   const [remoteLogLocator, setRemoteLogLocator] = useState<RemoteLogLocatorSnapshot>();
   // The UI-action registry closes over its own render; the ref keeps 开始采集 reading the
@@ -4538,6 +4620,7 @@ export default function App() {
       liveRenderQueueRef.current = Promise.resolve();
       setLiveConnectionStatus((current) => current === 'error' ? current : 'off');
       liveBoundTaskIdRef.current = undefined;
+      setLiveTimelineStartNs(undefined);
       return;
     }
     // 原始日志模式不再排除在外：RawLogView 会直接显示流进来的原文，
@@ -4575,6 +4658,8 @@ export default function App() {
     setLiveConnectionStatus('connecting');
     setLiveMessage('正在建立实时日志通道…');
     setLiveAddedCount(0);
+    // 时间线的实时起点 = 现在最新的日志时间；之后新来的日志都接在它后面。
+    setLiveTimelineStartNs((current) => current ?? taskSnapshot.latestImportedNs ?? taskSnapshot.earliestImportedNs);
 
     const handleEvent = (event: LiveLogStreamEvent) => {
       if (session !== liveSessionRef.current || controller.signal.aborted) return;
@@ -8219,6 +8304,9 @@ export default function App() {
         timeSelectionDisabled={liveListening}
         incrementalLoading={activeTask?.incrementalLoading}
         incrementalMessage={activeTask?.incrementalMessage}
+        live={liveListening}
+        liveStartNs={liveTimelineStartNs}
+        liveAnchorNs={liveListening ? (activeTask?.latestImportedNs ?? liveTimelineStartNs) : undefined}
         expanded={timelineDocked ? processTimelineExpanded : true}
         navigationPending={navigationPending}
         onToggle={timelineDocked ? () => setProcessTimelineExpanded((value) => !value) : () => undefined}
