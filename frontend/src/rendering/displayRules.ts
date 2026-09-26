@@ -344,6 +344,50 @@ function applyDisplayTemplate(
   });
 }
 
+/**
+ * 函数名比较用的归一化。
+ *
+ * 解析器把函数名统一成 `MoveAbsolute()` 这种带括号的形式，而日志正文里几乎从来不这么写：
+ * 常见的是 `[MoveAbsolute] >() enter …`（名字在方括号里、边界符单独一个 `>()`）
+ * 或者 `MoveAbsolute >() enter …`。所以比较前把两边的 `()` 都去掉 ——
+ * 「函数名包含关键字」写 `MoveAbsolute()` 和写 `MoveAbsolute` 必须等价。
+ */
+export function normalizeFunctionName(value: string): string {
+  return String(value || '').trim().replace(/\(\s*\)$/, '').trim();
+}
+
+/** 函数名是否命中关键字（把 `()` 归一化掉，其余仍区分大小写）。 */
+export function functionNameMatchesKeyword(functionName: string, keyword: string): boolean {
+  const name = normalizeFunctionName(functionName);
+  const needle = normalizeFunctionName(keyword);
+  if (!name || !needle) return false;
+  return name === needle || name.includes(needle);
+}
+
+/**
+ * 从一段文本（真实日志行、或者用户粘进「测试日志」的正文）里找出可能的函数名。
+ *
+ * 覆盖常见写法：
+ * - `FuncName()`：正文以函数名开头的老格式；
+ * - `[FuncName] [START] / [FuncName] >()`：执行器日志里函数标签 + 边界符；
+ * - `FuncName >()`：只有裸名字 + 边界符；
+ * - 行首的 `[FuncName]`：执行器日志的函数标签。
+ */
+export function collectFunctionNameCandidates(text: string): string[] {
+  const candidates = new Set<string>();
+  const push = (value: string | undefined) => {
+    const name = String(value || '').trim();
+    if (name) candidates.add(name);
+  };
+  const source = String(text || '');
+  for (const match of source.matchAll(/([A-Za-z_~][\w:<>~.\-]*)\(\s*\)/g)) push(match[1]);
+  for (const match of source.matchAll(/\[([A-Za-z_~][\w:<>~.\-]*)\]\s*(?:\[?\s*(?:START|END)|[<>]\s*\(\s*\))/gi)) push(match[1]);
+  for (const match of source.matchAll(/([A-Za-z_~][\w:<>~.\-]*)\s*[<>]\s*\(\s*\)/g)) push(match[1]);
+  const leading = source.match(/^\s*\[([A-Za-z_~][\w:<>~.\-]*)\]/);
+  if (leading) push(leading[1]);
+  return [...candidates];
+}
+
 export function matchDisplayRuleToMessage(rule: DisplayRule, rawOrMessage: string): DisplayRuleMatch | undefined {
   if (!rule.enabled) return undefined;
   const displayMode: DisplayRuleMode = rule.displayMode ?? 'semantic';
@@ -351,7 +395,13 @@ export function matchDisplayRuleToMessage(rule: DisplayRule, rawOrMessage: strin
 
   if (rule.kind === 'keyword') {
     const keyword = rule.keyword?.trim();
-    if (!keyword || !message.includes(keyword)) return undefined;
+    if (!keyword) return undefined;
+    // 函数名关键字（`MoveAbsolute()`）也要能命中把函数名写成 `[MoveAbsolute]` 的正文：
+    // 解析器给函数名补的 `()` 在正文里本来就不存在，用户没必要为此改写关键字。
+    const withoutParens = normalizeFunctionName(keyword);
+    const matched = message.includes(keyword)
+      || (keyword !== withoutParens && withoutParens.length >= 3 && message.includes(withoutParens));
+    if (!matched) return undefined;
     return {
       ruleId: rule.id,
       ruleName: rule.name,
@@ -449,7 +499,7 @@ export function matchDisplayRulesToFunction(
     if (!rule.enabled || rule.scope === 'log' || (rule.displayMode ?? 'semantic') === 'label') continue;
     if (rule.kind === 'keyword') {
       const keyword = rule.keyword?.trim();
-      if (keyword && node.name.includes(keyword)) {
+      if (keyword && functionNameMatchesKeyword(node.name, keyword)) {
         return {
           ruleId: rule.id,
           ruleName: rule.name,

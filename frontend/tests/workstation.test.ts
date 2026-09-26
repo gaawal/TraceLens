@@ -286,3 +286,60 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(appendLogContinuation({ message: 'a', raw: 'a' }, '  b').message, 'a\n  b');
   console.log('多行日志续行兼容检查通过');
 }
+
+// --- 语义规则「函数名包含关键字」必须按函数名判定 -------------------------------
+// 解析器把函数名统一成 `MoveAbsolute()`，但日志正文几乎从不这么写：
+// 常见的是 `[MoveAbsolute] >() enter …`。过去测试解析拿关键字去正文里做字面匹配，
+// 于是「函数名包含关键字 MoveAbsolute()」永远提示未命中。
+{
+  const { collectFunctionNameCandidates, functionNameMatchesKeyword, normalizeFunctionName } =
+    await import('../src/rendering/displayRules');
+  const { parseLogLineByCategories } = await import('../src/parser/logParser');
+
+  const candidatesFor = (text: string) => {
+    const parsed = parseLogLineByCategories(text, {
+      sourceFileId: 't', sourceFileName: 'test.log', lineNumber: 1, idPrefix: 't',
+    }, [], []);
+    return [...new Set([
+      parsed.entry?.boundaryFunctionName,
+      parsed.entry?.functionName,
+      ...collectFunctionNameCandidates(text),
+    ].filter(Boolean) as string[])];
+  };
+
+  // ① 用户粘进测试框的正文（没有方括号，名字后面直接跟边界符）。
+  const pasted = 'MoveAbsolute >() enter stage absolute move start dof=6 point=spiral_09 profile=scan';
+  assert.deepEqual(candidatesFor(pasted), ['MoveAbsolute']);
+  assert.ok(candidatesFor(pasted).some((name) => functionNameMatchesKeyword(name, 'MoveAbsolute()')));
+
+  // ② 完整日志行：解析器给的函数名带 ()，正文里是 [MoveAbsolute] + >()。
+  const fullLine = '[2026-09-26 00:44:56.222] [INFO] [WSP] [23070] [30070] [wsp] [normal] [wsp:MoveAbsolute:154] [MoveAbsolute] >() enter stage absolute move start';
+  assert.ok(candidatesFor(fullLine).some((name) => functionNameMatchesKeyword(name, 'MoveAbsolute()')));
+
+  // ③ 普通行（没有边界符）：从行首的 [函数标签] 也能认出函数名。
+  assert.deepEqual(candidatesFor('[MoveAbsolute] move absolute { x:0.031 }'), ['MoveAbsolute']);
+
+  // ④ 归一化：带不带 () 等价，其它字符仍区分大小写。
+  assert.equal(normalizeFunctionName('MoveAbsolute()'), 'MoveAbsolute');
+  assert.equal(functionNameMatchesKeyword('MoveAbsolute()', 'MoveAbsolute'), true);
+  assert.equal(functionNameMatchesKeyword('MoveAbsolute()', 'MoveAbsolute()'), true);
+  assert.equal(functionNameMatchesKeyword('MoveAbsolute()', 'moveabsolute'), false);
+  assert.equal(functionNameMatchesKeyword('MoveAbsolute()', 'Spiral'), false);
+  // 部分关键字（"函数名包含关键字"）仍然命中。
+  assert.equal(functionNameMatchesKeyword('MoveAbsolute()', 'Absolute'), true);
+  // 不相关的方括号内容不会被当成函数名。
+  assert.deepEqual(collectFunctionNameCandidates('[2026-09-26 00:44:56.222] [INFO] [WSP] plain text'), []);
+  // ⑤ 正文范围（scope=log）里，函数名写法也要能命中把名字写成 [MoveAbsolute] 的正文 ——
+  //    运行时和「测试解析」用的是同一个匹配器，测试通过就等于真的会命中。
+  const { matchDisplayRuleToMessage } = await import('../src/rendering/displayRules');
+  const logRule = {
+    id: 'r-log', name: 'log', enabled: true, kind: 'keyword' as const, scope: 'log' as const,
+    keyword: 'MoveAbsolute()', displayTemplate: '绝对移动',
+  };
+  const logMatch = matchDisplayRuleToMessage(logRule, '[MoveAbsolute] <() leave stage absolute move end status=ok');
+  assert.ok(logMatch, '函数名关键字应该命中把名字写成 [MoveAbsolute] 的正文');
+  assert.equal(logMatch?.text, '绝对移动');
+  // 不相干的关键字不能因为容错而乱命中。
+  assert.equal(matchDisplayRuleToMessage({ ...logRule, keyword: 'Spiral()' }, '[MoveAbsolute] <() leave stage absolute move end'), undefined);
+  console.log('语义规则函数名匹配检查通过');
+}

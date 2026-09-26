@@ -4478,16 +4478,21 @@ export default function App() {
   }, [activeTaskId, tasks]);
 
   const openEntryRuleEditor = useCallback((entry: LogEntry, ruleId?: string) => {
-    const suggestedKeyword = entry.functionName ?? entry.boundaryFunctionName ?? entry.message.slice(0, 80);
+    // 关键字来自**函数名**时（执行器日志的 `[MoveAbsolute] >() …` 就属于这种），
+    // 应用位置必须是「仅折叠函数标题」：把 `MoveAbsolute()` 这种函数名关键字丢进
+    // 「仅日志正文」里做字面匹配，正文里根本没有这个写法，测试解析必然提示未命中。
+    // 只有退回用正文片段当关键字时才是「仅日志正文」。
+    const entryFunctionName = entry.functionName ?? entry.boundaryFunctionName;
+    const suggestedKeyword = entryFunctionName ?? entry.message.slice(0, 80);
     setInlineRuleSeed({
       requestId: `entry-${entry.id}-${Date.now()}`,
       ruleId,
       source: 'log',
-      functionName: entry.functionName ?? entry.boundaryFunctionName,
+      functionName: entryFunctionName,
       sampleRaw: entry.raw,
-      suggestedName: `${entry.functionName ?? entry.boundaryFunctionName ?? '日志片段'} 语义说明`,
+      suggestedName: `${entryFunctionName ?? '日志片段'} 语义说明`,
       suggestedKeyword,
-      suggestedScope: 'log',
+      suggestedScope: entryFunctionName ? 'function' : 'log',
       ...ruleSourceContext(entry),
     });
   }, [ruleSourceContext]);
