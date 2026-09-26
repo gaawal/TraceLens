@@ -1096,26 +1096,7 @@ def query_environment_version(payload: dict[str, Any]) -> dict[str, Any]:
     environment = _environment(payload.get("environment_id"))
     from apps.environments.services.discovery import read_environment_versions
 
-    try:
-        return read_environment_versions(environment)
-    except Exception as exc:
-        # 兜到底：宁可把"为什么读不到"交给模型解释，也不要抛成一句
-        #「工具执行失败，详细异常已记录在后端日志」（用户看不到日志就等于没有信息）。
-        logger.warning(
-            "tooling.query_environment_version.failed environment=%s error=%s",
-            environment.id, exc, exc_info=True,
-        )
-        return {
-            "environment_id": environment.id,
-            "environment_name": environment.name,
-            "version": str(environment.software_version or "").strip(),
-            "checked_at": environment.version_checked_at,
-            "lower_versions": [],
-            "version_mismatch": False,
-            "mismatched_machine_ids": [],
-            "upper_error": str(exc),
-            "message": f"实时查询版本失败：{exc}",
-        }
+    return read_environment_versions(environment)
 
 
 def _deployment_merged_payload(environment: Environment, payload: dict[str, Any]) -> dict[str, Any]:

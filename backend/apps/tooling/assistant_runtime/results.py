@@ -224,11 +224,6 @@ def compact_environment_versions(data: dict[str, Any]) -> str:
     lines = [
         f"上位机版本={compact_scalar(data.get('version'))};版本不一致={compact_scalar(data.get('version_mismatch'))};检查时间={compact_scalar(data.get('checked_at'))}"
     ]
-    # 读不到版本时把**原因**放进这一行：模型据此解释"为什么没查到"，
-    # 而不是把空值当成"环境没有版本"（读不到 ≠ 不存在）。
-    problem = str(data.get("message") or data.get("upper_error") or data.get("error") or "").strip()
-    if problem:
-        lines.append(f"读取问题={compact_scalar(problem)}")
     lowers = [item for item in list(data.get("lower_versions") or []) if isinstance(item, dict)]
     for item in lowers[:20]:
         lines.append(

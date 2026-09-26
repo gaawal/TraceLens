@@ -459,7 +459,9 @@ def check_awk_window(client: paramiko.SSHClient) -> None:
 
 def check_version_file(client: paramiko.SSHClient) -> None:
     out, err, code = _exec(client, "cat -- /home/tracepilot/SW/version")
-    _record("cat 版本文件", code == 0 and out.decode().strip() == fleet.SOFTWARE_VERSION, out.decode().strip())
+    # 版本文件要和真实机器一致：带 `Current Version:` 标记（后端解析器只认这个）。
+    expected = f"Current Version: {fleet.SOFTWARE_VERSION}"
+    _record("cat 版本文件", code == 0 and out.decode().strip() == expected, out.decode().strip())
 
     out, _err, code = _exec(client, """printf '%s\n' "$(hostname)"; uname -srm""")
     _record("连接探测命令", code == 0 and b"\n" in out, out.decode().strip().replace("\n", " | ")[:48])

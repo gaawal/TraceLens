@@ -1016,7 +1016,7 @@ class LogFileIndexService:
             source_category=target.source_category,
             subsystem=subsystem,
             fm=fm,
-            port=_machine_ssh_port(target.machine),
+            port=machine_ssh_port(target.machine),
         )
 
     def _load_or_probe_direct(self, *, environment, target, lease, subsystem: str, fm: str, stat: RemoteFileStat, kind: str, operation_id: str = "") -> dict:

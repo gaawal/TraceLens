@@ -1417,11 +1417,14 @@ def plan_machine(spec: fleet.MachineSpec, *, now: datetime) -> list[tuple[str, P
         for relative, payload, count in run_family(now=now, today=today):
             plan.append((spec.run_root, relative, payload, count))
 
-    # 版本文件：后端 ResourceSettings.version_file_path 默认 ~/SW/version
+    # 版本文件：后端 ResourceSettings.version_file_path 默认 ~/SW/version。
+    # 🔴 内容必须是真实机器那种**带标记的**格式（`Current Version: <版本>`）：
+    # 后端 `discovery.parse_version_text()` 只认标记行，仿真里写一行裸版本号会让
+    # 「查询环境版本」判成"没找到 Current Version"→ 工具执行失败。
     plan.append((
         f"/home/{fleet.SIM_USERNAME}",
         Path("SW") / "version",
-        f"{fleet.SOFTWARE_VERSION}\n".encode("utf-8"),
+        f"Current Version: {fleet.SOFTWARE_VERSION}\n".encode("utf-8"),
         1,
     ))
     # 部署与「一键停/启进程」用的脚本。真实机器上是安装包带的，

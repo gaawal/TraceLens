@@ -2455,7 +2455,7 @@ def _artifact_cache_scope(environment: Environment, machine, artifact: LogArtifa
         source_category=artifact.source_category,
         subsystem=artifact.subsystem,
         fm=artifact.fm,
-        port=_machine_ssh_port(machine),
+        port=machine_ssh_port(machine),
     )
 
 

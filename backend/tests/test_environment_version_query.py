@@ -1,125 +1,21 @@
-"""版本查询链路：解析、容错、给模型的文案。
+"""版本查询链路的**契约**：仿真机必须生成真实机器那种版本文件。
 
-背景（用户报的 "查询环境版本 → 工具执行失败 / 没有搜到"）：两个原因叠在一起 ——
-1. 仿真机的假 shell 把 ``$HOME`` 映射到了**机器根**而不是用户家目录，于是后端
-   ``cat -- "$HOME"/SW/version`` 永远 "No such file or directory"；
-2. 后端解析器只认 ``Current Version:`` 标记行，而仿真机的版本文件就是一行裸版本号；
-   再加上上位机读取失败会让整个工具抛异常 → AI 只看到"工具执行失败"。
+背景（用户报的「查询环境版本 → 工具执行失败 / 没有搜到」）：
+1. 仿真假 shell 把 ``$HOME``（后端 ``read_text`` 用它读 ``~/SW/version``）映射到了机器根，
+   于是永远 "No such file or directory" —— 这是**仿真自己的 bug**，修在仿真里；
+2. 仿真写的版本文件是**一行裸版本号**，而后端 ``parse_version_text()`` 只认
+   ``Current Version: <版本>`` 标记行 —— 同样是仿真没对齐真实机器，所以仿真改成带标记的格式，
+   后端的查询逻辑**一行都不动**。
 
-这里守住修复后的行为：仿真 shell 的 ``$HOME`` 映射、裸版本号兜底、读取失败不再是异常、
-以及失败原因必须出现在给模型的文案里。
+这里守住两件事：仿真 shell 的 ``$HOME`` 语义、以及仿真版本文件能被后端原始解析器读出来。
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from datetime import datetime, timezone
 
-import pytest
+from apps.environments.services.discovery import parse_version_text
 
-from apps.environments.services.discovery import parse_version_text, read_environment_versions
-from apps.tooling.assistant_runtime.results import compact_environment_versions
-
-
-# --- 解析 -------------------------------------------------------------------
-
-def test_marker_lines_still_win():
-    assert parse_version_text("Current Version: SPM-V2026.09.23") == "SPM-V2026.09.23"
-    assert parse_version_text("Current XY Version: XY V100.2") == "XY V100.2"
-    # 多行时优先有标记的那行，别被其它行抢走。
-    assert parse_version_text("build 2026-09-26\nCurrent Version: SPM-V2026.09.23\n") == "SPM-V2026.09.23"
-
-
-def test_bare_version_file_is_accepted():
-    """仿真机 `~/SW/version` 就是一行裸版本号，以前会被判成"没找到标记"。"""
-    assert parse_version_text("SPM-V2026.09.23\n") == "SPM-V2026.09.23"
-    assert parse_version_text("  SPM-V2026.09.23  ") == "SPM-V2026.09.23"
-
-
-def test_bare_fallback_does_not_grab_junk():
-    """兜底必须保守：说明文字、日期、多词行都不能当成版本。"""
-    for content in ("Release Notes\nREADME", "2026-09-26", "", "build failed see log\n", "no version here"):
-        assert parse_version_text(content) == "", f"{content!r} 不该被解析出主版本"
-
-
-# --- 上/下位机查询容错 -------------------------------------------------------
-
-class _EmptyRelations:
-    def select_related(self, *args, **kwargs):
-        return self
-
-    def filter(self, **kwargs):
-        return []
-
-
-def _environment(**overrides):
-    base = {
-        "id": 2,
-        "name": "SIM-EUV-01",
-        "software_version": "SPM-V2026.09.23",
-        "version_checked_at": None,
-        "machine_relations": _EmptyRelations(),
-    }
-    base.update(overrides)
-    return SimpleNamespace(**base)
-
-
-def _settings():
-    return SimpleNamespace(version_file_path="~/SW/version")
-
-
-def test_upper_read_failure_is_reported_not_raised(monkeypatch):
-    """上位机读不到版本文件时：保留上次已知版本 + 带出原因，而不是抛异常。"""
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("cat: .../SW/version: No such file or directory")
-
-    monkeypatch.setattr("apps.environments.services.discovery.read_software_version", boom)
-    data = read_environment_versions(_environment(), _settings())
-
-    assert data["version"] == "SPM-V2026.09.23", "读不到就退回上一次已知版本"
-    assert data["upper_error"], "必须带出失败原因"
-    assert "No such file" in data["upper_error"]
-    assert data["message"].startswith("上位机版本文件读取失败")
-    assert data["lower_versions"] == []
-
-
-def test_successful_upper_read_has_no_error(monkeypatch):
-    monkeypatch.setattr(
-        "apps.environments.services.discovery.read_software_version",
-        lambda environment, settings_obj: "SPM-V2026.09.23",
-    )
-    data = read_environment_versions(_environment(), _settings())
-    assert data["version"] == "SPM-V2026.09.23"
-    assert data["upper_error"] == "" and data["message"] == ""
-
-
-# --- 给模型的文案 -----------------------------------------------------------
-
-def test_compact_text_tells_the_model_why_it_failed():
-    """空值 ≠ 不存在：读不到时必须把原因交给模型，否则它会答"环境没有版本"。"""
-    text = compact_environment_versions({
-        "version": "",
-        "version_mismatch": False,
-        "checked_at": None,
-        "lower_versions": [],
-        "upper_error": "读取远程文件失败 ~/SW/version：No such file or directory",
-    })
-    assert "读取问题=" in text
-    assert "No such file" in text
-
-
-def test_compact_text_has_no_problem_line_on_success():
-    text = compact_environment_versions({
-        "version": "SPM-V2026.09.23",
-        "version_mismatch": False,
-        "checked_at": "2026-09-26T03:10:44Z",
-        "lower_versions": [],
-    })
-    assert text.startswith("上位机版本=SPM-V2026.09.23")
-    assert "读取问题" not in text
-
-
-# --- 仿真 shell 的 $HOME 映射 -------------------------------------------------
 
 def _shell(role: str):
     from simremote import fleet
@@ -129,25 +25,57 @@ def _shell(role: str):
     return RemoteShell(spec)
 
 
-@pytest.mark.parametrize("role", ["upper", "lower"])
-def test_sim_shell_maps_dollar_home_to_the_user_home(role):
-    """``$HOME`` 必须等于 ``~``：后端的 read_text 正是用 ``"$HOME"/SW/version`` 读版本文件的。"""
-    shell = _shell(role)
-    home = str(shell.home)
-    assert shell.rewrite_command('cat -- "$HOME"/SW/version').endswith(f"{home}/SW/version")
-    assert shell.rewrite_command("cat -- $HOME/SW/version").endswith(f"{home}/SW/version")
-    assert shell.rewrite_command("cat -- ~/SW/version").endswith(f"{home}/SW/version")
-    # 远端绝对路径仍然映射到机器根，别被家目录替换带偏。
-    # （映射结果是 `<root>//log/...`，多一个斜杠是既有写法，路径语义不变，这里一并归一后比较。）
-    mapped = shell.rewrite_command("ls /log/tracepilot/debug").replace("//", "/")
-    assert mapped.endswith(f"{shell.root}/log/tracepilot/debug")
+def _version_plan(role: str) -> bytes:
+    """跑一遍 simremote 的计划生成，取出它准备写进 ``~/SW/version`` 的字节。"""
+    from simremote import fleet, loggen
+
+    spec = [machine for machine in fleet.FLEET if machine.role == role][0]
+    plan = loggen.plan_machine(spec, now=datetime.now(timezone.utc))
+    for _root, relative, payload, _count in plan:
+        if str(relative) == "SW/version":
+            return payload
+    raise AssertionError("plan_machine 没有生成 SW/version")
+
+
+# --- 仿真 shell：$HOME 必须等于 ~ -------------------------------------------
+
+def test_sim_shell_maps_dollar_home_to_the_user_home():
+    """``$HOME`` 与 ``~`` 指向同一个目录（后端 read_text 用的正是 ``"$HOME"/…``）。"""
+    for role in ("upper", "lower"):
+        shell = _shell(role)
+        home = str(shell.home)
+        assert shell.rewrite_command('cat -- "$HOME"/SW/version').endswith(f"{home}/SW/version")
+        assert shell.rewrite_command("cat -- $HOME/SW/version").endswith(f"{home}/SW/version")
+        assert shell.rewrite_command("cat -- ~/SW/version").endswith(f"{home}/SW/version")
+        # 远端绝对路径仍然映射到机器根（映射结果里 `<root>//log/...` 多一个斜杠是既有写法）。
+        mapped = shell.rewrite_command("ls /log/tracepilot/debug").replace("//", "/")
+        assert mapped.endswith(f"{shell.root}/log/tracepilot/debug")
 
 
 def test_sim_shell_can_actually_read_the_version_file():
-    """真读一遍：这条曾经是 No such file（就是用户看到的"工具执行失败"）。"""
+    """真读一遍：这条曾经是 No such file（用户看到的"工具执行失败"）。"""
     from simremote import fleet
 
     for role in ("upper", "lower"):
         result = _shell(role).execute('cat -- "$HOME"/SW/version')
         assert result.status == 0, f"{role} 读不到版本文件：{result.stderr.decode().strip()}"
-        assert result.stdout.decode().strip() == fleet.SOFTWARE_VERSION
+        assert parse_version_text(result.stdout.decode()) == fleet.SOFTWARE_VERSION
+
+
+# --- 版本文件格式：仿真写的内容必须能被后端**原始**解析器读出来 ---------------
+
+def test_sim_writes_a_version_file_the_backend_parser_accepts():
+    """仿真生成的版本文件带 ``Current Version:`` 标记（真实机器就是这种格式）。"""
+    from simremote import fleet
+
+    payload = _version_plan("upper").decode("utf-8")
+    assert "Current Version:" in payload, f"仿真版本文件缺少标记行：{payload!r}"
+    assert parse_version_text(payload) == fleet.SOFTWARE_VERSION
+
+
+def test_backend_parser_stays_strict():
+    """后端解析逻辑保持原样：只认标记行，裸版本号/说明文字/日期都不算（仿真去对齐它）。"""
+    assert parse_version_text("Current Version: SPM-V2026.09.23") == "SPM-V2026.09.23"
+    assert parse_version_text("Current XY Version: XY V100.2") == "XY V100.2"
+    assert parse_version_text("SPM-V2026.09.23") == ""
+    assert parse_version_text("Release Notes\nREADME") == ""
