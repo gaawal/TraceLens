@@ -17902,17 +17902,16 @@ html.workstation-docked {
 /* ── 函数折叠：展开/收起动效 + 展开时卡片自己就是入口日志 ────────────────────
    入口行不再作为子节点重复出现（原来展开后第一行和卡片一模一样，只多了详情）；
    展开时卡片里直接显示入口日志的级别 / 正文 / 源码位置。 */
-.function-entry-detail {
-  display: flex; align-items: baseline; gap: 6px;
-  margin-top: 3px; min-width: 0;
+/* 展开后接在同一行后面的入口日志：级别 + 正文（源码位置卡片右侧统计里已有）。
+   必须不换行：正文太长就省略，别把这一行撑成两行。 */
+.function-title-row { flex-wrap: nowrap; overflow: hidden; }
+.function-title-row .function-entry-message {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: #334155;
-  font: 11px/1.5 "Cascadia Code", Consolas, monospace;
+  font: 11px "Cascadia Code", Consolas, monospace;
 }
-.function-entry-detail .function-entry-message {
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.function-entry-detail code { flex: none; color: #94a3b8; font-size: 10px; }
-.function-entry-detail .level-badge { flex: none; }
+.function-title-row .level-badge { flex: none; }
 
 @keyframes function-children-in {
   from { opacity: 0; transform: translateY(-4px); }

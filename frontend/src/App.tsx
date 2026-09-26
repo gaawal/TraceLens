@@ -3341,17 +3341,18 @@ function FunctionItem({
                 {semanticText && <span className={classNames('semantic-function-description', semanticMatch ? 'rule' : 'auto')} title={semanticOrigin?.title}>{semanticText}</span>}
                 {semanticOrigin && <span className={`semantic-origin-badge function-semantic-origin ${semanticOrigin.className}`} title={semanticOrigin.title}>{semanticOrigin.label}</span>}
               </span>
+              {/* 展开时就把入口日志接在**同一行**后面（级别 + 正文 + 源码位置），
+                  和原先的日志行一致；不再另起一行，也不在子列表里重复这一条。 */}
+              {expanded && (
+                <>
+                  <span className={classNames('level-badge', `level-${String(node.startEntry.level || '').toLowerCase()}`)}>{node.startEntry.level}</span>
+                  {/* 源码位置不用再追加一遍：卡片右侧的统计里本来就有（wsp / cpfr）。 */}
+                  <span className="function-entry-message" title={node.startEntry.raw}>{node.startEntry.message}</span>
+                </>
+              )}
               {severity === 'error' && <span className="severity-badge error">ERROR 链路</span>}
               {severity === 'warning' && <span className="severity-badge warning">WARN</span>}
             </span>
-            {/* 展开时卡片自己就是「入口日志」：原来这只是子节点里重复的第一行。 */}
-            {expanded && (
-              <span className="function-entry-detail" title={node.startEntry.raw}>
-                <span className={classNames('level-badge', `level-${String(node.startEntry.level || '').toLowerCase()}`)}>{node.startEntry.level}</span>
-                <span className="function-entry-message">{node.startEntry.message}</span>
-                {node.source.raw && <code>{node.source.raw}</code>}
-              </span>
-            )}
           </span>
           <span className="function-stats">
             {(node.origin === 'boundary' || node.origin === 'repeated') && <span className="function-source" title={node.source.raw}>{node.source.raw}</span>}
