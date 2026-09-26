@@ -30,6 +30,9 @@ _VERSION_LINE_RE = re.compile(
 )
 
 
+_BARE_VERSION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.+\-]{1,63}$")
+
+
 def parse_version_text(content: str) -> str:
     """Parse both `Current Version:` and product-qualified variants.
 
@@ -41,6 +44,22 @@ def parse_version_text(content: str) -> str:
         match = _VERSION_LINE_RE.search(line.strip().strip("'\""))
         if match:
             return match.group("version").strip().strip("'\"")
+    return _parse_bare_version_line(content)
+
+
+def _parse_bare_version_line(content: str) -> str:
+    """兜底：有些机器的版本文件就是**一行裸版本号**。
+
+    仿真机上 ``~/SW/version`` 的内容是 ``SPM-V2026.09.23``（没有 ``Current Version:``
+    标记），严格解析会判成"没找到标记"→ 版本查询整个失败、AI 只看到"工具执行失败"。
+    这里只认**单 token、以字母开头、且必须含数字**的行，避免把历史版本行或说明文字误当成当前版本。
+    """
+    for line in content.splitlines():
+        text = line.strip().strip("'\"")
+        if not text or len(text.split()) != 1:
+            continue
+        if _BARE_VERSION_RE.match(text) and any(ch.isdigit() for ch in text):
+            return text
     return ""
 
 
@@ -102,7 +121,20 @@ def read_environment_versions(environment: Environment, settings_obj: ResourceSe
     endpoints keep their existing special handling and are excluded from consistency checks.
     """
     settings_obj = settings_obj or ResourceSettings.get_solo()
-    upper_version = read_software_version(environment, settings_obj)
+    # 上位机读不到版本文件**不该让整个查询失败**：机器离线、版本文件还没落盘、路径配错
+    # 都会走到这里。以前直接抛异常 → AI 助手只看到一句"工具执行失败"，也不知道是为什么。
+    # 现在把原因带回去，同时保留上一次已知版本。
+    upper_version = ""
+    upper_error = ""
+    try:
+        upper_version = read_software_version(environment, settings_obj)
+    except Exception as exc:
+        upper_error = str(exc)
+        upper_version = str(environment.software_version or "").strip()
+        logger.warning(
+            "version.upper_query.failed environment=%s path=%s error=%s",
+            environment.id, settings_obj.version_file_path, exc,
+        )
     lower_results = []
     mismatched_machine_ids = []
     relations = list(
@@ -155,11 +187,14 @@ def read_environment_versions(environment: Environment, settings_obj: ResourceSe
             })
     return {
         "environment_id": environment.id,
+        "environment_name": environment.name,
         "version": upper_version,
         "checked_at": environment.version_checked_at,
         "lower_versions": lower_results,
         "version_mismatch": bool(mismatched_machine_ids),
         "mismatched_machine_ids": mismatched_machine_ids,
+        "upper_error": upper_error,
+        "message": f"上位机版本文件读取失败：{upper_error}" if upper_error else "",
     }
 
 

@@ -195,7 +195,14 @@ class RemoteShell:
         """
         replacement = str(self.root).rstrip("/") + "/"
         simulated_home = str(self.home).rstrip("/")
-        text = command.replace('"$HOME"/', replacement).replace("$HOME/", replacement)
+        home_replacement = simulated_home + "/"
+        # 🔴 ``$HOME`` 必须指向**模拟用户的家目录**（``<root>/home/<user>``），不是机器根。
+        # 后端的 ``read_text``/``_shell_path`` 会把 ``~/SW/version`` 改写成
+        # ``cat -- "$HOME"/SW/version``（``~`` 与 ``$HOME`` 在真实机器上是同一个目录）；
+        # 映射成机器根就会去找 ``<root>/SW/version`` → 版本查询、stations.xml 读取
+        # 全部 "No such file or directory"，前端/AI 看到的就是一句"工具执行失败"。
+        text = command.replace('"$HOME"/', home_replacement).replace("$HOME/", home_replacement)
+        text = re.sub(r'(?<![\w.])"?\$HOME"?(?=\s|$|[;&|])', simulated_home, text)
         text = re.sub(r"(?<![\w.\-])~(?=/|\s|$)", simulated_home, text)
         return _PREFIX_RE.sub(lambda match: replacement + match.group(1), text)
 
