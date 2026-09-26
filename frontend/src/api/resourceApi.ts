@@ -50,8 +50,10 @@ export interface EnvironmentSummary {
   version_mismatch_hosts?: string[];
   last_discovered_at?: string;
   description: string;
-  /** 收藏（五角星）：存在环境上，所以团队看到的是同一份收藏。 */
-  is_favorite?: boolean;
+  /**
+   * 收藏（五角星）**不在环境上、也不由后端返回**：它是"我的工作台"，按浏览器存在
+   * localStorage（见 `services/favoriteEnvironments.ts`）—— 每个人可以有自己的一份收藏。
+   */
 }
 
 export type DeploymentStatus = 'scheduled' | 'pending' | 'running' | 'stopping' | 'stopped' | 'success' | 'failed';
@@ -1856,7 +1858,7 @@ export async function disconnectMachineSession(id: number): Promise<void> {
   return api(`/machines/${id}/disconnect-session/`, { method: 'POST', body: '{}' });
 }
 
-export async function updateEnvironment(id: number, payload: { name?: string; description?: string; folder?: number | null; is_favorite?: boolean }): Promise<EnvironmentSummary> {
+export async function updateEnvironment(id: number, payload: { name?: string; description?: string; folder?: number | null }): Promise<EnvironmentSummary> {
   return api(`/environments/${id}/`, { method: 'PATCH', body: JSON.stringify(payload) });
 }
 

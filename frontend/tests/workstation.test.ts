@@ -466,3 +466,52 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   );
   console.log('Workstation checks passed: 折叠栏展开后按折叠依据还原入口形态 (>() / <()).');
 }
+
+// --- 环境收藏存在本浏览器（不是环境上的字段）--------------------------------
+// Regression: 收藏以前写 `Environment.is_favorite`，全团队共用一份；收藏是"我的工作台"，
+// 应该只存在当前浏览器的 localStorage 里，每个人各不相同。
+{
+  // 测试环境里 window 是个独立的 EventTarget，需要把 localStorage 挂上去。
+  const favStorage = new Map<string, string>();
+  const favArea = {
+    getItem: (k: string) => (favStorage.has(k) ? favStorage.get(k)! : null),
+    setItem: (k: string, v: string) => { favStorage.set(k, v); },
+    removeItem: (k: string) => { favStorage.delete(k); },
+    clear: () => favStorage.clear(),
+    key: (i: number) => [...favStorage.keys()][i] ?? null,
+    get length() { return favStorage.size; },
+  } as unknown as Storage;
+  Object.assign((globalThis as { window: Record<string, unknown> }).window, { localStorage: favArea });
+
+  const fav = await import('../src/services/favoriteEnvironments');
+  const KEY = 'tracelens.favorite-environments.v1';
+
+  fav.saveFavoriteEnvironmentIds([]);
+  assert.deepEqual([...fav.loadFavoriteEnvironmentIds()], [], '初始为空');
+  assert.equal(fav.toggleFavoriteEnvironment(2), true, '第一次点=收藏');
+  assert.equal(fav.isFavoriteEnvironment(2), true);
+  assert.deepEqual(JSON.parse(favStorage.get(KEY) || '[]'), [2], '落进 localStorage');
+  assert.equal(fav.toggleFavoriteEnvironment(2), false, '再点=取消');
+  assert.deepEqual(JSON.parse(favStorage.get(KEY) || '[]'), [], '取消后写回空数组');
+
+  // 订阅：同页面其它组件要立刻知道
+  const seen: number[][] = [];
+  const off = fav.subscribeFavoriteEnvironments((ids) => seen.push([...ids]));
+  fav.toggleFavoriteEnvironment(7);
+  fav.toggleFavoriteEnvironment(9);
+  off();
+  fav.toggleFavoriteEnvironment(11);
+  assert.deepEqual(seen, [[7], [7, 9]], '订阅收到每次变化，取消后不再收到');
+
+  // 容错：脏数据、重复、非法 id 都不能带进来
+  favArea.setItem(KEY, JSON.stringify([3, 3, '4', 0, -1, 'abc', null]));
+  assert.deepEqual([...fav.loadFavoriteEnvironmentIds()].sort((a, b) => a - b), [3, 4], '只保留正整数且去重');
+
+  // 环境删掉后清理收藏，别让 localStorage 越积越多
+  fav.saveFavoriteEnvironmentIds([3, 4, 5]);
+  assert.deepEqual([...fav.pruneFavoriteEnvironments([4, 5, 6])].sort((a, b) => a - b), [4, 5], '清掉已不存在的环境');
+  assert.deepEqual([...fav.loadFavoriteEnvironmentIds()].sort((a, b) => a - b), [4, 5], '清理结果要落盘');
+
+  fav.saveFavoriteEnvironmentIds([]);
+  console.log('Workstation checks passed: 环境收藏只存在本浏览器（localStorage），支持订阅、脏数据过滤与失效清理.');
+}

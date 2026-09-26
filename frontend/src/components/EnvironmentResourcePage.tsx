@@ -61,6 +61,13 @@ import {
 } from '../api/resourceApi';
 import { EnvironmentDeploymentDialog } from './EnvironmentDeploymentDialog';
 import { subscribeDeploymentRealtime } from '../services/deploymentRealtime';
+import {
+  loadFavoriteEnvironmentIds,
+  pruneFavoriteEnvironments,
+  subscribeFavoriteEnvironments,
+  toggleFavoriteEnvironment,
+  watchFavoriteEnvironmentsStorage,
+} from '../services/favoriteEnvironments';
 
 interface Props {
   initialEnvironmentId?: number;
@@ -289,6 +296,8 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
   const [dhhConnectionToken, setDhhConnectionToken] = useState('');
   const [catalog, setCatalog] = useState<EnvironmentLogTree>();
   const [selectedResources, setSelectedResources] = useState<Set<number>>(new Set());
+  /** 收藏是**本浏览器**的（localStorage），不是环境上的字段：每个人可以有自己的一份。 */
+  const [favoriteIds, setFavoriteIds] = useState<Set<number>>(() => loadFavoriteEnvironmentIds());
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(loadStoredCollapsedFolders);
   const [treeSearchQuery, setTreeSearchQuery] = useState('');
   const [deploymentOpen, setDeploymentOpen] = useState(false);
@@ -307,6 +316,18 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
     setActiveResourceId(initialEnvironmentId);
     setOpenTabs((current) => current.includes(initialEnvironmentId) ? current : [...current, initialEnvironmentId]);
   }, [initialEnvironmentId, environments]);
+
+  // 收藏存在本浏览器：订阅同页面变化 + 多标签页 storage 事件；环境删掉后顺手清掉收藏。
+  useEffect(() => {
+    const unsubscribe = subscribeFavoriteEnvironments((ids) => setFavoriteIds(new Set(ids)));
+    const stopWatching = watchFavoriteEnvironmentsStorage();
+    return () => { unsubscribe(); stopWatching(); };
+  }, []);
+
+  useEffect(() => {
+    if (!environments.length) return;
+    setFavoriteIds(pruneFavoriteEnvironments(environments.map((item) => item.id)));
+  }, [environments]);
 
 
   useEffect(() => {
@@ -402,14 +423,14 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
     return groups.filter((group) => group.environments.length > 0);
   }, [environments, folders]);
 
-  // 总览统计：部署中直接取部署状态，收藏取环境上的 is_favorite，避免再引一份易漂移的本地状态。
+  // 总览统计：部署中取部署状态；收藏取**本浏览器的**收藏（服务端不再存，见 favoriteEnvironments）。
   const overviewStats = useMemo(() => ({
     deploying: environments.filter((item) => {
       const status = deploymentByEnvironment[item.id]?.status;
       return Boolean(status && ['pending', 'running', 'stopping'].includes(status));
     }).length,
-    favorite: environments.filter((item) => item.is_favorite).length,
-  }), [environments, deploymentByEnvironment]);
+    favorite: environments.filter((item) => favoriteIds.has(item.id)).length,
+  }), [environments, deploymentByEnvironment, favoriteIds]);
 
   async function refresh(preferredId?: number) {
     setLoading(true);
@@ -601,16 +622,15 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
     } finally { setBusy(''); }
   }
 
-  /** 收藏：写环境上的 is_favorite，成功后本地就地更新（不必整表重拉）。 */
-  async function toggleFavorite(environment: EnvironmentSummary) {
-    const next = !environment.is_favorite;
-    try {
-      await updateEnvironment(environment.id, { is_favorite: next });
-      setEnvironments((current) => current.map((item) => item.id === environment.id ? { ...item, is_favorite: next } : item));
-      setResourceMessage(environment.id, next ? `已收藏 ${environment.name}` : `已取消收藏 ${environment.name}`);
-    } catch (exc) {
-      setResourceErrors((current) => ({ ...current, [environment.id]: exc instanceof Error ? exc.message : String(exc) }));
-    }
+  /**
+   * 收藏：**只写本浏览器**（localStorage），不发请求。
+   *
+   * 收藏是"我的工作台"而不是环境的属性 —— 存在服务端会造成全团队共用一份收藏。
+   */
+  function toggleFavorite(environment: EnvironmentSummary) {
+    const nowFavorite = toggleFavoriteEnvironment(environment.id);
+    setFavoriteIds(loadFavoriteEnvironmentIds());
+    setResourceMessage(environment.id, nowFavorite ? `已收藏 ${environment.name}` : `已取消收藏 ${environment.name}`);
   }
 
   /**
@@ -1138,15 +1158,15 @@ export function EnvironmentResourcePage({ initialEnvironmentId, onOpenLogLocator
           {isDeploying && <span className="resource-card-deploying" title={deploymentState?.message || '部署中'}><LoaderCircle className="spin" size={14} />部署中</span>}
           <button
             type="button"
-            className={`resource-card-favorite ${environment.is_favorite ? 'active' : ''}`}
-            title={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
-            aria-label={environment.is_favorite ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
-            aria-pressed={Boolean(environment.is_favorite)}
+            className={`resource-card-favorite ${favoriteIds.has(environment.id) ? 'active' : ''}`}
+            title={favoriteIds.has(environment.id) ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
+            aria-label={favoriteIds.has(environment.id) ? `取消收藏 ${environment.name}` : `收藏 ${environment.name}`}
+            aria-pressed={favoriteIds.has(environment.id)}
             // 按住就拦住：有些容器用 pointerdown 触发导航，光拦截 click 来不及。
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => { event.stopPropagation(); void toggleFavorite(environment); }}
           >
-            <Star size={15} fill={environment.is_favorite ? 'currentColor' : 'none'} />
+            <Star size={15} fill={favoriteIds.has(environment.id) ? 'currentColor' : 'none'} />
           </button>
         </header>
 
