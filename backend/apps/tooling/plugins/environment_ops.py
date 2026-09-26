@@ -282,7 +282,10 @@ def create_environment_resource(payload: dict) -> dict[str, Any]:
 @register_function_tool(ToolDefinition(
     id="delete_environment_resource",
     name="删除环境资源",
-    description="删除一个 TraceLens 环境（其部署记录与绑定关系一并移除）。高风险写操作，必须经用户确认。",
+    description=(
+        "删除一个 TraceLens 环境：部署记录、上下位机绑定关系，以及**只属于它的机器**一并移除"
+        "（还被别的环境引用的机器不动）。高风险写操作，必须经用户确认。"
+    ),
     category="环境操作",
     handler=None,
     agent_exposed=True,
@@ -315,7 +318,8 @@ def create_environment_resource(payload: dict) -> dict[str, Any]:
     implementation="apps.tooling.plugins.environment_ops.delete_environment_resource",
 ))
 def delete_environment_resource(payload: dict) -> dict[str, Any]:
-    from apps.environments.models import Environment
+    from apps.environments.models import Environment, MachineRelation
+    from apps.machines.models import Machine
 
     environment = _environment(payload.get("environment_id"))
     confirm_name = str(payload.get("confirm_name") or "").strip()
@@ -323,6 +327,15 @@ def delete_environment_resource(payload: dict) -> dict[str, Any]:
         raise ValueError(
             f"confirm_name 必须与环境名称完全一致（当前为「{environment.name}」），已拒绝删除。"
         )
+
+    # 这台环境用到的机器：上位机（OneToOne）+ 拓扑关系里的上/下位机。
+    # 删环境之前先记下来 —— 关系是 CASCADE，环境一删就查不到了。
+    machine_ids = {environment.upper_machine_id} if environment.upper_machine_id else set()
+    relations = list(environment.machine_relations.values_list("source_machine_id", "target_machine_id"))
+    for source_id, target_id in relations:
+        machine_ids.update({source_id, target_id})
+    machine_ids.discard(None)
+
     snapshot = {
         "environment_id": environment.pk,
         "name": environment.name,
@@ -330,5 +343,21 @@ def delete_environment_resource(payload: dict) -> dict[str, Any]:
         "deployment_count": environment.deployments.count(),
     }
     environment.delete()
-    logger.warning("tooling.environment.deleted %s", snapshot)
-    return {"ok": True, "deleted": snapshot, "note": "环境及其部署记录已删除。"}
+
+    # 🔴 顺手把**只属于这台环境**的机器也删掉：
+    # 以前只删环境，机器会变成孤儿 —— 界面上看不见，但再建同名机器会报「机器名已存在」，
+    # 而且会一直堆在库里。还被别的环境/关系引用的机器不动（upper_machine 是 PROTECT）。
+    removed_machines: list[dict[str, Any]] = []
+    for machine in Machine.objects.filter(pk__in=machine_ids):
+        if Environment.objects.filter(upper_machine=machine).exists():
+            continue
+        if MachineRelation.objects.filter(source_machine=machine).exists() or MachineRelation.objects.filter(target_machine=machine).exists():
+            continue
+        removed_machines.append({"machine_id": machine.pk, "name": machine.name, "host": machine.host})
+        machine.delete()
+
+    logger.warning("tooling.environment.deleted %s machines=%s", snapshot, [item["name"] for item in removed_machines])
+    note = "环境及其部署记录已删除。"
+    if removed_machines:
+        note += f"同时删除了 {len(removed_machines)} 台只属于它的机器：" + "、".join(item["name"] for item in removed_machines) + "。"
+    return {"ok": True, "deleted": snapshot, "removed_machines": removed_machines, "note": note}
