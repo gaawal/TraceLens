@@ -18028,3 +18028,12 @@ html.workstation-docked {
 }
 .operation-user { color: #101828; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
 .operation-user::after { content: '·'; margin-left: 5px; color: #98a2b3; }
+
+/* 缩进树每行的时间：直接显示日志里的时间字符串（解析不出时间戳时也照样看得到）。 */
+.time-tree-node-time {
+  flex: none;
+  color: #6b7f91;
+  font: 9.5px/12px "Cascadia Code", Consolas, monospace;
+}
+/* 时间字符串模式下的刻度标签比时间戳标签长一点，别互相压住。 */
+.time-tree-axis-track .time-tree-tick em { max-width: 108px; overflow: hidden; text-overflow: ellipsis; }

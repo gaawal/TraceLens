@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { AlertTriangle, Maximize2, ZoomIn, ZoomOut } from 'lucide-react';
-import type { ContentSeverity, FunctionNode, TraceTimeline } from '../types';
+import type { ContentSeverity, FunctionNode, TimelineItem, TraceTimeline } from '../types';
 import { functionNodeEntries, matchDisplayRulesToFunction, type DisplayRule } from '../rendering/displayRules';
 import { durationNs, formatDuration } from '../parser/treeBuilder';
 import { timestampToNs } from '../parser/logParser';
+import { buildTimeSequence, shortTimeLabel } from '../rendering/timeAxis';
 
 /**
  * 时间轴缩进树 —— 保留折叠树的嵌套结构，同时把「谁先谁后」画清楚。
@@ -41,6 +42,9 @@ interface TreeRow {
   severity: ContentSeverity;
   startNs?: bigint;
   endNs?: bigint;
+  /** 日志里的时间字符串（正则抓出来的原文）。解析不出时间戳时，行顺序与时间轴都用它排。 */
+  startText?: string;
+  endText?: string;
   semantic?: string;
 }
 
@@ -67,19 +71,32 @@ function entryNs(entry: { timestampNs?: bigint; timestamp?: string }): bigint | 
   return text ? timestampToNs(text) : undefined;
 }
 
-/** 节点的时间范围：优先用折叠边界，缺失时退回子树内日志行的最早/最晚时间。 */
-function nodeRange(node: FunctionNode): { startNs?: bigint; endNs?: bigint } {
+/** 节点的时间范围：优先用折叠边界，缺失时退回子树内日志行的最早/最晚时间。
+ *
+ * 同时带出**日志原文里的时间字符串**：解析不出时间戳时（格式没配 / 格式不匹配），
+ * 时间字符串仍然能用——按字典序排就是时间先后，直接展示给用户看的就是它。
+ */
+export function nodeRange(node: FunctionNode): { startNs?: bigint; endNs?: bigint; startText: string; endText: string } {
+  const entries = functionNodeEntries(node);
+  const textOf = (entry?: { timestamp?: string } | null): string => String(entry?.timestamp || '').trim();
+  const texts = entries.map(textOf).filter(Boolean);
+  const sorted = [...texts].sort();
+  const startText = textOf(node.startEntry) || sorted[0] || '';
+  const endText = textOf(node.endEntry ?? node.startEntry) || sorted[sorted.length - 1] || startText;
+
   const directStart = entryNs(node.startEntry);
   if (directStart !== undefined) {
-    return { startNs: directStart, endNs: entryNs(node.endEntry ?? node.startEntry) ?? directStart };
+    return { startNs: directStart, endNs: entryNs(node.endEntry ?? node.startEntry) ?? directStart, startText, endText };
   }
-  const times = functionNodeEntries(node)
+  const times = entries
     .map((entry) => entryNs(entry))
     .filter((value): value is bigint => value !== undefined);
-  if (!times.length) return {};
+  if (!times.length) return { startText, endText };
   return {
     startNs: times.reduce((min, value) => (value < min ? value : min)),
     endNs: times.reduce((max, value) => (value > max ? value : max)),
+    startText,
+    endText,
   };
 }
 
@@ -97,6 +114,8 @@ function collectRows(items: readonly FunctionNode[], depth: number, rules: reado
       severity: subtreeSeverity(node),
       startNs: range.startNs,
       endNs: range.endNs,
+      startText: range.startText,
+      endText: range.endText,
       semantic: matchDisplayRulesToFunction([...rules], node)?.text,
     });
     collectRows(children, depth + 1, rules, out, seen);
@@ -152,6 +171,18 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
     return { min, max, spanNs, spanMs: Number(spanNs) / 1_000_000 };
   }, [rows]);
 
+  /**
+   * 时间字符串序列：解析不出时间戳时的**兜底坐标**。
+   *
+   * 日志里明明有时间（正则已经抓成字符串了），只是没被认成可计算的时间戳。
+   * 这种格式（`YYYY-MM-DD HH:MM:SS.fff` 之类）**按字典序排就是时间先后**，
+   * 所以直接拿字符串当刻度：序号 → 横坐标，轴上的标签就是日志里的原文。
+   */
+  const sequence = useMemo(() => buildTimeSequence(activeTrace?.items ?? []), [activeTrace]);
+
+  /** 有时间戳就按真实时间铺开；没有就按日志时间字符串的先后顺序等距铺开。 */
+  const axisMode: 'time' | 'sequence' = span ? 'time' : 'sequence';
+
   const maxDepth = rows.reduce((deepest, row) => Math.max(deepest, row.depth), 0);
   const labelWidth = LABEL_BASE + maxDepth * INDENT;
   const trackWidth = 1400;
@@ -165,7 +196,39 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
     return (Number(ns - span.min) / Number(span.spanNs)) * trackPx;
   }, [span, trackPx]);
 
+  /** 序号 → 横坐标（时间字符串模式下用）。 */
+  const indexToX = useCallback((index: number): number => {
+    if (sequence.last <= 0) return 0;
+    return (Math.max(0, Math.min(index, sequence.last)) / sequence.last) * trackPx;
+  }, [sequence.last, trackPx]);
+
+  /** 一行的时间条位置：优先真实时间，否则按时间字符串的序号。 */
+  const barGeometry = useCallback((row: TreeRow): { x: number; width: number } => {
+    if (axisMode === 'time') {
+      const x = timeToX(row.startNs);
+      return { x, width: Math.max(MIN_BAR, timeToX(row.endNs) - x) };
+    }
+    const startIndex = sequence.indexOf.get(row.startText || '') ?? 0;
+    const endIndex = sequence.indexOf.get(row.endText || row.startText || '') ?? startIndex;
+    const x = indexToX(startIndex);
+    return { x, width: Math.max(MIN_BAR, indexToX(Math.max(startIndex, endIndex)) - x) };
+  }, [axisMode, sequence, timeToX, indexToX]);
+
   const ticks = useMemo(() => {
+    if (axisMode === 'sequence') {
+      if (!sequence.labels.length) return [];
+      // 均匀挑几个刻度，标签直接用日志里的时间原文（不做任何时间戳换算）。
+      const step = Math.max(1, Math.ceil(sequence.labels.length / 8));
+      const result: Array<{ x: number; label: string }> = [];
+      for (let index = 0; index < sequence.labels.length && result.length < 12; index += step) {
+        result.push({ x: indexToX(index), label: shortTimeLabel(sequence.labels[index]) });
+      }
+      const lastX = indexToX(sequence.last);
+      if (result[result.length - 1]?.x !== lastX) {
+        result.push({ x: lastX, label: shortTimeLabel(sequence.labels[sequence.last]) });
+      }
+      return result;
+    }
     if (!span || span.spanMs <= 0) return [];
     const step = pickTickStep(span.spanMs, 7);
     const base = Number(span.min) / 1_000_000;
@@ -182,7 +245,7 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
     result.unshift({ x: 0, label: formatTick(base, showDate) });
     if (span.spanMs > step) result.push({ x: trackPx, label: formatTick(base + span.spanMs, showDate) });
     return result;
-  }, [span, showDate, trackPx]);
+  }, [axisMode, sequence, indexToX, span, showDate, trackPx]);
 
   const resetView = useCallback(() => {
     setZoom(1);
@@ -244,7 +307,11 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
         <div className="time-tree-summary">
           <strong>时间轴缩进树</strong>
           <span>{rows.length} 个节点</span>
-          {span && <span>跨度 {formatDuration(span.spanNs)}</span>}
+          {span
+            ? <span>跨度 {formatDuration(span.spanNs)}</span>
+            : sequence.labels.length > 0
+              ? <span title="日志里的时间没被解析成时间戳，这里直接用时间字符串排序与展示">按日志时间顺序 · {sequence.labels.length} 个时间点</span>
+              : null}
         </div>
         <div className="time-tree-actions">
           {traces.length > 1 && (
@@ -283,10 +350,9 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
                   <em>{tick.label}</em>
                 </span>
               ))}
-              {!span && (
+              {!span && !sequence.labels.length && (
                 <span className="time-tree-axis-hint">
-                  这批日志的解析结果里没有时间戳，无法按时间铺开。
-                  日志行里如果有时间但这里是空的，通常是「设置 → 日志规则」的格式解析没配时间字段或时间格式不匹配。
+                  这批日志里没有读到时间字段（解析结果里既没有时间戳也没有时间字符串），只能按行顺序铺开。
                 </span>
               )}
             </div>
@@ -294,8 +360,7 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
 
           <div className="time-tree-rows">
             {rows.map((row) => {
-              const x = timeToX(row.startNs);
-              const width = Math.max(MIN_BAR, timeToX(row.endNs) - x);
+              const { x, width } = barGeometry(row);
               const duration = durationNs(row.node);
               return (
                 <div
@@ -309,11 +374,13 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
                       type="button"
                       className="time-tree-label"
                       onClick={() => onSelectNode(activeTrace, row.node)}
-                      title={`${row.node.name}\n${row.node.source.raw}\n点击回到日志定位并展开`}
+                      title={`${row.node.name}\n${row.startText}${row.endText && row.endText !== row.startText ? ` → ${row.endText}` : ''}\n${row.node.source.raw}\n点击回到日志定位并展开`}
                     >
                       <span className="time-tree-node-name">{row.node.name}</span>
                       {/* 组件 + 子调用数 + 语义放在同一行：三行文字塞进 40px 的行会互相压。 */}
                       <span className="time-tree-node-meta">
+                        {/* 时间直接显示日志原文（正则抓到的字符串），不依赖时间戳换算。 */}
+                        {row.startText && <span className="time-tree-node-time" title={`${row.startText}${row.endText && row.endText !== row.startText ? ` → ${row.endText}` : ''}`}>{row.startText}</span>}
                         <span>{row.node.component || '—'}{row.childCount > 0 ? ` · ${row.childCount} 子调用` : ''}</span>
                         {row.semantic && <b className="time-tree-node-semantic" title={row.semantic}>{row.semantic}</b>}
                       </span>
@@ -339,7 +406,11 @@ export function TimeTreeView({ traces, rules, onSelectNode }: Props) {
       </div>
 
       <footer className="time-tree-foot">
-        <span>行顺序 = 开始时间先后 · 左侧缩进 = 嵌套层级 · 水平拖动平移，Shift+滚轮缩放时间轴</span>
+        <span>
+          {axisMode === 'time'
+            ? '行顺序 = 开始时间先后 · 左侧缩进 = 嵌套层级 · 水平拖动平移，Shift+滚轮缩放时间轴'
+            : '行顺序 = 日志时间字符串先后（未解析成时间戳） · 左侧缩进 = 嵌套层级 · 水平拖动平移，Shift+滚轮缩放'}
+        </span>
       </footer>
     </div>
   );
