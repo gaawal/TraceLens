@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertTriangle,
   Braces,
   Check,
   EyeOff,
@@ -747,18 +746,7 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
 
           <div className={`rule-form-grid ${semanticEditor.rule.kind === 'keyword' ? 'three-columns' : 'two-columns'}`}>
             <label><span>规则名称</span><input value={semanticEditor.rule.name} onChange={(event) => updateRule({ name: event.target.value })} placeholder="例如：安全初始化依赖组件"/></label>
-            {semanticEditor.rule.kind === 'keyword' && <label><span>函数名包含关键字</span><input value={semanticEditor.rule.keyword ?? ''} onChange={(event) => updateRule({ keyword: event.target.value })} placeholder="safe_initialize_default_dependencies()"/>
-              {/* 关键字带 () 只在「函数名」语境成立；选「仅日志正文」时正文里根本不会有
-                  `X()` 这种写法（日志通常写 `[X] >()`），规则会静默不命中。这里点明并给一键修正。 */}
-              {semanticEditor.rule.scope === 'log' && /\(\s*\)$/.test((semanticEditor.rule.keyword || '').trim()) && (
-                <span className="rule-keyword-warning">
-                  <AlertTriangle size={12}/>
-                  关键字里的 <code>()</code> 只在函数名里出现，「仅日志正文」要求正文里真的写着 <code>{semanticEditor.rule.keyword}</code>。
-                  你的日志一般写 <code>[{(semanticEditor.rule.keyword || '').trim().replace(/\(\s*\)$/, '')}] &gt;()</code>，点右侧按钮把 <code>()</code> 去掉即可命中。
-                  <button type="button" className="button secondary compact" onClick={() => updateRule({ keyword: (semanticEditor.rule.keyword || '').trim().replace(/\(\s*\)$/, '') })}>改成不带 ()</button>
-                </span>
-              )}
-            </label>}
+            {semanticEditor.rule.kind === 'keyword' && <label><span>函数名包含关键字</span><input value={semanticEditor.rule.keyword ?? ''} onChange={(event) => updateRule({ keyword: event.target.value })} placeholder="safe_initialize_default_dependencies()"/></label>}
             <label><span>应用位置</span><select value={semanticEditor.rule.scope} onChange={(event) => updateRule({ scope: event.target.value as DisplayRule['scope'] })}><option value="function">仅折叠函数标题</option><option value="log">仅日志正文</option><option value="both">函数标题 + 日志正文</option></select></label>
             <label><span>展示方式</span><select value={semanticEditor.rule.displayMode ?? 'semantic'} onChange={(event) => { const displayMode = event.target.value as DisplayRuleMode; updateRule({ displayMode, ...(displayMode !== 'semantic' && semanticEditor.rule.scope === 'function' ? { scope: displayMode === 'label' ? 'log' : 'both' } : {}) }); }}><option value="semantic">仅显示语义</option><option value="label">仅显示自定义标签</option><option value="both">语义 + 自定义标签</option></select></label>
           </div>

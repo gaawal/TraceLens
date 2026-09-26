@@ -8222,10 +8222,12 @@ body { font-size: 14px; }
 .log-row-meta .log-custom-label { flex: 0 1 auto; }
 .custom-label-config-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(230px, .7fr);
+  /* 单列：标签文本在上，色盘在它下方整行铺开 —— 色卡本来就多，挤在右半边看不清。 */
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   align-items: stretch;
 }
+.custom-label-config-grid .custom-label-template-field textarea { min-height: 62px; }
 .custom-label-config-grid > label {
   display: flex;
   flex-direction: column;
@@ -17896,12 +17898,3 @@ html.workstation-docked {
 .log-custom-label.style-outline { background: #fff; color: var(--custom-label-color); }
 .log-custom-label-symbol { margin-right: 4px; font-style: normal; font-size: 9.5px; opacity: .9; }
 
-/* 关键字带 () 但应用位置是「仅日志正文」时的提示：这种规则会静默不命中。 */
-.rule-keyword-warning {
-  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
-  margin-top: 5px; padding: 6px 8px;
-  border: 1px solid #fde68a; border-radius: 7px; background: #fffbeb;
-  color: #92400e; font-size: 11px; line-height: 1.5;
-}
-.rule-keyword-warning code { padding: 0 4px; border-radius: 4px; background: #fef3c7; font: 11px "Cascadia Code", Consolas, monospace; }
-.rule-keyword-warning .button { margin-left: auto; height: 22px; }
