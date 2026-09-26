@@ -17906,7 +17906,7 @@ html.workstation-docked {
    必须不换行：正文太长就省略，别把这一行撑成两行。 */
 .function-title-row { flex-wrap: nowrap; overflow: hidden; }
 .function-title-row .function-entry-message {
-  flex: 1 1 auto; min-width: 0;
+  flex: 0 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: #334155;
   font: 11px "Cascadia Code", Consolas, monospace;
@@ -17930,11 +17930,12 @@ html.workstation-docked {
   .function-children, .function-children.is-collapsing { animation-duration: .01s; }
 }
 
-/* 展开后这一行的弹性区是**日志正文**：正文撑满剩余宽度（太长就省略），
-   语义说明和来源标签恢复自然宽度跟在最后，不再被 flex 拉成一长条空盒子。 */
+/* 展开后这一行依次是：函数名 / 级别 / 日志正文 / 语义 / 来源，全部紧挨着排。
+   正文是唯一可压缩的元素（太长就省略），并且**不抢占剩余空间**——否则语义会被推到
+   行尾，和正文之间空出一大块；语义与来源标签保持自然宽度紧跟正文。 */
 .function-name-semantic .function-entry-message {
-  flex: 1 1 auto; min-width: 0;
+  flex: 0 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.function-name-semantic.is-expanded .semantic-function-description { flex: 0 1 auto; }
+.function-name-semantic.is-expanded .semantic-function-description { flex: 0 0 auto; min-width: 0; }
 .function-name-semantic.is-expanded .function-semantic-origin { flex: none; }
