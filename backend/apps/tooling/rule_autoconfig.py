@@ -304,6 +304,91 @@ def autoconfigure_data_extractor(
     return result
 
 
+_BATCH_RULE_PROMPT = """你在给 TraceLens 的日志规则批量起名字。
+
+输入是一批**已经分好组**的日志（每组代表一类日志：要么是同一个函数方法，要么是同一类特征
+——正文里只有变量不同）。请为每组写：
+
+- `semantic`：一句中文语义说明，告诉工程师这段日志在干什么（可含 {参数名}，只能用给出的参数名）。
+- `label`：日志行右侧的短标签，最多 10 个字，能一眼分类（例如「回零位」「版本校验」）。
+- `color`：适合这个语义的十六进制颜色（例如异常 #dc2626、流程开始 #10b981、建模 #8b5cf6）。
+- `scope`：function（整个函数折叠成一条语义）/ log（逐行日志）/ both。
+- `supplemental`：可选，异常含义或排查建议；没有就留空。
+- `name`：规则名称（简短中文，可与 label 相同）。
+
+通用规则：
+1. 只根据给出的日志内容写，不要编造日志里没有的业务含义。
+2. 只输出一个 JSON 对象，不要解释文字、不要 markdown 代码块。
+3. 每个输入组都要有一条输出，`index` 必须与输入组的下标一致。
+4. 拿不准就把 `semantic` 写得保守一些（例如"回零位流程开始"），不要瞎猜专有名词。
+
+输出格式：
+{"rules": [{"index": 0, "name": "回零位开始", "semantic": "回零位流程开始", "label": "回零位",
+            "color": "#10b981", "scope": "both", "supplemental": ""}], "warnings": ["不确定的地方"]}"""
+
+
+def autoconfigure_rule_batch(
+    groups: list[dict[str, Any]],
+    *,
+    mode: str = "semantic",
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """一批分组 → 每组一条中文语义/标签建议。
+
+    返回 ``({分组下标: 建议}, warnings)``。**模型不可用时返回空建议**，调用方会退回
+    确定性兜底（函数名 + 同类特征），所以批量生成不会因为模型抽风而整批失败。
+    """
+    warnings: list[str] = []
+    payload_groups = []
+    for index, group in enumerate(groups):
+        payload_groups.append({
+            "index": index,
+            "函数方法": str(group.get("function_name") or ""),
+            "同类特征": str(group.get("label") or ""),
+            "组件": str(group.get("component") or ""),
+            "出现次数": int(group.get("count") or 1),
+            "参数": [f"{key}={value}" for key, value in (group.get("parameters") or [])],
+            "样例日志": [str(item)[:400] for item in (group.get("members") or [])][:3],
+        })
+    if not payload_groups:
+        return {}, warnings
+    wanted_mode = "标签" if str(mode) == "label" else "语义说明" if str(mode) == "semantic" else "语义说明和标签"
+    payload = {
+        "任务": f"为下面每个分组生成{wanted_mode}。",
+        "目标模式": str(mode),
+        "分组数": len(payload_groups),
+        "分组": payload_groups,
+    }
+    try:
+        raw = _chat_json(_BATCH_RULE_PROMPT, payload)
+    except Exception as exc:  # noqa: BLE001 - 模型不可用/返回不可解析都要退回兜底
+        logger.warning("rule_autoconfig.batch_llm_failed error=%s", exc)
+        return {}, [f"AI 没能给出语义建议（{exc}），已用函数名/同类特征兜底。"]
+    warnings.extend(_text_list(raw.get("warnings"))[:6])
+    suggestions: dict[str, dict[str, Any]] = {}
+    for item in raw.get("rules") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= len(payload_groups):
+            continue
+        color = str(item.get("color") or "").strip()
+        scope = str(item.get("scope") or "").strip().lower()
+        suggestions[str(index)] = {
+            "name": str(item.get("name") or "").strip()[:120],
+            "semantic": str(item.get("semantic") or "").strip()[:600],
+            "label": str(item.get("label") or "").strip()[:60],
+            "color": color if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else "",
+            "scope": scope if scope in DISPLAY_SCOPES else "",
+            "supplemental": str(item.get("supplemental") or "").strip()[:600],
+        }
+    if len(suggestions) < len(payload_groups):
+        warnings.append(f"有 {len(payload_groups) - len(suggestions)} 组没有拿到 AI 语义，已用兜底文案。")
+    return suggestions, warnings
+
+
 def autoconfigure_semantic_rule(
     sample: str,
     *,

@@ -178,6 +178,7 @@ _DOMAIN_OVERRIDES = {
     "list_log_semantic_rules": "semantic",
     "set_log_semantic_labels": "semantic",
     "create_log_semantic_rule": "semantic",
+    "bulk_generate_log_rules": "semantic",
     "create_log_anomaly_rule": "semantic",
     "list_data_extraction_rules": "data",
     "create_data_extraction_capability": "data",
@@ -1237,6 +1238,63 @@ TOOLS: tuple[ToolDefinition, ...] = (
         max_llm_output_chars=1800,
         risk_level="low_write",
         implementation="apps.tooling.services.create_log_semantic_rule",
+        read_only=False,
+    ),
+    ToolDefinition(
+        id="bulk_generate_log_rules",
+        name="批量生成日志语义/标签规则",
+        description=(
+            "把一批真实日志按「函数方法」或「同类特征」分组，一次生成多条语义说明/标签规则候选，"
+            "由前端校验、去重后保存并立刻在时间线上渲染。用户没说明要语义还是标签时，先用一句话问清楚再调用。"
+        ),
+        category="日志语义",
+        handler=services.bulk_generate_log_rules,
+        input_schema=_object_schema({
+            "mode": {
+                "type": "string",
+                "enum": ["semantic", "label", "both"],
+                "description": "生成语义说明 / 标签 / 两者都要。用户没说就先去问用户，不要自己替他决定。",
+            },
+            "group_by": {
+                "type": "string",
+                "enum": ["function", "similar"],
+                "default": "similar",
+                "description": "function=按函数方法批量建（关键字就是函数名）；similar=把同类特征的日志归到一组（正文只有变量不同）。",
+            },
+            "samples": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 400,
+                "items": {"type": "string"},
+                "description": "参与分析的原始日志行（必须是本轮真实日志证据里的原文，不要自己编）。",
+            },
+            "existing_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "已知的规则关键字，用来跳过重复候选。",
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12},
+            "open_settings": {"type": "boolean", "default": False, "description": "保存后是否跳到「设置 → 日志规则」让用户复核。"},
+        }, ["mode", "samples"]),
+        tags=("assistant", "logs", "semantic", "rule", "authoring", "batch", "ui"),
+        use_when=(
+            "用户希望**批量**给日志加语义说明或标签（例如「这批日志你帮我批量加标签」"
+            "「按函数方法生成语义规则」「把同类日志整理成规则」）时调用。"
+            "**mode 必须来自用户**：用户没说语义还是标签，先问一句再调用。"
+        ),
+        do_not_use_when=(
+            "只针对单条日志/单个函数建规则用 create_log_semantic_rule；"
+            "只是想临时显示已有语义用 set_log_semantic_labels；没有真实日志证据时先取证据。"
+        ),
+        validation_rules=(
+            "samples 必须是本轮真实日志原文",
+            "mode 必须来自用户选择，不能替用户决定",
+            "不得把时间戳、PID/TID、随机 ID、波动数值当成稳定特征",
+        ),
+        max_llm_output_chars=2400,
+        risk_level="low_write",
+        implementation="apps.tooling.services.bulk_generate_log_rules",
         read_only=False,
     ),
     ToolDefinition(

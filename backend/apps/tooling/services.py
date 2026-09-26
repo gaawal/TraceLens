@@ -2239,6 +2239,110 @@ def create_log_semantic_rule(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def bulk_generate_log_rules(payload: dict[str, Any]) -> dict[str, Any]:
+    """批量生成日志**语义规则 / 标签规则**（用户可选），返回一次性的前端应用动作。
+
+    两条分组路线（用户原话）：按**函数方法**批量建，或把**同类特征**的日志挑出来一起建。
+    分组与候选配置是确定性的（``log_rule_batch``）；模型只负责把每组写成中文语义/标签，
+    模型失败就用函数名/同类特征兜底 —— 批量生成不允许因为模型抽风而整批失败。
+
+    这里**不直接写库**：返回 ``apply_log_display_rules`` 动作，由前端按原生 DisplayRule
+    校验、去重后保存并立刻渲染（和单条 ``create_log_semantic_rule`` 同一条路径）。
+    """
+    from apps.tooling import log_rule_batch
+    from apps.tooling.rule_autoconfig import autoconfigure_rule_batch
+
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in {"semantic", "label", "both"}:
+        raise ToolInputError("请先确定要生成「语义」还是「标签」（mode 只能是 semantic / label / both）。")
+    raw_samples = payload.get("samples")
+    if isinstance(raw_samples, str):
+        raw_samples = [line for line in raw_samples.splitlines() if line.strip()]
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise ToolInputError("samples 需要给出参与分析的日志行（来自本轮真实日志证据）。")
+
+    samples = [item for item in (log_rule_batch.parse_sample(entry) for entry in raw_samples[:400]) if item is not None]
+    if not samples:
+        raise ToolInputError("没有从 samples 里认出任何日志行，请传原始日志文本。")
+
+    group_by = str(payload.get("group_by") or "similar").strip().lower()
+    groups = log_rule_batch.group_samples(samples, group_by="function" if group_by == "function" else "similar")
+    if not groups:
+        raise ToolInputError("这批日志没有形成可用的分组。")
+
+    warnings: list[str] = []
+    suggestions, llm_warnings = autoconfigure_rule_batch(
+        [
+            {
+                "label": group.label,
+                "function_name": group.function_name,
+                "component": group.component,
+                "count": group.count,
+                "parameters": group.parameters,
+                "members": group.members,
+            }
+            for group in groups
+        ],
+        mode=mode,
+    )
+    warnings.extend(llm_warnings)
+
+    candidates = log_rule_batch.build_candidates(groups, mode=mode, suggestions=suggestions)
+    existing = [str(item).strip() for item in (payload.get("existing_keywords") or []) if str(item).strip()]
+    candidates, dropped = log_rule_batch.dedupe_candidates(candidates, existing)
+    limit = max(1, min(int(payload.get("limit") or 12), log_rule_batch.MAX_GROUPS))
+    if len(candidates) > limit:
+        warnings.append(f"分组较多，本次先给前 {limit} 条规则（共识别 {len(candidates)} 组）。")
+        candidates = candidates[:limit]
+    if dropped:
+        warnings.append(f"已跳过 {dropped} 条与现有规则重复的候选。")
+    if not candidates:
+        raise ToolInputError("这批日志与现有规则重复，没有新规则可建。")
+
+    semantic_count = sum(1 for item in candidates if item.get("display_template"))
+    label_count = sum(1 for item in candidates if item.get("custom_label_template"))
+    group_label = "按函数方法" if group_by == "function" else "按同类特征"
+    mode_label = {"semantic": "语义说明", "label": "标签", "both": "语义说明 + 标签"}[mode]
+    summary = (
+        f"{group_label}识别出 {len(groups)} 组日志，已生成 {len(candidates)} 条{mode_label}规则"
+        f"（{semantic_count} 条含语义、{label_count} 条含标签），保存后立刻生效。"
+    )
+    if warnings:
+        summary += " 注意：" + "；".join(warnings[:2])
+    return {
+        "status": "candidates_ready",
+        "mode": mode,
+        "group_by": group_by,
+        "group_count": len(groups),
+        "rule_count": len(candidates),
+        "summary": summary,
+        "warnings": warnings[:6],
+        "rules": [
+            {
+                "name": item["name"],
+                "kind": item["kind"],
+                "scope": item["scope"],
+                "keyword": item["keyword"],
+                "display_mode": item["display_mode"],
+                "display_template": item["display_template"],
+                "custom_label_template": item["custom_label_template"],
+                "custom_label_color": item["custom_label_color"],
+                "sample_message": item["sample_message"],
+                "parameters": item["parameters"],
+                "group": item["group"],
+            }
+            for item in candidates
+        ],
+        "ui_action": {
+            "type": "apply_log_display_rules",
+            "mode": mode,
+            "rules": candidates,
+            "open_settings": bool(payload.get("open_settings", False)),
+            "summary": summary,
+        },
+    }
+
+
 def create_log_anomaly_rule(payload: dict[str, Any]) -> dict[str, Any]:
     keywords = [str(item).strip() for item in (payload.get("keywords") or []) if str(item).strip()]
     if not keywords:

@@ -4140,6 +4140,14 @@ export default function App() {
   const [customEndTime, setCustomEndTime] = useState('');
   const [errorRules, setErrorRules] = useState<ErrorMatchRule[]>(loadErrorRules);
   const [displayRules, setDisplayRules] = useState<DisplayRule[]>(() => localDisplayRuleStore.load());
+  /**
+   * displayRules 的最新快照。
+   *
+   * `setDisplayRules(updater)` 里的 updater 是**渲染时**才跑的，动作处理函数拿不到结果，
+   * 所以"这次到底新增了几条"要用 ref 现算（否则回执会把新增的说成"重复跳过"）。
+   */
+  const displayRulesRef = useRef<DisplayRule[]>(displayRules);
+  useEffect(() => { displayRulesRef.current = displayRules; }, [displayRules]);
   const displayRulesBackendReadyRef = useRef(false);
   /** 首轮同步只对齐不回写；之后内容没变也不 PATCH（见下面的同步 effect）。 */
   const displayRulesPrimeRef = useRef(true);
@@ -6228,9 +6236,13 @@ export default function App() {
     setWorkspacePage('data');
   }
 
-  function createAiSemanticRule(detail: Record<string, unknown>) {
-    const spec = detail.rule && typeof detail.rule === 'object' ? detail.rule as Record<string, unknown> : undefined;
-    if (!spec) return;
+  /**
+   * AI 给的规则配置 → 原生 DisplayRule（单条 / 批量都走这里，保证校验与字段口径一致）。
+   *
+   * 返回 `error` 表示这条配置过不了原生校验（例如模板缺少参数），调用方决定是打开编辑器让用户补，
+   * 还是跳过这一条。
+   */
+  function buildAiDisplayRule(spec: Record<string, unknown>): { rule: DisplayRule; error: string } {
     const kind = String(spec.kind || 'keyword') === 'template' ? 'template' : 'keyword';
     const scopeText = String(spec.scope || 'log');
     const scope: DisplayRule['scope'] = scopeText === 'function' || scopeText === 'both' ? scopeText : 'log';
@@ -6285,12 +6297,34 @@ export default function App() {
       patternTokens: kind === 'template' ? buildPatternTokens(sampleMessage, marks) : [],
       createdAt: Date.now(),
     };
-    const validationError = validateDisplayRule(rule);
-    if (validationError) {
+    return { rule, error: validateDisplayRule(rule) || '' };
+  }
+
+  /** 打开「设置 → 日志规则」的语义页签（AI 建规则后复核用）。 */
+  function openSemanticRuleSettings() {
+    window.sessionStorage.setItem('tracelens-ai-rule-tab-v1', 'semantic');
+    setPreferredSettingsTab('rules');
+    setWorkspacePage('platform-settings');
+  }
+
+  /** 与已有规则去重后并入（同关键字/同作用域/同语义视为重复）。 */
+  function mergeDisplayRules(current: DisplayRule[], created: DisplayRule[]): DisplayRule[] {
+    const fresh = created.filter((rule) => !current.some((item) => item.kind === rule.kind
+      && String(item.keyword || '').trim().toLowerCase() === String(rule.keyword || '').trim().toLowerCase()
+      && item.scope === rule.scope
+      && item.displayTemplate.trim() === rule.displayTemplate.trim()));
+    return fresh.length ? [...fresh, ...current] : current;
+  }
+
+  function createAiSemanticRule(detail: Record<string, unknown>) {
+    const spec = detail.rule && typeof detail.rule === 'object' ? detail.rule as Record<string, unknown> : undefined;
+    if (!spec) return;
+    const { rule, error } = buildAiDisplayRule(spec);
+    if (error) {
       setRuleEditorRequest({
         requestId: `ai-semantic-${Date.now()}`,
-        source: scope === 'function' ? 'function' : 'log',
-        sampleRaw: sampleMessage,
+        source: rule.scope === 'function' ? 'function' : 'log',
+        sampleRaw: rule.sampleMessage || '',
         suggestedName: rule.name,
         suggestedKeyword: rule.keyword || '',
         suggestedScope: rule.scope,
@@ -6298,19 +6332,42 @@ export default function App() {
         openSemanticEditor: true,
       });
     } else {
-      setDisplayRules((current) => {
-        const duplicate = current.some((item) => item.kind === rule.kind
-          && String(item.keyword || '').trim().toLowerCase() === String(rule.keyword || '').trim().toLowerCase()
-          && item.scope === rule.scope
-          && item.displayTemplate.trim() === rule.displayTemplate.trim());
-        return duplicate ? current : [rule, ...current];
-      });
+      setDisplayRules((current) => mergeDisplayRules(current, [rule]));
     }
-    if (detail.open_settings !== false) {
-      window.sessionStorage.setItem('tracelens-ai-rule-tab-v1', 'semantic');
-      setPreferredSettingsTab('rules');
-      setWorkspacePage('platform-settings');
-    }
+    if (detail.open_settings !== false) openSemanticRuleSettings();
+  }
+
+  /**
+   * 批量保存 AI 生成的语义/标签规则（`bulk_generate_log_rules` 的落地动作）。
+   *
+   * 逐条过原生校验：过不了的跳过并计数（不因为一条坏配置整批失败）；有效规则去重后一次性并入，
+   * displayRules 的同步 effect 会把它写到后端并立刻在时间线上渲染。
+   */
+  function applyAiLogDisplayRules(detail: Record<string, unknown>): { detail: string } {
+    const specs = Array.isArray(detail.rules) ? detail.rules.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object') : [];
+    if (!specs.length) throw new Error('这批规则是空的，没有可保存的内容');
+    const built: DisplayRule[] = [];
+    let invalid = 0;
+    specs.forEach((spec) => {
+      const { rule, error } = buildAiDisplayRule(spec);
+      if (error) { invalid += 1; return; }
+      built.push(rule);
+    });
+    if (!built.length) throw new Error('生成的规则都没通过校验，请在「设置 → 日志规则」里手动补充');
+    const snapshot = displayRulesRef.current;
+    const created = mergeDisplayRules(snapshot, built).length - snapshot.length;
+    setDisplayRules((current) => mergeDisplayRules(current, built));
+    const semantic = built.filter((rule) => (rule.displayMode ?? 'semantic') !== 'label').length;
+    const labels = built.filter((rule) => (rule.displayMode ?? 'semantic') !== 'semantic').length;
+    const invalidCount = specs.length - built.length;
+    const duplicate = built.length - created;
+    const summary = String(detail.summary || '').trim();
+    const parts = [`已保存 ${created} 条规则（${semantic} 条语义、${labels} 条标签）`];
+    if (duplicate > 0) parts.push(`跳过 ${duplicate} 条与现有规则重复`);
+    if (invalidCount > 0) parts.push(`跳过 ${invalidCount} 条未通过校验的候选`);
+    const text = parts.join('，') + '，时间线已按新规则渲染。';
+    if (detail.open_settings === true) openSemanticRuleSettings();
+    return { detail: summary ? `${text}${summary}` : text };
   }
 
   function createAiAnomalyRules(detail: Record<string, unknown>) {
@@ -6474,6 +6531,7 @@ export default function App() {
       create_log_semantic_rule: (detail) => {
         createAiSemanticRule(detail);
       },
+      apply_log_display_rules: (detail) => applyAiLogDisplayRules(detail),
       create_log_anomaly_rule: (detail) => {
         createAiAnomalyRules(detail);
       },

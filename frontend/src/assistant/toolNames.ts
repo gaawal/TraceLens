@@ -56,6 +56,7 @@ export const TOOL_DISPLAY_NAMES: Record<string, string> = {
   list_log_semantic_rules: '读取日志语义与标签规则',
   set_log_semantic_labels: '切换日志语义标签',
   create_log_semantic_rule: '创建日志语义规则',
+  bulk_generate_log_rules: '批量生成日志语义/标签规则',
   create_log_anomaly_rule: '创建日志异常规则',
   list_data_extraction_rules: '读取数据提取能力',
   create_data_extraction_capability: '创建数据提取能力',
