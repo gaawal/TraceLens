@@ -17898,3 +17898,35 @@ html.workstation-docked {
 .log-custom-label.style-outline { background: #fff; color: var(--custom-label-color); }
 .log-custom-label-symbol { margin-right: 4px; font-style: normal; font-size: 9.5px; opacity: .9; }
 
+
+/* ── 函数折叠：展开/收起动效 + 展开时卡片自己就是入口日志 ────────────────────
+   入口行不再作为子节点重复出现（原来展开后第一行和卡片一模一样，只多了详情）；
+   展开时卡片里直接显示入口日志的级别 / 正文 / 源码位置。 */
+.function-entry-detail {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-top: 3px; min-width: 0;
+  color: #334155;
+  font: 11px/1.5 "Cascadia Code", Consolas, monospace;
+}
+.function-entry-detail .function-entry-message {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.function-entry-detail code { flex: none; color: #94a3b8; font-size: 10px; }
+.function-entry-detail .level-badge { flex: none; }
+
+@keyframes function-children-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes function-children-out {
+  from { opacity: 1; transform: translateY(0); max-height: 2000px; }
+  to { opacity: 0; transform: translateY(-3px); max-height: 0; }
+}
+.function-children { animation: function-children-in .18s cubic-bezier(.22, 1, .36, 1); }
+.function-children.is-collapsing {
+  animation: function-children-out .17s ease-in forwards;
+  overflow: hidden; pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .function-children, .function-children.is-collapsing { animation-duration: .01s; }
+}

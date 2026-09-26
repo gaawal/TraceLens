@@ -84,7 +84,7 @@ import {
   type ErrorMatchRule,
 } from './parser/logParser';
 import type { ImportProgress, ImportStrategy, LogStreamWorkerResponse, WorkerImportSource } from './workers/logStreamProtocol';
-import { buildCrossComponentTraces, buildProcessTimelines, durationNs, formatDuration, mergeRepeatedFunctionGroups } from './parser/treeBuilder';
+import { buildCrossComponentTraces, buildProcessTimelines, durationNs, formatDuration, mergeRepeatedFunctionGroups, nestFunctionsByTimeSpan } from './parser/treeBuilder';
 import {
   diffFoldLogs,
   mergeFoldInflux,
@@ -887,6 +887,8 @@ const TIMELINE_MAX_ADAPTIVE_ZOOM = 240;
 // 左侧固定模块列不属于时间轨道，因此目标比例必须按可用轨道宽度动态折算，
 // 不能直接拿整个滚动容器的 2/3，否则 Brush 会看起来越出当前屏幕。
 const TIMELINE_AUTO_VISIBLE_TRACK_RATIO = 2 / 3;
+/** 函数折叠收起动画时长；这段时间里子节点留在 DOM 里播完出场动画。 */
+const FUNCTION_COLLAPSE_MS = 170;
 const TIMELINE_MIN_AUTO_RANGE_SPAN_NS = 250_000_000n;
 /** 实时时间线的最小可视跨度：刚开监听时也要有一段像样的“磁带”，不跟着秒数抖。 */
 const LIVE_TIMELINE_MIN_SPAN_NS = 60n * 1_000_000_000n;
@@ -3268,6 +3270,26 @@ function FunctionItem({
   onSelectEntry: (entry: LogEntry) => void;
 }) {
   const expanded = expandedIds.has(node.id);
+  /**
+   * 展开/收起都要有动效：收起时先把 children 留在 DOM 里播完出场动画再卸载，
+   * 否则 React 一卸载就没得动画了。
+   */
+  const [childrenMounted, setChildrenMounted] = useState(expanded);
+  const [collapsing, setCollapsing] = useState(false);
+  useEffect(() => {
+    if (expanded) {
+      setChildrenMounted(true);
+      setCollapsing(false);
+      return undefined;
+    }
+    if (!childrenMounted) return undefined;
+    setCollapsing(true);
+    const timer = window.setTimeout(() => {
+      setCollapsing(false);
+      setChildrenMounted(false);
+    }, FUNCTION_COLLAPSE_MS);
+    return () => window.clearTimeout(timer);
+  }, [expanded, childrenMounted]);
   const childFilters = functionMatchesDuration(node, filters.durationRange)
     ? { ...filters, durationRange: undefined }
     : filters;
@@ -3322,6 +3344,14 @@ function FunctionItem({
               {severity === 'error' && <span className="severity-badge error">ERROR 链路</span>}
               {severity === 'warning' && <span className="severity-badge warning">WARN</span>}
             </span>
+            {/* 展开时卡片自己就是「入口日志」：原来这只是子节点里重复的第一行。 */}
+            {expanded && (
+              <span className="function-entry-detail" title={node.startEntry.raw}>
+                <span className={classNames('level-badge', `level-${String(node.startEntry.level || '').toLowerCase()}`)}>{node.startEntry.level}</span>
+                <span className="function-entry-message">{node.startEntry.message}</span>
+                {node.source.raw && <code>{node.source.raw}</code>}
+              </span>
+            )}
           </span>
           <span className="function-stats">
             {(node.origin === 'boundary' || node.origin === 'repeated') && <span className="function-source" title={node.source.raw}>{node.source.raw}</span>}
@@ -3333,7 +3363,7 @@ function FunctionItem({
               </>
             ) : (
               <>
-                <span>{children.length} 条日志</span>
+                <span>{nodeLogCount} 条日志</span>
                 {nestedFunctionCount > 0 && <span>{nestedFunctionCount} 个子流程</span>}
               </>
             )}
@@ -3382,8 +3412,8 @@ function FunctionItem({
         </div>
       )}
 
-      {expanded && (
-        <div className="function-children">
+      {childrenMounted && (
+        <div className={classNames('function-children', collapsing && 'is-collapsing')}>
           {children.map((child) =>
             child.kind === 'function' ? (
               <FunctionItem
@@ -3503,6 +3533,7 @@ function FlatTimelineItems({
   selectedEntryId,
   onToggle,
   onSelectEntry,
+  crossComponent = false,
 }: {
   traces: TraceTimeline[];
   filters: Filters;
@@ -3511,6 +3542,8 @@ function FlatTimelineItems({
   selectedEntryId?: string;
   onToggle: (id: string) => void;
   onSelectEntry: (entry: LogEntry) => void;
+  /** 合并（跨组件）视图：把落在别的函数时间范围内的折叠函数收进去。 */
+  crossComponent?: boolean;
 }) {
   // 先按未过滤的真实时间顺序做“连续重复函数”二次收纳，再应用展示筛选。
   // 这样多个 Trace/Span 中连续出现、入口/出口完全一致的同一函数也能恢复 ×N，
@@ -3523,7 +3556,11 @@ function FlatTimelineItems({
       return leftTime < rightTime ? -1 : leftTime > rightTime ? 1 : 0;
     });
   const foldingRules = useContext(FoldingRuleContext);
-  const mergedItems = filteredItems(mergeRepeatedFunctionGroups(orderedItems, foldingRules), filters);
+  const groupedItems = mergeRepeatedFunctionGroups(orderedItems, foldingRules);
+  // 跨组件视图：不同组件/线程没有可对齐的 traceId，只能按时间包含把「别的组件在这段时间里
+  // 折叠出来的函数」收进外层函数里 —— 它就是这段流程的一部分。
+  const nestedItems = crossComponent ? nestFunctionsByTimeSpan(groupedItems) : groupedItems;
+  const mergedItems = filteredItems(nestedItems, filters);
   const items = sortOrder === 'desc' ? mergedItems.slice().reverse() : mergedItems;
 
   return (
@@ -3700,6 +3737,7 @@ function MergedFmTimelineView({
     <section className="merged-fm-timeline-view">
       <FlatTimelineItems
         traces={traces}
+        crossComponent
         filters={filters}
         sortOrder={sortOrder}
         expandedIds={expandedIds}

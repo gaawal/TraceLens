@@ -328,3 +328,67 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(shouldAnimateTextReplay(undefined, 'j1'), false);
   console.log('已完成对话回看判定检查通过');
 }
+
+// --- 函数折叠：入口行不重复 + 跨组件按时间包含收拢 -------------------------------
+{
+  const { parseLogText } = await import('../src/parser/logParser');
+  const { buildProcessTimelines, nestFunctionsByTimeSpan } = await import('../src/parser/treeBuilder');
+  const { functionNodeEntries } = await import('../src/rendering/displayRules');
+
+  const line = (component: string, func: string, marker: string, body: string, time: string) =>
+    `[2026-09-25 ${time}] [INFO] [${component}] [1] [1] [${component}] [normal] [${component}:${func}:1] [${func}] ${marker} ${body}`;
+  const itemsOf = (text: string) => {
+    const parsed = parseLogText(text);
+    return buildProcessTimelines(parsed.entries, [])
+      .flatMap((process) => process.threads.flatMap((thread) => thread.traces.flatMap((trace) => trace.items)));
+  };
+
+  // ① 折叠卡片不再把入口行当成子节点重复一遍，但计数/证据里仍然包含它。
+  const folded = itemsOf([
+    line('CPFR', 'CoolantLoop', '>()', 'enter coolant loop start', '10:00:00.000'),
+    line('CPFR', 'CoolantLoop', '', 'flow read 3.8L/min', '10:00:01.000'),
+    line('CPFR', 'CoolantLoop', '<()', 'leave coolant loop end', '10:00:04.000'),
+  ].join('\n'));
+  const card = folded.find((item) => item.kind === 'function');
+  assert.ok(card, '应该折叠出一个函数卡片');
+  if (card && card.kind === 'function') {
+    const duplicated = card.children.some((child) => child.kind === 'log' && child.entry.id === card.startEntry.id);
+    assert.equal(duplicated, false, '入口行不该作为子节点重复出现');
+    assert.equal(functionNodeEntries(card).some((entry) => entry.id === card.startEntry.id), true, '入口行仍要算进这条函数的日志');
+  }
+
+  // ② 跨组件按时间包含：B 组件整体落在 A 组件时间范围内 → 收进 A；范围外的 C 保持顶层。
+  const a = itemsOf([
+    line('CPFR', 'OuterFlow', '>()', 'enter outer flow start', '10:00:00.000'),
+    line('CPFR', 'OuterFlow', '<()', 'leave outer flow end', '10:00:10.000'),
+  ].join('\n'));
+  const b = itemsOf([
+    line('WSP', 'MoveAbsolute', '>()', 'enter move absolute start', '10:00:03.000'),
+    line('WSP', 'MoveAbsolute', '<()', 'leave move absolute end', '10:00:06.000'),
+  ].join('\n'));
+  const c = itemsOf([
+    line('SIL', 'LaterFlow', '>()', 'enter later flow start', '10:00:20.000'),
+    line('SIL', 'LaterFlow', '<()', 'leave later flow end', '10:00:22.000'),
+  ].join('\n'));
+  const merged = [...a, ...b, ...c]
+    .slice()
+    .sort((left, right) => {
+      const leftNs = left.kind === 'function' ? left.startEntry.timestampNs : left.entry.timestampNs;
+      const rightNs = right.kind === 'function' ? right.startEntry.timestampNs : right.entry.timestampNs;
+      return (leftNs ?? 0n) < (rightNs ?? 0n) ? -1 : (leftNs ?? 0n) > (rightNs ?? 0n) ? 1 : 0;
+    });
+  const originalChildren = a[0].kind === 'function' ? a[0].children.length : -1;
+  const nested = nestFunctionsByTimeSpan(merged);
+  assert.equal(nested.length, 2, '范围外的组件仍留在顶层');
+  const outer = nested[0];
+  assert.equal(outer.kind, 'function');
+  if (outer.kind === 'function') {
+    assert.equal(outer.name, 'OuterFlow()');
+    const inner = outer.children.filter((child) => child.kind === 'function');
+    assert.equal(inner.length, 1, '落在时间范围内的别的组件的折叠函数应该被收进来');
+    assert.equal((inner[0] as { name?: string }).name, 'MoveAbsolute()');
+    // 收拢是浅拷贝：原节点不能被改坏（时间线/Gantt 还在用同一批对象）。
+    assert.equal(a[0].kind === 'function' ? a[0].children.length : -1, originalChildren, '原树不能被就地修改');
+  }
+  console.log('函数折叠归属与入口去重检查通过');
+}

@@ -280,7 +280,9 @@ function buildTreeRaw(entries: LogEntry[], foldingRules: readonly FoldingRule[])
         rpc: entry.rpc,
         source: entry.source,
         startEntry: entry,
-        children: [...preambleLogs, leaf(entry)],
+        // 入口行**不再**作为子节点重复一遍：展开时卡片自己就是入口日志的形态
+        //（原来展开后第一行总是和卡片一模一样，只是多了详情，白白多一行）。
+        children: [...preambleLogs],
         incomplete: !hasMatchingEnd,
         foldRuleId: boundary.ruleId,
         foldRuleName: boundary.ruleName,
@@ -638,6 +640,56 @@ export function buildCrossComponentTraces(entries: LogEntry[], foldingRules: rea
       const rightEntry = right.entries[0];
       return leftEntry && rightEntry ? compareEntries(leftEntry, rightEntry) : 0;
     });
+}
+
+/**
+ * 跨组件的函数折叠：把「落在别的函数时间范围内」的折叠函数收进去。
+ *
+ * 背景：不同组件 / 不同线程之间没有能对齐的 traceId，唯一可用的关联是**时间** ——
+ * 某个折叠函数的起止时间整体落在外层函数范围内，它就是这段流程的一部分。
+ * 按字节去逐个时间窗查找代价很高，这里直接用已有的 start/end 时间戳做区间包含，
+ * 一次遍历（输入已按时间排序）即可完成，不做任何额外日志读取。
+ *
+ * 只收拢**折叠函数**节点（连同它自己的子节点一起搬进去），普通日志行保持原位，
+ * 避免把无关行吞进别的组件的卡片里。
+ *
+ * 返回的是浅拷贝的新树：原节点可能同时被时间线 / Gantt 等视图引用，不能就地改。
+ */
+export function nestFunctionsByTimeSpan(items: readonly TimelineItem[]): TimelineItem[] {
+  const startNsOf = (item: TimelineItem): bigint | undefined => (
+    item.kind === 'function' ? item.startEntry.timestampNs : item.entry.timestampNs
+  );
+  const endNsOf = (node: FunctionNode): bigint | undefined => (
+    node.endEntry?.timestampNs ?? node.startEntry.timestampNs
+  );
+  const roots: TimelineItem[] = [];
+  const open: FunctionNode[] = [];
+  const copyOf = (node: FunctionNode): FunctionNode => ({ ...node, children: [...node.children] });
+
+  for (const item of items) {
+    const start = startNsOf(item);
+    // 关掉所有已经结束、且结束时间早于当前项的容器。
+    while (open.length) {
+      const top = open[open.length - 1];
+      const end = endNsOf(top);
+      if (end === undefined || start === undefined || end >= start) break;
+      open.pop();
+    }
+    if (item.kind !== 'function') { roots.push(item); continue; }
+    const end = endNsOf(item);
+    const parent = open[open.length - 1];
+    const parentEnd = parent ? endNsOf(parent) : undefined;
+    if (parent && end !== undefined && (parentEnd === undefined || end <= parentEnd)) {
+      const copy = copyOf(item);
+      parent.children = [...parent.children, copy];
+      open.push(copy);
+      continue;
+    }
+    const copy = copyOf(item);
+    roots.push(copy);
+    if (end !== undefined) open.push(copy);
+  }
+  return roots;
 }
 
 export function durationNs(node: FunctionNode): bigint | undefined {
