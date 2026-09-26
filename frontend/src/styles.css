@@ -18028,3 +18028,40 @@ html.workstation-docked {
 }
 .operation-user { color: #101828; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
 .operation-user::after { content: '·'; margin-left: 5px; color: #98a2b3; }
+
+/* ===== 对话里的固定选择组件（AI 让用户选一个时）=====
+   以前 AI 只能把选项写在回复里让用户手打；现在 `ask_user_choice` 工具发结构化选项，
+   这里渲染成按钮列表：点一下等于回答，多选时勾选后统一提交，也可以自己输入其它答案。 */
+.ai-assistant-choices {
+  margin: 8px 0 2px;
+  padding: 10px 11px;
+  border: 1px solid #cfe0f5;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f7fbff 0%, #ffffff 100%);
+}
+.ai-assistant-choices-title { display: flex; align-items: center; gap: 6px; color: #1d4ed8; font-size: 12.5px; line-height: 1.45; }
+.ai-assistant-choices-title strong { font-weight: 700; }
+.ai-assistant-choices-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.ai-assistant-choice {
+  display: inline-flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  min-height: 30px; padding: 5px 11px; max-width: 100%;
+  border: 1px solid #cddff2; border-radius: 8px; background: #fff;
+  color: #1f3b57; font-size: 12.5px; cursor: pointer; text-align: left;
+}
+.ai-assistant-choice:hover:not(:disabled) { border-color: #1d4ed8; color: #1d4ed8; background: #f5f9ff; }
+.ai-assistant-choice:disabled { opacity: .55; cursor: not-allowed; }
+.ai-assistant-choice.active { border-color: #1d4ed8; background: #eaf2ff; color: #1d4ed8; }
+.ai-assistant-choice-label { display: inline-flex; align-items: center; gap: 5px; font-weight: 650; }
+.ai-assistant-choice small { color: #7d8fa3; font-size: 11px; }
+.ai-assistant-choice-check {
+  display: inline-grid; place-items: center; width: 14px; height: 14px;
+  border: 1px solid #c3d3e5; border-radius: 4px; background: #fff;
+  color: #fff; font-size: 10px; font-style: normal;
+}
+.ai-assistant-choice-check.on { background: #1d4ed8; border-color: #1d4ed8; }
+.ai-assistant-choices-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.ai-assistant-choices-other { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.ai-assistant-choices-other input {
+  flex: 1 1 auto; min-width: 0; height: 30px; padding: 0 9px;
+  border: 1px solid #d9e2ec; border-radius: 7px; background: #fff; font-size: 12.5px;
+}

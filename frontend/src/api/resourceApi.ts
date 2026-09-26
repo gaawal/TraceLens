@@ -1177,6 +1177,21 @@ export interface TraceLensAssistantConfirmation {
   summary: Record<string, unknown>;
 }
 
+export interface TraceLensAssistantChoiceOption {
+  id?: string;
+  /** 选项文字：用户点它等于回答了问题，所以必须能独立看懂。 */
+  label: string;
+  detail?: string;
+}
+
+/** 「让用户选择」工具发过来的结构化选项（前端渲染成固定选择组件，不用手打）。 */
+export interface TraceLensAssistantChoices {
+  question: string;
+  options: TraceLensAssistantChoiceOption[];
+  multi?: boolean;
+  allow_other?: boolean;
+}
+
 export interface TraceLensAssistantResponse {
   message: string;
   steps: TraceLensAssistantStep[];
@@ -1339,6 +1354,7 @@ export type TraceLensAssistantStreamEvent =
   | { type: 'token_reset'; text: string }
   | { type: 'token_usage'; usage: TraceLensAssistantTokenUsage }
   | { type: 'confirmation'; confirmation: TraceLensAssistantConfirmation }
+  | { type: 'choices'; choices: TraceLensAssistantChoices }
   | { type: 'ui_action'; action: Record<string, unknown>; action_id?: string; run_id?: string }
   | { type: 'done'; message: string; confirmation_count?: number; memory?: string; result_cards?: TraceLensAssistantResultCard[]; suggested_actions?: string[] }
   | { type: 'error'; message: string };

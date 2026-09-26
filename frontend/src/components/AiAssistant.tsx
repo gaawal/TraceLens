@@ -27,6 +27,7 @@ import {
   Smartphone,
   Plus,
   Send,
+  ListChecks,
   ShieldCheck,
   Trash2,
   X,
@@ -43,6 +44,7 @@ import {
   streamTraceLensAssistant,
   transcribeTraceLensVoice,
   type TraceLensAiModelOption,
+  type TraceLensAssistantChoices,
   type TraceLensAssistantConfirmation,
   type TraceLensAssistantResultCard,
   type TraceLensAssistantTrace,
@@ -105,6 +107,8 @@ interface AssistantMessage {
   tokenUsage?: AssistantTokenUsage;
   task?: AssistantTaskState;
   confirmations?: TraceLensAssistantConfirmation[];
+  /** 结构化选项：渲染成固定选择组件，点一下就把选项内容发回去。 */
+  choices?: TraceLensAssistantChoices;
   resultCards?: TraceLensAssistantResultCard[];
   suggestions?: string[];
   /** 整理成案例 — the extracted conclusion attached to the message it came from. */
@@ -508,6 +512,81 @@ function loadFabPosition(): FabPosition {
 
 function currentContext(): Record<string, unknown> { return collectPageContext(); }
 
+
+/**
+ * 「让用户选择」的固定选择组件。
+ *
+ * 后端 `ask_user_choice` 工具会把候选发成 `choices` 事件；这里渲染成按钮列表，
+ * 用户点一下就把**选项文字**作为下一条消息发回去（等于回答了那个问题），
+ * 不需要自己手打。多选时逐个勾选后点「提交选择」。
+ */
+function AssistantChoiceCard({ choices, onPick }: {
+  choices: TraceLensAssistantChoices;
+  onPick: (label: string) => void;
+}) {
+  const [selected, setSelected] = useState<string[]>([]);
+  const [other, setOther] = useState('');
+  // 只在自己的点击已经提交后禁用：**不能**因为"AI 那一轮还没收尾"就禁用整个组件 ——
+  // 选项事件比 done 先到，那样用户刚看到选项却点不动（实测就是这个问题）。
+  const [submitted, setSubmitted] = useState(false);
+  const multi = choices.multi === true;
+  const options = choices.options || [];
+  const disabled = submitted;
+
+  function pick(label: string) {
+    if (disabled) return;
+    setSubmitted(true);
+    onPick(label);
+  }
+
+  function toggle(label: string) {
+    if (disabled) return;
+    if (!multi) { pick(label); return; }
+    setSelected((current) => current.includes(label) ? current.filter((item) => item !== label) : [...current, label]);
+  }
+
+  return (
+    <div className="ai-assistant-choices" role="group" aria-label="可选答案">
+      <div className="ai-assistant-choices-title"><ListChecks size={16} /><strong>{choices.question || '请选择'}</strong></div>
+      <div className="ai-assistant-choices-list">
+        {options.map((option, index) => {
+          const label = String(option.label || '').trim();
+          const active = multi && selected.includes(label);
+          return (
+            <button
+              type="button"
+              key={option.id || `${label}-${index}`}
+              className={`ai-assistant-choice${active ? ' active' : ''}`}
+              disabled={disabled}
+              onClick={() => toggle(label)}
+              title={option.detail || label}
+            >
+              <span className="ai-assistant-choice-label">{multi && <i className={`ai-assistant-choice-check${active ? ' on' : ''}`} aria-hidden="true">{active ? '✓' : ''}</i>}{label}</span>
+              {option.detail && <small>{option.detail}</small>}
+            </button>
+          );
+        })}
+      </div>
+      {multi && (
+        <div className="ai-assistant-choices-actions">
+          <button type="button" className="button primary compact" disabled={disabled || selected.length === 0} onClick={() => pick(selected.join('、'))}>提交选择</button>
+        </div>
+      )}
+      {choices.allow_other !== false && (
+        <div className="ai-assistant-choices-other">
+          <input
+            value={other}
+            disabled={disabled}
+            placeholder="也可以直接输入其它答案…"
+            onChange={(event) => setOther(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && other.trim()) { const value = other.trim(); setOther(''); pick(value); } }}
+          />
+          <button type="button" className="button ghost compact" disabled={disabled || !other.trim()} onClick={() => { const value = other.trim(); setOther(''); pick(value); }}>发送</button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function confirmationText(item: TraceLensAssistantConfirmation): string {
   const summary = item.summary || {};
@@ -2484,6 +2563,13 @@ export function AiAssistant() {
               });
               return;
             }
+            if (event.type === 'choices') {
+              const choices = event.choices && typeof event.choices === 'object' ? event.choices as TraceLensAssistantChoices : undefined;
+              if (choices && Array.isArray(choices.options) && choices.options.length) {
+                updateMessage(conversationId, assistantId, (message) => ({ ...message, choices }));
+              }
+              return;
+            }
             if (event.type === 'confirmation') {
               updateMessage(conversationId, assistantId, (message) => ({
                 ...message,
@@ -2934,6 +3020,15 @@ export function AiAssistant() {
                         onRegenerate={(notes) => void requestCaseDraft(activeConversation.id, message.id, notes)}
                         onSave={(result) => void saveCaseDraft(result)}
                         onDismiss={() => patchMessage(activeConversation.id, message.id, { caseDraft: undefined })}
+                      />
+                    )}
+                    {message.role === 'assistant' && message.choices && (
+                      <AssistantChoiceCard
+                        choices={message.choices}
+                        onPick={(label) => {
+                          patchMessage(activeConversation.id, message.id, { choices: undefined });
+                          void send(label);
+                        }}
                       />
                     )}
                     {(message.confirmations || []).map((item) => (

@@ -159,6 +159,10 @@ def _prepare(state: ExecutionState) -> dict[str, Any]:
         selected_tool_ids.add("plan_log_retrieval")
     if isinstance(context.get("log_locator"), dict) and context["log_locator"].get("task_id"):
         selected_tool_ids.add("control_log_view")
+    # 「让用户选择」是**通用交互**，不属于某个领域：不论本轮路由选了哪个领域都要留给 Agent，
+    # 否则模型只能把选项写进正文让用户手打（用户明确要求改成可点选的固定选择组件）。
+    if kernel.registry.get("ask_user_choice") is not None:
+        selected_tool_ids.add("ask_user_choice")
     tools = kernel.registry.llm_specs(selected_tool_ids)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": a._system_prompt(context, normalized_skill, selected_tool_ids)},
@@ -553,7 +557,24 @@ def _execute(state: ExecutionState) -> dict[str, Any]:
                     _emit(state, {"type": "tool_call", "id": trace_id, "tool_id": tool.id, "title": trace_title, "detail": trace_detail, "status": "running", "input": public_snapshot(arguments)})
                     _emit(state, a._trace_event(trace_id, "tool", trace_title, detail=trace_detail))
 
-                if a._requires_confirmation(tool):
+                interactive_choice = False
+                if tool.id == "ask_user_choice":
+                    # 「让用户选择」：把选项发成结构化事件，前端渲染固定选择组件；
+                    # 本轮到此为止，用户点选后选项内容会作为下一条消息回来，再继续。
+                    choice = state["kernel"].execute(tool.id, arguments, context=state["context"])
+                    choice_payload = choice.get("data") if isinstance(choice, dict) and isinstance(choice.get("data"), dict) else choice
+                    _emit(state, {"type": "choices", "choices": choice_payload})
+                    interactive_choice = True
+                    options_text = "、".join(str(item.get("label") or "") for item in (choice_payload or {}).get("options") or [])
+                    result = {
+                        "success": True,
+                        "waiting_for_user_choice": True,
+                        "message": (
+                            "已把选项交给用户（" + options_text + "）。"
+                            "本轮请**立即结束**：不要再调用工具、不要再复述选项、只回一句「请选择」即可。"
+                        ),
+                    }
+                elif a._requires_confirmation(tool):
                     pending = a._pending_action(tool, arguments)
                     confirmations.append(pending)
                     result = {
@@ -595,7 +616,9 @@ def _execute(state: ExecutionState) -> dict[str, Any]:
                         raise a.AssistantCancelled("用户已终止当前分析。")
 
                     result = {"status": "ok", "data": value}
-                    action = a._extract_ui_action(value) or evidence_action(tool.id, arguments, value)
+                    # 「让用户选择」只发 choices 事件，**绝不能**再发 ui_action：
+                    # 前端不会给一个不存在的页面动作回执，发了就会让整轮一直等回执（卡在"运行中"）。
+                    action = None if interactive_choice else (a._extract_ui_action(value) or evidence_action(tool.id, arguments, value))
                     if action:
                         ui_actions.append(action)
                         action_id = uuid.uuid4().hex

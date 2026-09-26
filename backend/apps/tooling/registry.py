@@ -179,6 +179,7 @@ _DOMAIN_OVERRIDES = {
     "set_log_semantic_labels": "semantic",
     "create_log_semantic_rule": "semantic",
     "bulk_generate_log_rules": "semantic",
+    "ask_user_choice": "context",
     "create_log_anomaly_rule": "semantic",
     "list_data_extraction_rules": "data",
     "create_data_extraction_capability": "data",
@@ -1241,6 +1242,46 @@ TOOLS: tuple[ToolDefinition, ...] = (
         read_only=False,
     ),
     ToolDefinition(
+        id="ask_user_choice",
+        name="让用户选择",
+        description=(
+            "需要用户在**有限选项**里做决定时调用：界面会渲染成固定的选择组件（按钮列表），"
+            "用户点一下就把选项内容作为下一条消息发回来。不要用文字列选项让用户手打。"
+        ),
+        category="交互",
+        handler=services.ask_user_choice,
+        input_schema=_object_schema({
+            "question": {"type": "string", "description": "要问用户的问题（写清楚为什么要选）。"},
+            "options": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "选项文字（用户点击后原样发回，写得能独立看懂）。"},
+                        "detail": {"type": "string", "description": "可选的一句话补充说明。"},
+                    },
+                    "required": ["label"],
+                    "additionalProperties": False,
+                },
+            },
+            "multi": {"type": "boolean", "default": False, "description": "是否允许多选（前端会显示为可多选再提交）。"},
+            "allow_other": {"type": "boolean", "default": True, "description": "是否允许用户自己输入其它答案。"},
+        }, ["question", "options"]),
+        tags=("assistant", "interaction", "ui"),
+        use_when=(
+            "需要用户从几个固定选项里挑一个时（例如「生成语义还是标签」、环境有歧义要选一个、"
+            "参数方案二选一）。**凡是能用选项表达的选择都用它**，别让用户手打。"
+        ),
+        do_not_use_when="需要用户确认高风险写操作时用确认卡（那是执行前确认，不是选择）；纯开放问题（比如让用户补一段日志）直接问即可。",
+        validation_rules=("options 至少 2 个、最多 6 个", "label 要能独立看懂（用户点它等于回答你）"),
+        max_llm_output_chars=600,
+        risk_level="low_write",
+        implementation="apps.tooling.services.ask_user_choice",
+        read_only=False,
+    ),
+    ToolDefinition(
         id="bulk_generate_log_rules",
         name="批量生成日志语义/标签规则",
         description=(
@@ -1253,7 +1294,7 @@ TOOLS: tuple[ToolDefinition, ...] = (
             "mode": {
                 "type": "string",
                 "enum": ["semantic", "label", "both"],
-                "description": "生成语义说明 / 标签 / 两者都要。用户没说就先去问用户，不要自己替他决定。",
+                "description": "生成语义说明 / 标签 / 两者都要。用户没说就先用 ask_user_choice 让他点选，不要自己替他决定。",
             },
             "group_by": {
                 "type": "string",
@@ -1281,7 +1322,7 @@ TOOLS: tuple[ToolDefinition, ...] = (
         use_when=(
             "用户希望**批量**给日志加语义说明或标签（例如「这批日志你帮我批量加标签」"
             "「按函数方法生成语义规则」「把同类日志整理成规则」）时调用。"
-            "**mode 必须来自用户**：用户没说语义还是标签，先问一句再调用。"
+            "**mode 必须来自用户**：用户没说语义还是标签，先用 ask_user_choice 让他在选项里点选，再调用本工具。"
         ),
         do_not_use_when=(
             "只针对单条日志/单个函数建规则用 create_log_semantic_rule；"

@@ -106,11 +106,18 @@ def test_dedupe_skips_existing_and_duplicated_candidates():
     assert kept == [] and dropped == 1, "与已有规则同关键字要跳过"
 
 
-def test_bulk_tool_requires_mode_and_samples():
-    with pytest.raises(ToolInputError) as missing_mode:
-        bulk_generate_log_rules({"samples": [LINE_HOME_IN]})
-    assert "语义" in str(missing_mode.value) and "标签" in str(missing_mode.value)
+def test_bulk_tool_without_mode_asks_the_user_instead_of_failing():
+    """没说语义还是标签时**不再抛异常**（那会显示成"工具执行失败"）：
+    把现成的选项交回去，让模型下一步调用 ask_user_choice，由用户在固定选择组件里点选。"""
+    payload = bulk_generate_log_rules({"samples": [LINE_HOME_IN]})
+    assert payload["status"] == "need_user_choice"
+    options = payload["suggested_choice"]["options"]
+    assert len(options) >= 2
+    assert {item["label"] for item in options} >= {"语义说明", "标签"}
+    assert "ask_user_choice" in payload["message"]
 
+
+def test_bulk_tool_requires_samples():
     with pytest.raises(ToolInputError):
         bulk_generate_log_rules({"mode": "semantic"})
     with pytest.raises(ToolInputError):

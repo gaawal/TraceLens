@@ -2239,6 +2239,43 @@ def create_log_semantic_rule(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ask_user_choice(payload: dict[str, Any]) -> dict[str, Any]:
+    """把"让用户选一个"变成**结构化选项**，前端渲染成固定选择组件（点一下即可，不用手打）。
+
+    只在真的需要用户在有限选项里做决定时用（例如"要语义还是标签"）。
+    返回的 payload 会由 ai_engine 发成 `choices` 事件；本轮到此为止，等用户点选后作为下一条消息回来。
+    """
+    question = str(payload.get("question") or "").strip()[:300]
+    if not question:
+        raise ToolInputError("question 不能为空，要把问题本身写给用户看。")
+    raw_options = payload.get("options")
+    if not isinstance(raw_options, list) or len(raw_options) < 2:
+        raise ToolInputError("options 至少要有 2 个候选（固定选择组件才有意义）。")
+    options: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_options[:6]):
+        if isinstance(item, dict):
+            label = str(item.get("label") or item.get("value") or "").strip()
+            detail = str(item.get("detail") or item.get("description") or "").strip()
+        else:
+            label = str(item or "").strip()
+            detail = ""
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        options.append({"id": f"choice-{index + 1}", "label": label[:60], "detail": detail[:200]})
+    if len(options) < 2:
+        raise ToolInputError("去掉重复/空选项后不足 2 个，请重新给候选。")
+    allow_other = payload.get("allow_other")
+    return {
+        "status": "waiting_for_choice",
+        "question": question,
+        "options": options,
+        "multi": bool(payload.get("multi", False)),
+        "allow_other": True if allow_other is None else bool(allow_other),
+    }
+
+
 def bulk_generate_log_rules(payload: dict[str, Any]) -> dict[str, Any]:
     """批量生成日志**语义规则 / 标签规则**（用户可选），返回一次性的前端应用动作。
 
@@ -2254,7 +2291,20 @@ def bulk_generate_log_rules(payload: dict[str, Any]) -> dict[str, Any]:
 
     mode = str(payload.get("mode") or "").strip().lower()
     if mode not in {"semantic", "label", "both"}:
-        raise ToolInputError("请先确定要生成「语义」还是「标签」（mode 只能是 semantic / label / both）。")
+        # 不抛异常（那会变成用户看到的"工具执行失败"）：把现成的选项交回去，
+        # 并明确要求模型下一步调用 ask_user_choice，让用户在固定选择组件里点选。
+        return {
+            "status": "need_user_choice",
+            "message": "还没有确定要生成哪一类：请调用 ask_user_choice 让用户在选项里点选，再调用本工具。",
+            "suggested_choice": {
+                "question": "这批日志要生成哪一种规则？",
+                "options": [
+                    {"label": "语义说明", "detail": "展开后写在函数/日志旁边的一句中文解释"},
+                    {"label": "标签", "detail": "列表右侧的小色块，用来一眼分类"},
+                    {"label": "两者都要", "detail": "每条规则同时带语义说明和标签"},
+                ],
+            },
+        }
     raw_samples = payload.get("samples")
     if isinstance(raw_samples, str):
         raw_samples = [line for line in raw_samples.splitlines() if line.strip()]
