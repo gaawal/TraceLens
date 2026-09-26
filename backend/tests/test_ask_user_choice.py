@@ -73,3 +73,30 @@ def test_router_tells_the_model_to_ask_before_bulk_generating():
     assert "本轮 tool_ids 只放 ask_user_choice，不要放 bulk_generate_log_rules" in router
     assistant = (ROOT / "backend/apps/tooling/assistant.py").read_text(encoding="utf-8")
     assert "必须调用 ask_user_choice" in assistant, "系统提示里要有「需要选择就用组件」的硬规则"
+
+
+# --- 「回答上面的选择」标记：确定性认出"用户已经选过了" -------------------------
+
+def test_parse_choice_answer_reads_the_frontend_marker():
+    from apps.tooling.assistant import CHOICE_ANSWER_PREFIX, parse_choice_answer
+
+    parsed = parse_choice_answer("回答上面的选择——「本轮要生成哪种规则？」：只要标签规则")
+    assert parsed == {"question": "本轮要生成哪种规则？", "label": "只要标签规则"}
+    # 半角冒号 / 多余空白也要认
+    assert parse_choice_answer("回答上面的选择——「Q」:  两者都要 ")["label"] == "两者都要"
+    # 普通消息不能被误判成"回答"
+    assert parse_choice_answer("只要标签") is None
+    assert parse_choice_answer("") is None
+    assert parse_choice_answer("回答上面的选择——「Q」：") is None
+    assert CHOICE_ANSWER_PREFIX == "回答上面的选择——"
+
+
+def test_frontend_sends_the_marker_so_the_backend_can_stop_re_asking():
+    """前端点选必须带上问题标记 —— 这是后端"不再重复问"的确定性依据。"""
+    component = (ROOT / "frontend/src/components/AiAssistant.tsx").read_text(encoding="utf-8")
+    assert "回答上面的选择——「${question}」：${label}" in component
+    graph = (ROOT / "backend/apps/tooling/ai_engine/graph.py").read_text(encoding="utf-8")
+    assert "choice_answer = a.parse_choice_answer(message)" in graph
+    assert "if choice_answer is None and kernel.registry.get(\"ask_user_choice\") is not None:" in graph
+    router = (ROOT / "backend/apps/tooling/ai_engine/router.py").read_text(encoding="utf-8")
+    assert "必须**放行 bulk_generate_log_rules" in router

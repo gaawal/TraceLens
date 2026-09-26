@@ -102,9 +102,20 @@ def _prepare(state: ExecutionState) -> dict[str, Any]:
         "title": "正在理解任务", "detail": "结合当前页面上下文选择最合适的能力",
         "status": "running", "percentage": 3,
     })
+    # 这一轮是不是"用户刚在选项组件里做了选择"？是的话把**上一轮的问题和这次的选择**补给路由：
+    # 否则路由只看得到一句「回答上面的选择——「…」：只要标签」，会判成"没说明要什么"而不放行执行工具，
+    # 于是模型反复问同一个问题、永远不执行（用户实测踩过）。
+    choice_answer = a.parse_choice_answer(message)
+    route_message = message
+    if choice_answer is not None:
+        route_message = (
+            f"{message}\n\n【上一轮提出的选择】{choice_answer['question']}\n"
+            f"【用户已经选好】{choice_answer['label']}\n"
+            "（用户已经做过这个选择，不要再让他重选；请据此放行真正要执行的那个工具。）"
+        )
     semantic_route = SemanticRouter(kernel.registry, event_sink=lambda event: _emit(state, event)).route(
         client,
-        message=message,
+        message=route_message,
         context=context,
         skill_id=requested_skill,
     )
@@ -161,8 +172,22 @@ def _prepare(state: ExecutionState) -> dict[str, Any]:
         selected_tool_ids.add("control_log_view")
     # 「让用户选择」是**通用交互**，不属于某个领域：不论本轮路由选了哪个领域都要留给 Agent，
     # 否则模型只能把选项写进正文让用户手打（用户明确要求改成可点选的固定选择组件）。
-    if kernel.registry.get("ask_user_choice") is not None:
+    #
+    # 但**这一轮本身就是"用户刚在组件里回答了"**时绝不投放：模型会拿着同一个问题反复问，
+    # 用户看到的是一遍遍"请选择"却永远不执行（实测踩过这个死循环）。
+    if choice_answer is None and kernel.registry.get("ask_user_choice") is not None:
         selected_tool_ids.add("ask_user_choice")
+    elif choice_answer is not None:
+        logger.info(
+            "assistant.graph.choice_answered question=%s label=%s",
+            choice_answer.get("question"), choice_answer.get("label"),
+        )
+    # 用户在聊天里**直接打字**指定了"要语义还是标签"（没走组件）时，路由有时会判成"没说清"而不放行
+    # 批量工具，于是又回头问一遍。这里兜一手：命中就补上这个可选工具（调不调仍由模型决定）。
+    if "bulk_generate_log_rules" not in selected_tool_ids and a.message_selects_log_rule_mode(message):
+        if kernel.registry.get("bulk_generate_log_rules") is not None:
+            selected_tool_ids.add("bulk_generate_log_rules")
+            logger.info("assistant.graph.rule_mode_detected_in_message")
     tools = kernel.registry.llm_specs(selected_tool_ids)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": a._system_prompt(context, normalized_skill, selected_tool_ids)},

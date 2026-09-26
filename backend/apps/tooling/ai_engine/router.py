@@ -234,10 +234,12 @@ class SemanticRouter:
             "页面已有充分日志证据时优先 use_page_evidence=true；相对时间且上下文无时间时才 needs_current_time=true；"
             "沿用最近成功部署参数并覆盖少量字段时 workflow_hint=deployment_reuse_last_success。不要回答用户。"
             "已有证据只够部分分析时仍保留补取工具；用户明确要求继续查日志时 use_page_evidence=false。"
-            # 需要用户在选项里做决定时，**只放选择工具**：把 batch 生成规则这种必须带 mode 的工具先挡住，
-            # 主 Agent 就不会自己替用户默认一个（界面会渲染成可点选的固定选择组件）。
-            "如果用户要求批量生成/新增日志语义或标签规则，但**没有明说**要「语义说明」「标签」还是两者，"
-            "本轮 tool_ids 只放 ask_user_choice，不要放 bulk_generate_log_rules —— 先让用户点选。"
+            # 「让用户选择」只在**确实还没选过**时才挡：用户已经在选项组件里点过（消息形如
+            # 「回答上面的选择——「…」：…」）就是选定了，必须放行执行工具，否则会陷入"反复问同一个问题"。
+            "如果用户要求批量生成/新增日志语义或标签规则，但确实**还没有**做过这个选择，"
+            "本轮 tool_ids 只放 ask_user_choice，不要放 bulk_generate_log_rules；"
+            "而当下这一轮是对上一轮选项的回答（消息里带「回答上面的选择——」），或答案里已经给出"
+            "「语义」「标签」「两者都要」等选择时，**必须**放行 bulk_generate_log_rules（mode 按答案取），不要再放 ask_user_choice。"
         )
         route_tool = {
             "type": "function",

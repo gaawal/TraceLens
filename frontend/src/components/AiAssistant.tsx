@@ -3026,8 +3026,11 @@ export function AiAssistant() {
                       <AssistantChoiceCard
                         choices={message.choices}
                         onPick={(label) => {
+                          // 带上问题本身：后端据此**确定性**判定"用户已经选过了"，
+                          // 本轮不再投放选择工具，直接照这个答案执行（否则会反复问同一个问题）。
+                          const question = message.choices?.question || '请选择';
                           patchMessage(activeConversation.id, message.id, { choices: undefined });
-                          void send(label);
+                          void send(`回答上面的选择——「${question}」：${label}`);
                         }}
                       />
                     )}
