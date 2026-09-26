@@ -392,3 +392,38 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   }
   console.log('函数折叠归属与入口去重检查通过');
 }
+
+// --- 折叠头展开后的入口正文 -----------------------------------------------
+// Regression: 展开的函数卡片把日志原文整条又贴了一遍（`Stage_WSP_HOME() >() enter …`），
+// 函数名与边界符在卡片头上已经有了，重复一遍让这一行又长又难读。
+{
+  const {stripFunctionPrefixFromMessage} = await import('../src/rendering/logMessage');
+  const start = 'Stage_WSP_HOME() >() enter stage homing stage start step=1/6 wafer=W01 lot=LOT-20260926-01';
+  assert.equal(
+    stripFunctionPrefixFromMessage(start, 'Stage_WSP_HOME()'),
+    'enter stage homing stage start step=1/6 wafer=W01 lot=LOT-20260926-01',
+    '函数名与 >() 边界符都要剥掉，只留正文',
+  );
+  assert.equal(
+    stripFunctionPrefixFromMessage('MoveAbsolute() <() leave stage absolute move end', 'MoveAbsolute()'),
+    'leave stage absolute move end',
+    '<() 退出边界符同样剥掉',
+  );
+  assert.equal(
+    stripFunctionPrefixFromMessage('[Stage_WSP_HOME] >() enter stage homing stage start', 'Stage_WSP_HOME()'),
+    'enter stage homing stage start',
+    '方括号包裹的函数名也要兼容',
+  );
+  assert.equal(
+    stripFunctionPrefixFromMessage('call Stage_WSP_HOME() failed code=3', 'Stage_WSP_HOME()'),
+    'call Stage_WSP_HOME() failed code=3',
+    '只剥开头的一次，正文中间的函数名保持原样',
+  );
+  assert.equal(
+    stripFunctionPrefixFromMessage('Stage_WSP_HOME()', 'Stage_WSP_HOME()'),
+    'Stage_WSP_HOME()',
+    '剥完什么都不剩时退回原文，避免展开后一片空白',
+  );
+  assert.equal(stripFunctionPrefixFromMessage('', 'Stage_WSP_HOME()'), '', '空正文不炸');
+  console.log('Workstation checks passed: 折叠展开后的入口正文去掉重复的函数名前缀与 >() 边界符.');
+}

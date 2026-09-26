@@ -231,7 +231,8 @@ RUN_ROOT = LOG_ROOT + "/run"
 SUBSYSTEM_MODULES: dict[str, tuple[str, ...]] = {
     "spwsp": ("spwsp", "lgsw", "wtrm"),
     # wsp = 工件台点位子系统。它的 fm 日志专门记**绝对移动点位**
-    # （``move absolute { x:…, y:… }``），内容规则见 loggen.WSP_MOVE_POINTS。
+    # （``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``，六自由度），
+    # 内容规则见 loggen.WSP_MOVE_POINTS。
     "wsp": ("wsp",),
     "mecore": ("mecore", "cpcore", "metrl"),
     "cpfr": ("cpfr", "frhyd"),
@@ -337,6 +338,42 @@ class MachineSpec:
     @property
     def cpd_data_root(self) -> str:
         return CPD_DATA_ROOT.format(username=SIM_USERNAME)
+
+
+def hosts_subsystem_logs(spec: MachineSpec) -> bool:
+    """这台模拟机是否承载 ``<debug root>/<子系统>/<fm>.log`` 与 ``run/event.log``。
+
+    **只有上位机承载**，原因是这个模拟里两台机器用的是同一个日志根模板
+    （``/log/{username}/debug``、``/log/{username}/run``），而且 host 也常常落成同一个
+    地址。如果两台都生成同构的子系统树，后端 ``LogPathScope.each_machine`` 就会把
+    **同一份日志各读一遍**：检索结果里每条 ``函数名() >() enter`` / ``<() leave`` 都出现两次
+    （内容、时间戳、线程号完全相同），前端按路径归并后看起来就是"同一个出口打印两遍"。
+
+    下位机真正该有的机台日志，本项目是通过上位机 elog 树下的
+    ``<elog root>/<下位机地址>/<子系统>/<executor>_cp_nn.log`` 发布的（后端 executor
+    profile 的 scope 就是 ``upper_only``）。所以下位机只留 ``home/SW`` 与部署日志。
+    """
+    return spec.role == "upper"
+
+
+def managed_roots(spec: MachineSpec) -> tuple[str, ...]:
+    """这台机器**可能**承载产物的全部远端根 —— 清理时必须遍历它们**全部**。
+
+    不能只遍历"本轮计划里出现过的根"：某棵树一旦不再由这台机器产出（例如子系统日志树
+    改成只有上位机承载，见 ``hosts_subsystem_logs``），它就再也不会出现在计划里，
+    于是**永远不被清理**。实测下位机上那棵 88 个文件的 debug 树一直躺在磁盘上，
+    mtime 停在改动之前、正文还是旧的 ``[函数名] >()`` 写法，会被后端读到、被前端搜出来。
+
+    刻意**不含** ``log_root`` 本身：``log_root/deploy`` 是 ``deploy.py`` 写的部署日志，
+    不归 loggen 管；把 log_root 整个纳入清理会把部署历史一起搬走。
+    """
+    return (
+        spec.home,
+        spec.debug_root,
+        spec.run_root,
+        spec.cpd_report_root,
+        spec.cpd_data_root,
+    )
 
 
 UPPER = MachineSpec(

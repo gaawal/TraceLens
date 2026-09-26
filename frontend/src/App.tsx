@@ -120,6 +120,7 @@ import {
 import type { DisplayRule, DisplayRuleEditorRequest, DisplayRuleParameter, ParameterMark } from './rendering/displayRules';
 import { isEntryMasked, loadMaskingRules, saveMaskingRules, type MaskingRule } from './rendering/maskingRules';
 import { loadFoldingRules, saveFoldingRules, type FoldingRule } from './rendering/foldingRules';
+import { stripFunctionPrefixFromMessage } from './rendering/logMessage';
 import { createEmptyDataExtractionRule, detectStructuredDataCandidates, extractDataRow, inferDataSourceUnit, inferDataValueType, loadDataExtractionRules, saveDataExtractionRules, validateDataExtractionRule, type DataExtractionField, type DataExtractionRule, type DataValueType } from './rendering/dataExtractionRules';
 import { extractFromLoadedEntries, type ExtractionProgress } from './rendering/dataExtractionRuntime';
 import { downloadMergedTemporaryRuleData, downloadTemporaryRuleData, saveTemporaryExtractionSession, temporarySessionKey } from './rendering/extractedDataStore';
@@ -3335,21 +3336,20 @@ function FunctionItem({
             <span className="function-title-row">
               <span className="function-entry-time" title={node.startEntry.timestamp}>{node.startEntry.timestamp}</span>
               <ComponentBadge component={node.component} compact />
-              <span className="function-name-semantic">
+              <span className={classNames('function-name-semantic', expanded && 'is-expanded')}>
                 <span className="function-name" title={node.name}>{node.name}</span>
                 {node.origin === 'repeated' && <span className="function-repeat-badge">×{node.repeatCount ?? children.length}</span>}
+                {/* 展开时把入口日志的信息接在函数名后面（级别 + 正文，正文剥掉重复的函数名/边界符），
+                    语义说明自然被挤到这一行最后，整行读起来是：组件 函数名 级别 正文 语义。 */}
+                {expanded && (
+                  <>
+                    <span className={classNames('level-badge', `level-${String(node.startEntry.level || '').toLowerCase()}`)}>{node.startEntry.level}</span>
+                    <span className="function-entry-message" title={node.startEntry.raw}>{stripFunctionPrefixFromMessage(node.startEntry.message, node.name)}</span>
+                  </>
+                )}
                 {semanticText && <span className={classNames('semantic-function-description', semanticMatch ? 'rule' : 'auto')} title={semanticOrigin?.title}>{semanticText}</span>}
                 {semanticOrigin && <span className={`semantic-origin-badge function-semantic-origin ${semanticOrigin.className}`} title={semanticOrigin.title}>{semanticOrigin.label}</span>}
               </span>
-              {/* 展开时就把入口日志接在**同一行**后面（级别 + 正文 + 源码位置），
-                  和原先的日志行一致；不再另起一行，也不在子列表里重复这一条。 */}
-              {expanded && (
-                <>
-                  <span className={classNames('level-badge', `level-${String(node.startEntry.level || '').toLowerCase()}`)}>{node.startEntry.level}</span>
-                  {/* 源码位置不用再追加一遍：卡片右侧的统计里本来就有（wsp / cpfr）。 */}
-                  <span className="function-entry-message" title={node.startEntry.raw}>{node.startEntry.message}</span>
-                </>
-              )}
               {severity === 'error' && <span className="severity-badge error">ERROR 链路</span>}
               {severity === 'warning' && <span className="severity-badge warning">WARN</span>}
             </span>

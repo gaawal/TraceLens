@@ -7,35 +7,54 @@
 
 * 往 5 条 ``<root>/debug/<子系统>/<模块>.log`` 持续追加**合规的八字段调试日志**
   （匹配 ``DEBUG_PATTERN``，否则前端解析不出 level/module）；
-* 正文遵守项目的调用链规则：``[函数名] >()`` 入口、``[函数名] <()`` 出口，
+* **每条流 0.5 秒落一行**：一个 tick 里 5 条流**各写一行**（不是共用一条扁平
+  游标、5 条轮流写），所以不管你订阅哪一条，都是稳定的 0.5s 一行；
+  落笔时刻每条流各抖 ``LIVE_STAMP_SPREAD_SECONDS``，各流看起来有自己的时钟；
+* **每条流有自己的剧本游标**：走完自己那一遍就回到开头，不跟别人的长度对齐。
+  于是短剧本的流（cpfr 12 行 / mecore 13 行 / sil 15 行）一轮里会把自己的剧本
+  走二三遍 —— 真机台的"周期采样 / 周期检查"日志本来就是这样反复出现的；
+  spwsp（39 行）一轮正好走一遍，wsp（116 行）因为**每个点位都是一次调用**
+  （三行一组）长得多，一轮里走不完，跨 3 轮才走完自己的剧本。一轮 ≈ 20s 换一次
+  ``trace`` / ``lot`` / ``wafer``（轮长 ``ROUND_TICKS`` 由扫片流 spwsp 定义）；
+* 正文遵守项目的调用链规则：``函数名() >()`` 入口、``函数名() <()`` 出口，
   同名 LIFO 配对（拼装逻辑复用 ``loggen.log_message``）。前端就是靠这对方向符
-  把一段调用折成函数卡片的，所以不能只写没有边界的散句；
+  把一段调用折成函数卡片的，所以不能只写没有边界的散句；函数方法名必须带括号，
+  写成 ``ScanWafer() >()`` 而不是 ``[ScanWafer] >()``；
 * 内容是一段可循环的故障剧本：**1 类正常节拍 + 3 类异常**，异常之间靠
   ``trace=`` / ``cause=`` 与同一个 lot / wafer 编号显式关联 ——
   编码器抖动 → 伺服补偿发热 → 冷却流量不足 → 光源互锁跳闸 → 扫片侧
   WARN/ERROR/FATAL 三级升级 → 复位重试；
-* 其中 ``wsp`` 这条流是**工件台点位**日志：每一行都是一条固定格式的
-  ``move absolute { x:…, y:… }``（点位表见 ``loggen.WSP_MOVE_POINTS``），
+* 其中 ``wsp`` 这条流是**工件台点位**日志：正文是一条固定格式的
+  ``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``（**完整六自由度**，
+  点位表见 ``loggen.WSP_MOVE_POINTS``）。**每个点位各是一次 ``MoveAbsolute``
+  调用** —— 入口 / 点位正文 / 出口三行一组（见 :func:`_wsp_call`），
+  所以每条点位正文都落在自己的边界里，前端能折出"这一次移动"、并读出它花了多久。
+  曝光那一段走的是**螺旋步进轨迹** —— 从曝光场中心起步、一圈圈向外盘到边缘
+  （``point:spiral_01`` … ``spiral_24``，几何参数见 ``loggen.SPIRAL_*``），
+  所以把 wsp 的点位正文按序读下来，读到的就是工件台的运动轨迹本身。
   它自己也带一条 WARN → ERROR → FATAL 的停位异常链，所以单独订阅它同样有料；
 * 因为前端「实时监听」一次只盯一个模块，需要被单独盯住的流（``spwsp`` / ``wsp``，
   见 :data:`OBSERVER_KEYS`）自己也会把整条链的后果按 WARN / ERROR / FATAL
   三个级别记一遍，只订阅一个模块就能同时看到「≥3 类异常 + 1 类正常节拍」；
-* 活动文件写满 ``MAX_LIVE_LINES`` 行就**轮转**（改名成带关闭边界的归档、重建空文件），
-  日志目录里只留最新一份归档，旧的搬进 ``run/recycle/``（用改名而不是删除，
-  见 ``reclaim()``），所以活动文件永远不超过 1000 行、目录也不会越堆越乱。
+* **滑动窗口**：活动文件写满 ``MAX_LIVE_LINES`` 行就**轮转**（改名成带关闭边界的
+  归档、重建空文件），日志目录里只留最新一份归档，旧的搬进 ``run/recycle/``
+  （用改名而不是删除，见 ``reclaim()``）。于是每条流的实时数据量**恒定有界**：
+  当前段 ≤ ``MAX_LIVE_LINES`` + 最新归档 ≤ ``MAX_LIVE_LINES``，回收站的槽位是
+  固定文件名、下一轮直接覆盖 —— 日志既不会无限追加，也不会把磁盘/内存堆爆。
 
-于是前端点开「实时监听」就能看到日志从订阅点开始一行行滚出来，
-滚满一轮后自动从头再来，不需要人工造数据。
+于是前端点开「实时监听」就能看到日志从订阅点开始一行行滚出来（0.5s 一行），
+写满 ``MAX_LIVE_LINES`` 行就滑动一格接着写，不需要人工造数据，也不会越挂越大。
 """
 
 from __future__ import annotations
 
 import json
+import random
 import signal
 import time
 import zlib
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import fleet
@@ -43,27 +62,51 @@ from .loggen import (
     PHASE_BODY,
     PHASE_ENTER,
     PHASE_LEAVE,
+    SCAN_TRAJECTORY_POINTS,
     expand_stage_groups,
     log_message,
+    move_call_rows,
     point_body,
+    scan_metric_body,
     source_line,
     stage_codes_of,
 )
 
 # --------------------------------------------------------------------------- 常量
 
-#: 活动文件行数上限。写满就轮转，保证前端「日志不超过 1000 行」的观感。
-MAX_LIVE_LINES = 1000
+#: **滑动窗口宽度**：一条流的活动文件最多放这么多行，写满就整段收档、重建空文件。
+#: 于是实时数据量恒定有界（当前段 ≤ 2000 行 + 最新归档 ≤ 2000 行），日志源可以
+#: 7×24 挂着跑：每 2000 行挪一次，旧段进回收站固定槽位被下一轮覆盖，
+#: 不会像"只追加、从不清理"的写法那样把磁盘（以及读它的进程内存）慢慢吃满。
+MAX_LIVE_LINES = 2000
 
-#: 每行间隔（秒）。1s 一行 ≈ 1000 行 / 17 分钟写满一轮活动文件。
-#: 注意剧本是**5 条流交错**的一条扁平序列，每 tick 只落一行，
-#: 所以被观察的那一条流实际是 ``5 × DEFAULT_INTERVAL_SECONDS`` 才走一行。
-#: 想让自己盯的那条流 1 秒一行，用 ``--interval 0.2``。
-DEFAULT_INTERVAL_SECONDS = 1.0
+#: 每条流的落笔间隔（秒）。``emit_tick`` 一个 tick 里 5 条流**各写一行**，
+#: 所以这就是"任何一条日志"的追加间隔 —— 0.5s 一行，看着像活的。
+#: 2000 行 ÷ 0.5s ≈ 16.7 分钟写满一轮活动文件，然后滑动一格。
+DEFAULT_INTERVAL_SECONDS = 0.5
 
 #: 轮转后留给远端 ``tail -F`` 的检测窗口：BSD/GNU tail 都是每秒 stat 一次文件名，
 #: 太急着往新文件写，切换瞬间的那几行会被漏掉。
 ROTATE_SETTLE_SECONDS = 1.05
+
+#: 实时节奏的抖动比例。
+#:
+#: 不抖的话，``time.sleep(interval)`` 会让相邻两行的时间戳**匀速平移** ——
+#: 毫秒位从 .045 一路 .083 / .135 / .181 / .232 地往上爬，看着像节拍器，
+#: 一行行的"活气"就没了（用户原话：「有时间不断变化的感觉」）。
+#: 真机台写日志不可能匀速：别的线程抢 CPU、日志缓冲 flush、磁盘 IO 都会插队，
+#: 间隔会忽快忽慢。±35% 足够看出节奏在呼吸，又不会把"0.5s 一行"的观感
+#: 拉成"有时候半天不动"（下限仍有 0.325s）。
+INTERVAL_JITTER_RATIO = 0.35
+
+#: 每条流的**落笔时刻抖动**（秒）。
+#:
+#: 一个 tick 里 5 条流各写一行，如果都用同一个 ``datetime.now()``，那么跨模块
+#: 查询（把几条流摆在一起看）里 5 条流的时间戳会**逐列对齐到同一毫秒** ——
+#: 真机台里五个子系统各有各的时钟，不可能同时落笔，一眼就能看出是同进程写出来的。
+#: ±120ms 让每条流看起来有自己的时钟，又不会打乱任何一条文件内部的时间顺序
+#: （间隔 0.5s，来回最多吃掉 0.24s，仍是递增的）。
+LIVE_STAMP_SPREAD_SECONDS = 0.12
 
 #: 每 N 个 tick 用磁盘真实行数校准一次内存计数，防止外部改动导致计数漂移。
 RECOUNT_EVERY = 60
@@ -138,15 +181,17 @@ NORMAL_BEAT_MARKERS: tuple[str, ...] = (
 #   {rms} {rms2} 编码器抖动读数   {flow} 冷却流量   {elapsed} 本次调用耗时
 #
 # 相位决定正文长什么样（见 ``loggen.log_message``）：
-#   enter -> ``[ScanWafer] >() enter 晶圆扫片 开始 wafer=W07 ...``
-#   body  -> ``[ScanWafer] 普通正文``
-#   leave -> ``[ScanWafer] <() leave 晶圆扫片 end wafer=W07 elapsed=86.4ms status=ok``
-# 入口/出口那句**固定关键字**（「晶圆扫片」「曝光扫描」「获取冷却流量」……）来自
-# ``loggen.PHASE_KEYWORDS``；出口复用同一个关键字 + ``end``，肉眼就能配对。
+#   enter -> ``ScanWafer() >() enter wafer scan start wafer=W07 ...``
+#   body  -> ``ScanWafer() 普通正文``
+#   leave -> ``ScanWafer() <() leave wafer scan end wafer=W07 elapsed=86.4ms status=ok``
+# 方向符**前面**那个词是被调用的函数，写成调用形状 ``函数名()``（前端
+# ``logParser.ts::FUNCTION_PREFIX_REGEX`` 首选就是按这个抓的）。
+# 入口/出口那句**固定关键字**（``wafer scan`` / ``exposure scan`` / ``coolant flow read``……）
+# 来自 ``loggen.PHASE_KEYWORDS``，**一律英文**；出口复用同一个关键字 + ``end``，肉眼就能配对。
 #
-# 阶段码把一串调用包成 ``[Stage_<阶段码>]`` 阶段框（展开逻辑在
-# ``loggen.expand_stage_groups``）。码为 ``None`` 表示不套框 —— ``ScanLot`` /
-# ``ScanWafer`` 要跨整轮，套进阶段框就会让子阶段先闭合、父帧被迫跨框。
+# 阶段码把一串调用包成 ``Stage_<阶段码>()`` 阶段框（展开逻辑在
+# ``loggen.expand_stage_groups``）。码为 ``None`` 表示不套框 —— ``ScanLot()`` /
+# ``ScanWafer()`` 要跨整轮，套进阶段框就会让子阶段先闭合、父帧被迫跨框。
 #
 # 三条必须守住的约束：
 #
@@ -156,11 +201,29 @@ NORMAL_BEAT_MARKERS: tuple[str, ...] = (
 #   ⚠️ 推论：一个函数**不能跨两个阶段框**（例如把服务循环的开头放阶段 A、
 #   收尾放阶段 B）—— 阶段框比它晚开却要比它先合，栈立刻乱。
 # * **边界行只记进出**：入口/出口固定 INFO，异常级别只落在正文行 ——
-#   否则会出现 ``[X] <() leave status=ok`` 却标着 FATAL 这种自相矛盾的行。
+#   否则会出现 ``ScanWafer() <() leave status=ok`` 却标着 FATAL 这种自相矛盾的行。
 # * **阶段框的顺序就是流程顺序**：同一条流上阶段序号必须递增（selftest 会查）。
 #
 # ``cause=`` 里写的是**上游故障码**，这样三条异常在文本层面就能串成一条链，
 # 前端按关键字搜索任意一环都能找到整条因果链。
+
+def _wsp_call(
+    stream: str, code: str, name: str, profile: str
+) -> tuple[tuple[str, str, str, str, str, str], ...]:
+    """把一个点位展开成实时剧本里的**一整次** ``MoveAbsolute`` 调用（三行一组）。
+
+    三行的形状由 ``loggen.move_call_rows`` 定义 —— 批量程序与实时剧本共用同一份，
+    所以不会出现"批量补了出口、实时的还是半条调用"这种两边漂移。
+
+    ⚠️ **一个点位一次调用**：整条扫描轨迹（27 个点）是 27 次 ``MoveAbsolute``，
+    不是"一次调用里连打 27 条点位"。后者的点位正文没有自己的入口/出口，
+    既不合日志规范，也没法回答"走到这个点位用了多久"。
+    """
+    return tuple(
+        (stream, code, level, function, phase, body)
+        for function, phase, level, body in move_call_rows(name, profile=profile)
+    )
+
 
 _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     # ---- 引子：扫片主流程的最外层帧（跨整轮，不套阶段框） ----
@@ -168,40 +231,61 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     ("spwsp", None, "INFO", "ScanWafer", PHASE_ENTER, "wafer={wafer} recipe=SPM-V2026.09.21"),
     # ---- 阶段⓪：工件台回零（wsp 点位流）----
     # wsp 这条流记的是**工件台运动轨迹**，所以它跟着主流程一路走：回零 → 上片点 →
-    # 对准点 → 扫描点 → 停位检查 → 卸片点。每行都是一条固定格式的移动点位
-    # （``move absolute { x:…, y:… }``），点位表在 ``loggen.WSP_MOVE_POINTS``。
+    # 对准点 → 扫描点 → 停位检查 → 卸片点。正文是一条固定格式的移动点位
+    # （``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``，六自由度），
+    # 点位表在 ``loggen.WSP_MOVE_POINTS``。
+    #
+    # ⚠️ **一个点位 = 一次 ``MoveAbsolute`` 调用**（入口 / 点位正文 / 出口，
+    # 由 ``_wsp_call`` 展开）：点位正文必须落在**它自己那一次调用**的边界里，
+    # 而不是几十条点位共用一对入口/出口。所以下面每个点位都是三行。
+    #
     # 之所以**插在主流程各个节点之间**而不是整块放在末尾：真实机台的点位日志是
     # 跟着动作持续刷的，整块放末尾会让"实时监听 wsp"变成几十秒静默 + 一串爆发。
-    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_ENTER, "axis=XY mode=absolute search=reference_mark"),
+    # 回零不是"绝对移动一个点位"，它有自己的函数（``HomeStage``），所以它照旧是
+    # 三行一组、正文里报的是参考点（origin）的坐标。
+    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_ENTER, "dof=6 mode=absolute search=reference_mark"),
     ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_BODY, point_body("origin")),
-    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    ("wsp", "WSP_HOME", "INFO", "HomeStage", PHASE_LEAVE, "dof=6 elapsed={elapsed} status=ok"),
     # ---- 阶段①：上片 ----
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_ENTER, "axis=XY target=chuck"),
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_BODY, "wafer stage settled, position error within tolerance"),
     ("spwsp", "WAFER_LOAD", "INFO", "MoveWaferStage", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
     # ---- 阶段①b：工件台走上片点（wsp）----
-    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=load_position profile=rapid"),
-    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("load_position")),
-    ("wsp", "WSP_LOAD_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    *_wsp_call("wsp", "WSP_LOAD_MOVE", "load_position", "rapid"),
     # ---- 阶段②：对准 ----
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_ENTER, "wafer={wafer} marks=8"),
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_BODY, "alignment mark detected, offset compensation applied for wafer {wafer}"),
     ("spwsp", "ALIGNMENT", "INFO", "AlignWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
-    # ---- 阶段②b：工件台逐个对准标记对位（wsp）----
-    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=align_mark_01 profile=align"),
-    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("align_mark_01")),
-    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("align_mark_08")),
-    ("wsp", "WSP_ALIGN_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    # ---- 阶段②b：工件台逐个对准标记对位（wsp）—— 两个标记 = 两次移动 ----
+    *_wsp_call("wsp", "WSP_ALIGN_MOVE", "align_mark_01", "align"),
+    *_wsp_call("wsp", "WSP_ALIGN_MOVE", "align_mark_08", "align"),
     # ---- 阶段③：曝光开始。这个框在 spwsp 上要一直开到互锁恢复之后才合
     #      （中间夹着编码器 / 冷却 / 互锁各自的阶段，但那些是别的文件，不打断本流）----
     ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_ENTER, "wafer={wafer} dose=30mJ/cm2"),
     ("spwsp", "EXPOSURE", "INFO", "ExposeWafer", PHASE_BODY, "illumination source power stabilised at setpoint, dose within specification"),
+    # ---- 阶段③a：曝光过程中的测量快照（spwsp）----
+    # 一次采样就把整包读数打成**跨多行**的字典：六自由度位置 + 功率 + 对比度 +
+    # 激光器镜干涉仪 x1..x4 / y1..y3 七路对比度通道。正文构造见
+    # ``loggen.scan_metric_body``。
+    #
+    # ⚠️ 这是**故意**保留的多行形态：只有首行带时间戳，后面十几行都是无时间戳的
+    # 续行 —— 正是"按行首时间戳切记录"的解析器会**截断正文**的场景，用来复现
+    # 并盯住那个 bug。别把它改成单行，改单了截断场景就复现不出来了。
+    ("spwsp", "EXPOSURE", "INFO", "CaptureScanMetrics", PHASE_ENTER, "wafer={wafer} point=exposure_mid channels=7"),
+    ("spwsp", "EXPOSURE", "INFO", "CaptureScanMetrics", PHASE_BODY, scan_metric_body("exposure_mid")),
+    ("spwsp", "EXPOSURE", "INFO", "CaptureScanMetrics", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
     # ---- 阶段③b：工件台走扫描轨迹（wsp）—— 曝光期间真正在动的就是它 ----
-    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=exposure_start profile=scan"),
-    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_start")),
-    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_mid")),
-    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("exposure_end")),
-    ("wsp", "WSP_SCAN_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    # 轨迹是**螺旋步进**的：入场到曝光场 → 走到场中心 → 从中心一圈圈向外螺旋
+    # 步进（``spiral_01`` … 末圈贴边缘）→ 退场。点序取自
+    # ``loggen.SCAN_TRAJECTORY_POINTS``（几何参数在 ``loggen.SPIRAL_*``），
+    # 与批量程序共用同一份 —— 改圈数/密度只动常量，两边自动同步。
+    # **每一个点位各是一次 ``MoveAbsolute`` 调用**（三行），所以这段是
+    # ``len(SCAN_TRAJECTORY_POINTS)`` 次调用，不是一次调用连打几十条点位。
+    *(
+        row
+        for name in SCAN_TRAJECTORY_POINTS
+        for row in _wsp_call("wsp", "WSP_SCAN_MOVE", name, "scan")
+    ),
     # ---- 阶段④：伺服采样（编码器流）→ 异常① 故障链起点 ----
     ("encoder", "SERVO_SAMPLE", "INFO", "ServoLoop", PHASE_ENTER, "axis=Rz loop=position"),
     ("encoder", "SERVO_SAMPLE", "INFO", "CheckEncoderFeedback", PHASE_ENTER, "axis=Rz threshold=0.50um"),
@@ -242,14 +326,14 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     # → 逼近软限位、动作中止。这条 WARN → ERROR → FATAL 的本地链让 **wsp 单独订阅
     # 也有 3 类异常**；根因仍挂在编码器上，所以 trace 与其它子系统同号，跨模块关联
     # 照样成立（wsp 就是第 5 条流）。
-    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_ENTER, "axis=XY tolerance=0.020um"),
-    ("wsp", "WSP_SETTLE", "WARN", "CheckPositionError", PHASE_BODY, "position error 0.031um exceeds tolerance 0.020um axis=XY code=ERR_WSP_POSITION_DEVIATION cause=ERR_MECORE_ENC_JITTER trace={trace}"),
-    ("wsp", "WSP_SETTLE", "ERROR", "CheckPositionError", PHASE_BODY, "settling window expired, position error not converged axis=XY code=ERR_WSP_SETTLE_TIMEOUT cause=ERR_WSP_POSITION_DEVIATION trace={trace}"),
-    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=deviated"),
-    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_ENTER, "axis=XY reason=settle_timeout"),
-    ("wsp", "WSP_SETTLE", "FATAL", "AbortMotion", PHASE_BODY, "motion aborted near soft limit, travel range guard triggered axis=XY code=ERR_WSP_SOFT_LIMIT_PROXIMITY cause=ERR_WSP_SETTLE_TIMEOUT trace={trace}"),
+    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_ENTER, "dof=6 tolerance=0.020um"),
+    ("wsp", "WSP_SETTLE", "WARN", "CheckPositionError", PHASE_BODY, "position error 0.031um exceeds tolerance 0.020um dof=6 code=ERR_WSP_POSITION_DEVIATION cause=ERR_MECORE_ENC_JITTER trace={trace}"),
+    ("wsp", "WSP_SETTLE", "ERROR", "CheckPositionError", PHASE_BODY, "settling window expired, position error not converged dof=6 code=ERR_WSP_SETTLE_TIMEOUT cause=ERR_WSP_POSITION_DEVIATION trace={trace}"),
+    ("wsp", "WSP_SETTLE", "INFO", "CheckPositionError", PHASE_LEAVE, "dof=6 elapsed={elapsed} status=deviated"),
+    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_ENTER, "dof=6 reason=settle_timeout"),
+    ("wsp", "WSP_SETTLE", "FATAL", "AbortMotion", PHASE_BODY, "motion aborted near soft limit, travel range guard triggered dof=6 code=ERR_WSP_SOFT_LIMIT_PROXIMITY cause=ERR_WSP_SETTLE_TIMEOUT trace={trace}"),
     ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_BODY, "stage re-settled after motion abort, position error within tolerance"),
-    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=aborted"),
+    ("wsp", "WSP_SETTLE", "INFO", "AbortMotion", PHASE_LEAVE, "dof=6 elapsed={elapsed} status=aborted"),
     # ---- 阶段⑪：扫片停线（spwsp）WARN → ERROR → FATAL，三级升级 ----
     # 前端「实时监听」一次只盯一个模块，所以被观察的那条流自己也必须把整条链的
     # 后果按三个级别记下来 —— 否则只订阅一个模块时只能看到 1 类异常，凑不齐
@@ -269,9 +353,7 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_BODY, "exposure sequence resumed, lot {lot} continues from checkpoint"),
     ("spwsp", "SCAN_RECOVER", "INFO", "ResumeExposure", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=ok"),
     # ---- 阶段⑫b：工件台退回卸片位（wsp 点位流）----
-    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_ENTER, "axis=XY point=unload_position profile=rapid"),
-    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_BODY, point_body("unload_position")),
-    ("wsp", "WSP_UNLOAD_MOVE", "INFO", "MoveAbsolute", PHASE_LEAVE, "axis=XY elapsed={elapsed} status=ok"),
+    *_wsp_call("wsp", "WSP_UNLOAD_MOVE", "unload_position", "rapid"),
     # ---- 收尾：最外层帧闭合（不套阶段框）----
     ("spwsp", None, "INFO", "ScanWafer", PHASE_LEAVE, "wafer={wafer} elapsed={elapsed} status=recovered"),
     ("spwsp", None, "INFO", "ScanLot", PHASE_LEAVE, "lot={lot} elapsed={elapsed} status=ok"),
@@ -286,6 +368,35 @@ STAGE_CODES: tuple[str, ...] = stage_codes_of(_ROUND_ROWS)
 _SCRIPT: tuple[tuple[str, str, str, str, str], ...] = tuple(expand_stage_groups(_ROUND_ROWS))
 
 SCRIPT_LENGTH = len(_SCRIPT)
+
+#: **每条流自己的剧本行**（只含本流的行，顺序与 ``_SCRIPT`` 一致）。
+#:
+#: 为什么要按流切片：``_SCRIPT`` 是一条扁平序列，一个 tick 只落一行的话，
+#: 5 条流要轮流等 —— 任何一条都得 5 个 tick 才轮到自己，用户看到的就不是
+#: "0.5 秒一行"了。切片之后 ``emit_tick`` 一个 tick 让**每条流各落一行**，
+#: 于是每条日志都是稳定的 0.5s 一行。
+#:
+#: 切片不改变任何顺序：每条流的行仍按剧本先后出现，所以 LIFO 闭合、
+#: 阶段序号递增这些调用链约束照样成立（selftest 对每条流单独查）。
+_FLOW_SCRIPTS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+    target.key: tuple(
+        (level, function, phase, body)
+        for key, level, function, phase, body in _SCRIPT
+        if key == target.key
+    )
+    for target in TARGETS
+}
+
+#: 一轮剧本由**扫片流**（spwsp）定义：它走完自己一遍 = 一片晶圆走完
+#: （``ScanLot() >()`` … ``ScanLot() <()``）。轮末换新的追踪号 / 批次 / 晶圆，
+#: 所以一轮 ≈ 39 × 0.5s ≈ 20s。
+#:
+#: 为什么不用"最长那条流"的长度：追踪号是给**这一片晶圆**打的相关性标记，
+#: 换轮时刻必须落在 spwsp 的 pass 边界上，否则新的一片晶圆的前几行会顶着
+#: 上一片的 trace。其它流各有各的周期（wsp 116 行 ≈ 58s，cpfr 12 行 ≈ 6s），
+#: 各走各的游标，互不干扰 —— 这正是真机台的形态：每个子系统按自己的节拍记日志。
+ROUND_DRIVER = "spwsp"
+ROUND_TICKS = len(_FLOW_SCRIPTS[ROUND_DRIVER])
 
 
 # --------------------------------------------------------------------------- 状态
@@ -306,7 +417,10 @@ class TargetState:
 
 @dataclass
 class StreamState:
+    #: 轮次时钟：0..ROUND_TICKS-1。站满一轮就换追踪号 / 批次 / 晶圆。
     cursor: int = 0
+    #: **每条流**各自的行游标（走完自己的剧本回到 0）。见 ``emit_tick``。
+    cursors: dict[str, int] = field(default_factory=dict)
     round: int = 0
     trace: str = ""
     lot: str = ""
@@ -328,11 +442,16 @@ def new_round(state: StreamState, moment: datetime) -> None:
     state.wafer = (state.wafer % 25) + 1
 
 
-def render_values(state: StreamState, function: str) -> dict[str, object]:
-    """剧本模板变量。抖动、流量与耗时随轮次变化，避免逐轮完全雷同。"""
+def render_values(state: StreamState, function: str, template: str = "") -> dict[str, object]:
+    """剧本模板变量。抖动、流量与耗时随轮次变化，避免逐轮完全雷同。
+
+    ``template`` 参与 ``elapsed`` 的取数（与 ``loggen._program_values`` 同一套算法）：
+    耗时应当**逐次调用各不相同**，只按函数名取的话，wsp 那 27 次 ``MoveAbsolute``
+    的出口会把同一个毫秒数连印 27 遍 —— 一眼就是克隆的。
+    """
     if not state.trace:
         new_round(state, datetime.now())
-    elapsed = 6 + zlib.crc32(function.encode("utf-8")) % 180
+    elapsed = 6 + zlib.crc32(f"{function}|{template}".encode("utf-8")) % 180
     return {
         "trace": state.trace,
         "lot": state.lot,
@@ -357,11 +476,12 @@ def make_line(
 ) -> str:
     """八字段调试日志，字段布局与 ``loggen.debug_line`` 完全一致。
 
-    正文用 ``loggen.log_message`` 拼装，所以每一行都带 ``[函数名]`` 前缀，
-    入口/出口行还带 ``>()`` / ``<()`` 方向符 —— 前端折叠就是认这两个符号。
+    正文用 ``loggen.log_message`` 拼装，所以每一行都以 ``函数名()`` 开头，
+    入口/出口行紧跟着 ``>()`` / ``<()`` 方向符 —— 前端折叠就是认这对符号，
+    而函数名靠 ``函数名()`` 这个调用形状识别（必须带括号）。
 
-    后端 ``DEBUG_PATTERN`` 要求 8 个 ``[...]`` 分组；正文里的方括号不参与分字段
-    （第 9 组是 ``.*``），所以正文可以放心写 ``[ScanWafer] >() ...``。
+    后端 ``DEBUG_PATTERN`` 要求 8 个 ``[...]`` 分组；正文是第 9 组的 ``.*``，
+    里面的方括号不参与分字段（不过现在正文里已经不再放方括号了）。
     level 位置允许任意词，所以这里可以放心用 WARN / ERROR / FATAL。
     """
     stamp = f"{moment:%Y-%m-%d %H:%M:%S}.{moment.microsecond // 1000:03d}"
@@ -441,8 +561,9 @@ def reclaim(state: TargetState, module: str) -> list[str]:
 def rotate(target: StreamTarget, state: TargetState, moment: datetime) -> Path:
     """轮转：整段收档 + 重建空当前段，然后把旧归档搬进回收站。
 
-    清理只认 state 里记下的路径（``owned``），绝不按 glob 批量删 —— 否则会误伤
-    loggen 生成的合法日包与轮转段。
+    这就是**滑动窗口的那一格**：窗口写满 → 关掉当前段 → 开一段空的接着写，
+    同时把上上段挪出日志目录。清理只认 state 里记下的路径（``owned``），
+    绝不按 glob 批量删 —— 否则会误伤 loggen 生成的合法日包与轮转段。
     """
     archived = archive_current(target.local_path, target.module, moment)
     state.archived = str(archived)
@@ -450,7 +571,6 @@ def rotate(target: StreamTarget, state: TargetState, moment: datetime) -> Path:
     state.rotations += 1
     state.lines = 0
     reclaim(state, target.module)
-    return archived
     return archived
 
 
@@ -467,9 +587,9 @@ def trim_to_capacity(path: Path, limit: int = MAX_LIVE_LINES) -> int:
 
 
 def prepare(state: StreamState, *, report: bool = False) -> list[str]:
-    """确保每条流的目录/文件存在，并把当前段裁到 1000 行以内。
+    """确保每条流的目录/文件存在，并把当前段裁到 ``MAX_LIVE_LINES`` 行以内。
 
-    启动时 ``<fm>.log`` 往往带着 loggen 生成的当天历史（00:00 → 现在，通常 1400+ 行）。
+    启动时 ``<fm>.log`` 往往带着 loggen 生成的当天历史（00:00 → 现在，上千行）。
     这里**只截掉超出的部分**，不整段收档归零，理由有两个：
 
     * 订阅一开始就要有上下文 —— 历史的"最近 30 分钟"过滤、时间窗查询都得有行可读；
@@ -504,40 +624,81 @@ def prepare(state: StreamState, *, report: bool = False) -> list[str]:
 
 # --------------------------------------------------------------------------- 推进
 
+#: 一个 tick 里单条流的产物：(哪条流, 写进去的行, 这一笔之前轮转出来的归档)。
+EmitEvent = tuple[StreamTarget, str, Path | None]
 
-def emit_once(
-    state: StreamState, moment: datetime | None = None
-) -> tuple[StreamTarget, str, Path | None] | None:
-    """按剧本推进一行：写入目标文件并更新状态。
+#: 给每条流抖落笔时刻用。没有可复现性要求（自检查的是"散不散"，不是"等于几"），
+#: 所以不播种，进程启动时从系统熵源起算。
+_STAMP_RNG = random.Random()
 
-    返回 ``(目标, 行内容, 本次轮转出来的归档)``。轮转发生在**落笔之前**：
-    当前段已经写满就先整段收档、重建空文件，再写新的一行。这样活动文件
-    任何时刻都不会超过 ``MAX_LIVE_LINES``，不会出现 1001 行这种越界。
+
+def emit_tick(state: StreamState, moment: datetime | None = None) -> list[EmitEvent]:
+    """推进一个 tick：**每条流各落一条记录**，写满就先轮转再落笔。
+
+    返回 ``[(目标, 行内容, 本次轮转出来的归档), ...]``，一个元素对应一条流。
+    轮转发生在**落笔之前**：当前段已经写满就先整段收档、重建空文件，再写新的
+    记录。这样活动文件任何时刻都不会超过 ``MAX_LIVE_LINES``，不会出现 2001 行
+    这种越界。
+
+    ⚠️ "一条记录"**不等于**"一个物理行"：测量快照一次落十几行、只有首行带时间戳
+    （``loggen.scan_metric_body``）。容量与轮转都以**物理行**为准，所以下面是按
+    ``line.count("\\n") + 1`` 的宽度累加、并把这个宽度带进轮转判断的。
+
+    每条流按**自己的**游标往前走一步（``state.cursors[模块]``，走完自己的剧本回到 0），
+    所以一个 tick 之后每条流都恰好多**一条记录** —— 任何一条日志的追加间隔都等于
+    tick 间隔（0.5s），且每条流内部的记录顺序（也就是它的调用栈轨迹）永远按剧本走，
+    不跳行。
     """
     moment = moment or datetime.now()
-    cursor = state.cursor % SCRIPT_LENGTH
-    key, level, function, phase, template = _SCRIPT[cursor]
-    target = _TARGET_BY_KEY[key]
-    slot = state.target(target.key)
+    events: list[EmitEvent] = []
+    for target in TARGETS:
+        script = _FLOW_SCRIPTS[target.key]
+        # 每条流**自己的**游标：走完自己的剧本就回到第 0 行，不跟别人的长度对齐。
+        # 用全局游标取模是错的 —— 剧本长度（36 / 13 / 12 …）与一轮的 tick 数
+        # （``ROUND_TICKS``）不整除时，每次换轮都会把这条流拽回第 0 行，
+        # 于是 ``ScanLot() >()`` 这种入口会连着出现两遍、出口却少一个，
+        # 前端折叠出来的调用栈就断了。
+        index = state.cursors.get(target.key, 0) % len(script)
+        level, function, phase, template = script[index]
+        slot = state.target(target.key)
 
-    archived = rotate(target, slot, moment) if slot.lines >= MAX_LIVE_LINES else None
+        message = template.format(**render_values(state, function, template))
+        # 每条流各抖一点落笔时刻，别让 5 条流的时间戳逐列对齐（见常量说明）
+        stamp = moment + timedelta(
+            seconds=_STAMP_RNG.uniform(-LIVE_STAMP_SPREAD_SECONDS, LIVE_STAMP_SPREAD_SECONDS)
+        )
+        line = make_line(target, level, function, phase, message, stamp)
 
-    message = template.format(**render_values(state, function))
-    line = make_line(target, level, function, phase, message, moment)
+        # ``MAX_LIVE_LINES`` / ``trim_to_capacity`` / 前端读的都是**物理行**，
+        # 而一条记录**不一定只占一行**：测量快照那种字典日志一次落十几行、
+        # 只有首行带时间戳（``loggen.scan_metric_body``）。所以这里必须按实际
+        # 落盘宽度累加，不能恒加 1 —— 否则多行记录会让活动文件悄悄越过上限。
+        width = line.count("\n") + 1
 
-    path = target.local_path
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+        # 轮转在落笔**之前**判，而且要把这一笔的宽度一起算进去：只判
+        # ``slot.lines >= MAX_LIVE_LINES`` 时，一条 16 行的记录能把当前段从
+        # 1999 行顶到 2015 行，容量上限与滑动窗口就都失效了。
+        archived = (
+            rotate(target, slot, moment)
+            if slot.lines + width > MAX_LIVE_LINES
+            else None
+        )
 
-    slot.lines += 1
-    state.last_line = line
+        path = target.local_path
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+        slot.lines += width
+        state.last_line = line
+        state.cursors[target.key] = (index + 1) % len(script)
+        events.append((target, line, archived))
+
     state.ticks += 1
-
-    state.cursor = (cursor + 1) % SCRIPT_LENGTH
+    state.cursor = (state.cursor + 1) % ROUND_TICKS
     if state.cursor == 0:
-        # 剧本站满一整轮 -> 下一行开始就是新的追踪号/批次/晶圆
+        # 一轮剧本站满 -> 下一 tick 开始就是新的追踪号/批次/晶圆
         new_round(state, moment)
-    return target, line, archived
+    return events
 
 
 # --------------------------------------------------------------------------- 状态文件
@@ -551,7 +712,7 @@ def load_state() -> StreamState:
     except (OSError, ValueError):
         return StreamState()
     state = StreamState(
-        cursor=int(raw.get("cursor", 0)) % SCRIPT_LENGTH,
+        cursor=int(raw.get("cursor", 0)) % ROUND_TICKS,
         round=int(raw.get("round", 0)),
         trace=str(raw.get("trace", "")),
         lot=str(raw.get("lot", "")),
@@ -559,6 +720,10 @@ def load_state() -> StreamState:
         ticks=int(raw.get("ticks", 0)),
         last_line=str(raw.get("last_line", "")),
     )
+    for key, value in dict(raw.get("cursors") or {}).items():
+        script = _FLOW_SCRIPTS.get(str(key))
+        if script:
+            state.cursors[str(key)] = int(value) % len(script)
     for key, value in dict(raw.get("targets") or {}).items():
         state.targets[str(key)] = TargetState(
             lines=int(value.get("lines", 0)),
@@ -600,6 +765,9 @@ def snapshot() -> dict:
             "recycled": slot.recycled,
             # 只报"该搬走却还没搬走"的（``owned`` 里留着的是最新那份，不算欠账）
             "pending_reclaim": len([item for item in slot.owned if item != slot.archived]),
+            # 滑动窗口的实际占用：当前段 + 最新归档（两者都 ≤ MAX_LIVE_LINES）
+            "window_lines": count_lines(target.local_path)
+            + (count_lines(Path(archived)) if archived else 0),
         })
     return {
         "round": state.round,
@@ -609,6 +777,9 @@ def snapshot() -> dict:
         "wafer": state.wafer,
         "ticks": state.ticks,
         "max_lines": MAX_LIVE_LINES,
+        "interval_seconds": DEFAULT_INTERVAL_SECONDS,
+        "round_ticks": ROUND_TICKS,
+        "cursor_of_round": f"{state.cursor}/{ROUND_TICKS}",
         "targets": rows,
     }
 
@@ -631,19 +802,52 @@ class _Stopper:
         self.flag = True
 
 
+def _breath(interval: float, rng: random.Random) -> float:
+    """下一行的间隔：围绕 ``interval`` 抖动，让实时流的节奏有呼吸感。
+
+    见 :data:`INTERVAL_JITTER_RATIO`。**均值等于 interval**，所以平均速率不变
+    （自检里那条"等 ~27 行把管道缓冲填满"的窗口不用跟着改），
+    变的只是"每两行之间到底是快了还是慢了"。
+    """
+    return interval * rng.uniform(1.0 - INTERVAL_JITTER_RATIO, 1.0 + INTERVAL_JITTER_RATIO)
+
+
 def run_forever(
     *,
     interval: float = DEFAULT_INTERVAL_SECONDS,
     limit: int | None = None,
     verbose: bool = True,
 ) -> StreamState:
-    """持续产出日志，直到收到 SIGINT/SIGTERM（或达到 ``limit`` 行，调试用）。"""
+    """持续产出日志，直到收到 SIGINT/SIGTERM（或达到 ``limit`` 个 tick，调试用）。
+
+    ``interval`` 是**每条流的追加间隔**：一个 tick 里 5 条流各落一行，所以
+    ``interval=0.5`` 就是"每条日志 0.5 秒加一条"、全局 10 行/秒。
+    """
     state = load_state()
+    # 每次启动都从剧本第 0 行重新起算（``cursors`` 不跨进程复用），并把轮次时钟归零。
+    #
+    # 理由不是"连续性"，恰恰相反：**落盘文件是拼接出来的** —— 前面是 ``init``
+    # 用 ``loggen`` 生成的历史段，后面是本进程追加的实时段。若沿用上一进程的游标，
+    # 本进程的第一笔就落在剧本中间，可能正好是某次调用的 ``<() leave``、甚至是
+    # ``move absolute`` 正文；它和历史段尾部那个没来得及收口的 ``>()``
+    # 在同一个调用栈上配成一对 —— 折出来的调用"有边界却没有正文"。
+    # 实测：``wsp.log`` 里一次 ``MoveAbsolute`` 被配成 0 条点位正文，
+    # 被 ``selftest.check_wsp_point_call_boundaries()`` 的落盘层抓了个正着。
+    #
+    # 从第 0 行起算就不一样了：每条流剧本的第 0 行都是**最外层函数的入口**
+    # （``ScanLot()`` / ``Stage_WSP_HOME()`` / …），所以拼接缝在调用栈上是干净的。
+    # 历史段尾部那个没闭合的 ``>()`` 会一直留在栈底、到文件尾也不会被配上，
+    # 既不会凑成"缺正文的调用"，也不会让正文变成孤儿。
+    state.cursors.clear()
+    state.cursor = 0
     if not state.trace:
         new_round(state, datetime.now())
     notes = prepare(state)
     if verbose:
-        print(f"实时日志源启动：{len(TARGETS)} 条流，间隔 {interval:g}s，活动文件上限 {MAX_LIVE_LINES} 行")
+        print(
+            f"实时日志源启动：{len(TARGETS)} 条流，每条 {interval:g}s 一行"
+            f"（活动文件写满 {MAX_LIVE_LINES} 行即滑动一格）"
+        )
         for note in notes:
             print(f"  {note}")
         for target in TARGETS:
@@ -651,30 +855,40 @@ def run_forever(
 
     stopper = _Stopper()
     stopper.install()
+    rng = random.Random()
     sleep_for = interval
+    # 轮转后的那一觉**不能**抖动：它的下限 ROTATE_SETTLE_SECONDS 是给远端
+    # ``tail -F`` 发现新 inode 用的，抖低了就会在切换瞬间丢行。
+    settle = False
     try:
         while not stopper.flag:
+            started = time.monotonic()
             moment = datetime.now()
-            produced = emit_once(state, moment)
-            if produced is not None:
-                target, _line, rotated = produced
-                if rotated is not None:
-                    if verbose:
-                        print(f"  [轮转] {target.module}: 满 {MAX_LIVE_LINES} 行 -> {rotated.name}")
-                    # 给远端 tail -F 留出发现新 inode 的窗口，避免切换瞬间丢行
-                    sleep_for = max(interval, ROTATE_SETTLE_SECONDS)
+            for target, _line, rotated in emit_tick(state, moment):
+                if rotated is None:
+                    continue
+                if verbose:
+                    print(f"  [轮转] {target.module}: 满 {MAX_LIVE_LINES} 行 -> {rotated.name}")
+                # 给远端 tail -F 留出发现新 inode 的窗口，避免切换瞬间丢行
+                sleep_for = max(interval, ROTATE_SETTLE_SECONDS)
+                settle = True
             if state.ticks % RECOUNT_EVERY == 0:
                 for target in TARGETS:
                     state.target(target.key).lines = count_lines(target.local_path)
             save_state(state)
             if limit is not None and state.ticks >= limit:
                 break
-            time.sleep(sleep_for)
+            # 扣掉本 tick 真正花掉的时间（5 次落盘 + 状态写盘 + 计数校准）：
+            # 不扣的话实际间隔会漂成 0.5s + 开销（实测 ~0.57s），
+            # "0.5 秒一条"就名不副实了。开销超过间隔时退化为不睡。
+            budget = sleep_for if settle else _breath(interval, rng)
+            time.sleep(max(0.0, budget - (time.monotonic() - started)))
             sleep_for = interval
+            settle = False
     except KeyboardInterrupt:
         pass
     finally:
         save_state(state)
         if verbose:
-            print(f"实时日志源已停止（累计 {state.ticks} 行，第 {state.round} 轮）")
+            print(f"实时日志源已停止（累计 {state.ticks} 轮 tick，第 {state.round} 轮）")
     return state

@@ -17929,3 +17929,12 @@ html.workstation-docked {
 @media (prefers-reduced-motion: reduce) {
   .function-children, .function-children.is-collapsing { animation-duration: .01s; }
 }
+
+/* 展开后这一行的弹性区是**日志正文**：正文撑满剩余宽度（太长就省略），
+   语义说明和来源标签恢复自然宽度跟在最后，不再被 flex 拉成一长条空盒子。 */
+.function-name-semantic .function-entry-message {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.function-name-semantic.is-expanded .semantic-function-description { flex: 0 1 auto; }
+.function-name-semantic.is-expanded .function-semantic-origin { flex: none; }

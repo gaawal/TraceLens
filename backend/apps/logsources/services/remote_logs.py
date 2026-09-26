@@ -25,7 +25,7 @@ from apps.logsources.models import (
     LogSubsystemDefinition,
 )
 from apps.logsources.services.archive_selector import LogArtifact, parse_archive_timestamp, parse_log_name, select_artifacts_for_window
-from apps.logsources.services.cache_identity import LogCacheScope
+from apps.logsources.services.cache_identity import LogCacheScope, machine_ssh_port
 from apps.logsources.services.content_cache import log_content_cache
 from apps.logsources.services.file_index import log_file_index, parse_line_time
 from apps.logsources.services.reverse_reader import reverse_lines
@@ -2455,6 +2455,7 @@ def _artifact_cache_scope(environment: Environment, machine, artifact: LogArtifa
         source_category=artifact.source_category,
         subsystem=artifact.subsystem,
         fm=artifact.fm,
+        port=_machine_ssh_port(machine),
     )
 
 

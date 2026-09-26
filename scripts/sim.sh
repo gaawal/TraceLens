@@ -22,7 +22,7 @@
 #   assets     模拟资产（非守护进程，缺了才生成：日志树 + CPD + ATLog 用例站）
 #   fleet      假 SSH/SFTP 机群            上位机与下位机**各自一个地址**（见下）
 #   site       模拟 ATLog/CPD 报告站       网络IP:8901（同时绑 127.0.0.1）
-#   stream     实时日志源（tail -f 效果）  持续追加 <fm>.log，1000 行轮转
+#   stream     实时日志源（tail -f 效果）  每条流 0.5s 一行，2000 行滑动窗口
 #   backend    Django API                  127.0.0.1:8000
 #   watcher    实时监听/采集 worker         无端口，常驻 claim 监视器并写命中
 #   frontend   Vite 前端                   127.0.0.1:5173
@@ -261,9 +261,9 @@ c_start_stream() {
     info "实时日志源已在运行（跳过）"
     return 0
   fi
-  info "启动实时日志源（spwsp/mecore/cpfr/sil，1s 一行，1000 行轮转）"
+  info "启动实时日志源（spwsp/wsp/mecore/cpfr/sil，每条流 0.5s 一行，2000 行滑动窗口）"
   spawn stream "$RUN_DIR/stream.out" "$BACKEND_DIR" \
-    "$PY" -u -m simremote.cli stream --interval 1 >/dev/null
+    "$PY" -u -m simremote.cli stream --interval 0.5 >/dev/null
   sleep 2
   cli_running stream || fail "日志源未存活，见 $RUN_DIR/stream.out"
   ok "实时日志源就绪（scripts/sim.sh logs stream 可跟踪）"
@@ -528,20 +528,29 @@ try:
 
     keys = " / ".join(item.module for item in livesim.TARGETS)
     count = len(livesim.TARGETS)
-    share = f"{count:g}"
+    every = f"{livesim.DEFAULT_INTERVAL_SECONDS:g}"
+    cap = livesim.MAX_LIVE_LINES
+    full_minutes = cap * livesim.DEFAULT_INTERVAL_SECONDS / 60
 except Exception:  # noqa: BLE001 - 提示语而已，取不到就用兜底文案
-    keys, count, share = "spwsp / wsp / mecore / cpfr / sil", 5, "5"
+    keys, count, every, cap, full_minutes = "spwsp / wsp / mecore / cpfr / sil", 5, "0.5", 2000, 16.7
 
 print(f"""
  怎么找日志：
    前端 → 环境资源 → 远程日志查询，时间窗口选「最近 3 小时」即可命中
    实时日志：选 {keys} 任一模块后打开「实时监听」，
-             日志会一行行滚出来（总体 1s 一行；{count} 条流轮转，单条流约 {share}s 一行，
-             约 17 分钟写满 1000 行后自动轮转）
-             注意头一行要等约 1 分钟才出现：远端 tail -F 的 stdout 是管道（全缓冲），
+             日志会一行行滚出来（**每条流 {every}s 一行**，{count} 条流每 tick 各写一行，
+             合计约 {count / float(every):g} 行/秒）
+             每条流写满 {cap} 行（约 {full_minutes:.0f} 分钟）就滑动一格：整段收档、
+             重建空文件，旧归档挪进回收站固定槽位覆盖 —— 日志量恒定有界，
+             挂多久都不会把磁盘（以及读它的进程内存）堆满。
+             注意头一行要等十几秒才出现：远端 tail -F 的 stdout 是管道（全缓冲），
              要攒满几 KB 才 flush 一次。真实机台同样如此，不是模拟器卡住了。
-   点位日志：wsp 是工件台点位组件，日志正文是固定的
-             move absolute {{ x:…, y:… }} 点位行
+   点位日志：wsp 是工件台点位组件，日志正文是固定的六自由度点位行
+             move absolute {{ x:…, y:…, z:…, rx:…, ry:…, rz:… }}
+             （每个点位各是一次 MoveAbsolute 调用，三行一组：
+               MoveAbsolute() >() enter … point:spiral_nn …
+               MoveAbsolute() move absolute {{ … point:spiral_nn … }}
+               MoveAbsolute() <() leave … point:spiral_nn elapsed=… status=ok）
    CPD 测校：环境资源 → CPD 测校报告，选子系统 / 模块
    用例分析：ATLog 用例分析页粘贴下面的用例 URL""")
 PY

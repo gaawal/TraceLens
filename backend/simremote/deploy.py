@@ -6,7 +6,7 @@
     2. 生成 SSH 密钥对   两台机器各生成自己的 id_rsa / id_rsa.pub
     3. 交换主机指纹      把对方的主机密钥写进本机 known_hosts
     4. 双向分发公钥      把本机公钥写进对方的 authorized_keys
-    5. 校验正向免密      上位机拿私钥登录下位机并读一次日志根目录
+    5. 校验正向免密      上位机拿私钥登录下位机并读一次日志目录
     6. 校验反向免密      下位机拿私钥登录上位机并读一次日志根目录
     7. 写入环境资源      落库 + 落盘部署报告
 
@@ -447,16 +447,30 @@ class DeployRunner:
                 )
 
     def _verify_passwordless(self, source: fleet.MachineSpec, target: fleet.MachineSpec) -> str:
-        """用 ``source`` 的私钥登录 ``target``，并读一次它的日志根目录。
+        """用 ``source`` 的私钥登录 ``target``，并在 ``target`` 上读一次目录内容。
 
         只读一次 ``ls`` 是有意的：TraceLens 接入机台要的就是这个能力，
-        能列出日志根说明免密 + 只读通道都通了，比单纯"登录成功"更有说服力。
+        能列出目录说明免密 + 只读通道都通了，比单纯"登录成功"更有说服力。
+
+        ⚠️ **不能只探测 ``debug_root``**：子系统日志树只有上位机承载
+        （见 ``fleet.hosts_subsystem_logs``），下位机上那棵树按设计就不存在。
+        拿它当"免密可读"的判据，会让部署在校验正向免密（上位机 → 下位机）时**假失败**。
+        按 ``debug_root`` → ``log_root`` → ``home`` 依次找第一个存在的目录，
+        既保住了"读日志树"的语义，又不依赖某一台机器特有的目录。
         """
         key = self.private_keys.get(source.key)
         if key is None:
             raise DeployError(f"{source.name} 没有可用私钥，无法验证免密")
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        candidates = list(dict.fromkeys([target.debug_root, target.log_root, target.home]))
+        # 逐个探测：目录存在**并且非空**才算数（下位机上 ``debug`` 目录可能还在、
+        # 只是已经被清空，那时它证明不了任何东西）。
+        probe = (
+            f'for d in {" ".join(candidates)}; do '
+            f'if [ -d "$d" ]; then out=$(ls "$d"); '
+            f'if [ -n "$out" ]; then echo "$d"; echo "$out"; exit 0; fi; fi; done; exit 1'
+        )
         try:
             client.connect(
                 target.host,
@@ -467,7 +481,7 @@ class DeployRunner:
                 allow_agent=False,
                 look_for_keys=False,
             )
-            _stdin, stdout, _stderr = client.exec_command(f"ls {target.debug_root}", timeout=10)
+            _stdin, stdout, _stderr = client.exec_command(probe, timeout=10)
             output = stdout.read().decode("utf-8", errors="replace")
             status = stdout.channel.recv_exit_status()
         except paramiko.AuthenticationException as exc:
@@ -479,15 +493,16 @@ class DeployRunner:
         finally:
             client.close()
 
-        items = [item for item in output.split() if item]
-        if status != 0 or not items:
+        lines = [line for line in output.splitlines() if line.strip()]
+        if status != 0 or len(lines) < 2:
             raise DeployError(
-                f"{source.name} -> {target.name} 登录成功但读不到 {target.debug_root}"
-                f"（退出码 {status}）"
+                f"{source.name} -> {target.name} 登录成功但读不到日志目录"
+                f"（已尝试 {', '.join(candidates)}，退出码 {status}）"
             )
+        probed, items = lines[0].strip(), lines[1:]
         return (
             f"{source.name} -> {target.name}  免密登录成功 · "
-            f"ls {target.debug_root} 返回 {len(items)} 项"
+            f"ls {probed} 返回 {len(items)} 项"
         )
 
     def _step_verify_forward(self) -> None:

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from . import fleet
+from . import fleet, loggen
 
 # 远端根、相对路径、内容、行数
 Artifact = tuple[str, Path, bytes, int]
@@ -86,6 +86,23 @@ def _report_stamp(moment: datetime) -> str:
     )
 
 
+def _sample_moments(plan: ReportPlan) -> list[datetime]:
+    """一次测校的采样时刻序列。
+
+    报告的 ``Samples`` 行与数据表格的行**必须来自同一份序列** —— 各算一遍的话，
+    加了亚秒抖动之后 ``(stop - start) // step`` 会在边界上差 1，报告说 49 行、
+    表格里 48 行，对着看会觉得数据是坏的。
+
+    抖动走 ``loggen.clock_series``：采样间隔不再精确等于 15s，而是带调度抖动。
+    """
+    return list(loggen.clock_series(
+        plan.start,
+        plan.stop + timedelta(microseconds=1),
+        fleet.CPD_SAMPLE_STEP_SECONDS,
+        salt=f"cpd:{plan.subsystem}:{plan.module}:{plan.index}",
+    ))
+
+
 def _execution_time(plan: ReportPlan) -> str:
     seconds = int((plan.stop - plan.start).total_seconds())
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
@@ -113,7 +130,7 @@ def report_text(plan: ReportPlan) -> bytes:
         "Summary",
         f"  Subsystem: {plan.subsystem}",
         f"  Module: {plan.module}",
-        f"  Samples: {int((plan.stop - plan.start).total_seconds() // fleet.CPD_SAMPLE_STEP_SECONDS) + 1}",
+        f"  Samples: {len(_sample_moments(plan))}",
     ]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -131,7 +148,7 @@ def workbook_bytes(plan: ReportPlan) -> tuple[bytes, int]:
     moment = plan.start
     index = 0
     rows = 0
-    while moment <= plan.stop:
+    for moment in _sample_moments(plan):
         # 漂移的报告让 X 向 overlay 超规格，让"FAILED"在数据里也成立
         drift = 0.0
         if plan.drifted:
@@ -148,13 +165,13 @@ def workbook_bytes(plan: ReportPlan) -> tuple[bytes, int]:
         ])
         index += 1
         rows += 1
-        moment = plan.start + timedelta(seconds=index * fleet.CPD_SAMPLE_STEP_SECONDS)
 
     for column in sheet.columns:
         width = max(len(str(cell.value)) for cell in column if cell.value is not None)
         sheet.column_dimensions[column[0].column_letter].width = min(28, max(12, width + 2))
     for cell in sheet["A"][1:]:
-        cell.number_format = "yyyy-mm-dd hh:mm:ss"
+        # 采样时刻是带毫秒的：真机的采样是异步中断触发的，落不到整秒上。
+        cell.number_format = "yyyy-mm-dd hh:mm:ss.000"
 
     buffer = io.BytesIO()
     book.save(buffer)
@@ -170,18 +187,25 @@ def module_plans(subsystem: str, module: str, *, now: datetime) -> list[ReportPl
         start = stop - timedelta(minutes=REPORT_SPAN_MINUTES)
         # 让倒数第二次测校失败，界面上既有 OK 行也有 FAILED 行
         drifted = index == fleet.CPD_REPORTS_PER_MODULE - 2
+        # 起止时刻的**亚秒尾巴**各自随机：报告里 "Start Time: ... 09:12:33 418372us"
+        # 与 "Stop Time: ... 09:24:33 071550us" 的微秒位不一样，像真机记下来的。
+        # 只动微秒、不动秒：报告的分钟刻度（09:12:33）本身是业务含义，不该漂。
+        # 每份报告的盐带上 index，避免同一模块 4 份报告的微秒位一模一样。
+        tag = f"cpd:{subsystem}:{module}:{index}"
         plans.append(ReportPlan(
             subsystem=subsystem,
             module=module,
             index=index,
-            start=start,
-            stop=stop,
+            start=loggen.subsecond(start, salt=f"{tag}:start"),
+            stop=loggen.subsecond(stop, salt=f"{tag}:stop"),
             result="FAILED" if drifted else "OK",
             validation="FAILED" if drifted else "OK",
             quality="OK" if not drifted else "UNKNOWN",
             mcs="SAVED" if not drifted else "NOT SAVED",
             drifted=drifted,
         ))
+        # 用**未抖动**的 start 递推，保证 4 次测校的间隔仍然精确 —— 否则亚秒误差
+        # 会一轮轮累加，最后一份报告的分钟刻度就开始乱跳了。
         stop = start - timedelta(minutes=REPORT_GAP_MINUTES - REPORT_SPAN_MINUTES)
     return plans
 

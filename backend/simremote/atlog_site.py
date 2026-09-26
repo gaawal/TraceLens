@@ -160,7 +160,15 @@ def _timeline(spec: CaseSpec, now: datetime) -> CaseTimeline:
     stop = (now - timedelta(minutes=3)).replace(microsecond=0)
     start = stop - timedelta(minutes=CASE_SPAN_MINUTES)
     # 失败点靠近用例结束，与 xytest 行、event 行保持一致
-    return CaseTimeline(start=start, stop=stop, failure=stop - timedelta(seconds=40))
+    failure = stop - timedelta(seconds=40)
+    # 整秒刻度是"业务时间"（写报告的人就是这么填的），毫秒尾巴才是调度抖动。
+    # 不起止时刻都改成亚秒随机的话，报告里会出现"18:42:07.418 开始"这种
+    # 明显是程序生成的味道；只让毫秒散开就够真了。
+    return CaseTimeline(
+        start=loggen.subsecond(start, salt=f"{spec.case_id}:start"),
+        stop=loggen.subsecond(stop, salt=f"{spec.case_id}:stop"),
+        failure=loggen.subsecond(failure, salt=f"{spec.case_id}:failure"),
+    )
 
 
 # --------------------------------------------------------------------------- 内容构造
@@ -255,8 +263,8 @@ def _test_html(spec: CaseSpec, line: CaseTimeline) -> bytes:
 def _xytest_log(spec: CaseSpec, line: CaseTimeline) -> bytes:
     """xytest 日志。行首 ``[时间] [级别]`` 且级别必须是 ERROR/FATAL/CRITICAL/FAIL/FAILED。"""
     rows = [
-        (line.start + timedelta(seconds=5), "INFO", "[T-1] case bootstrap finished"),
-        (line.start + timedelta(seconds=35), "INFO", "[T-2] device session established"),
+        (loggen.subsecond(line.start + timedelta(seconds=5), salt=f"{spec.case_id}:x1"), "INFO", "[T-1] case bootstrap finished"),
+        (loggen.subsecond(line.start + timedelta(seconds=35), salt=f"{spec.case_id}:x2"), "INFO", "[T-2] device session established"),
         (
             (line.failure - timedelta(minutes=1)) if spec.status == "failed" else (line.start + timedelta(minutes=1)),
             "INFO",
@@ -286,9 +294,15 @@ def _event_line(moment: datetime, *, level: str, code: int, error_id: str, messa
 def _event_log(spec: CaseSpec, line: CaseTimeline) -> bytes:
     """用例根 event.log：十三字段格式，每行带时间戳且单调递增。"""
     rows: list[tuple[datetime, str]] = []
-    moment = line.start
-    index = 0
-    while moment <= line.stop:
+    # 用 ``loggen.clock_series`` 生成带调度抖动的时刻序列，而不是 ``start + i * 30s``
+    # 的算术网格 —— 后者会让每一行的秒位一模一样，一眼就是程序造的。
+    # ratio 用事件驱动的那档：用例跑的 event 是"跑到哪打哪"，本来就忽长忽短。
+    for index, moment in enumerate(
+        loggen.clock_series(
+            line.start, line.stop + timedelta(microseconds=1), EVENT_STEP_SECONDS,
+            salt=f"{spec.case_id}:event", ratio=loggen.EVENT_WALK_RATIO,
+        )
+    ):
         rows.append((moment, _event_line(
             moment,
             level="INFO",
@@ -297,8 +311,6 @@ def _event_log(spec: CaseSpec, line: CaseTimeline) -> bytes:
             message=("lot started, process sequence initialised", "recipe step advanced to next stage",
                      "process checkpoint reported nominal")[index % 3],
         )))
-        index += 1
-        moment = line.start + timedelta(seconds=index * EVENT_STEP_SECONDS)
     if spec.status == "failed":
         rows.append((line.failure - timedelta(seconds=5), _event_line(
             line.failure - timedelta(seconds=5), level="ERROR", code=1060,
@@ -332,12 +344,15 @@ def _environment_html(spec: CaseSpec) -> bytes:
 def _debug_lines(spec: CaseSpec, line: CaseTimeline) -> tuple[bytes, int]:
     """用例的调试日志夹具。行按时间戳单调递增（调用链规则下同样成立）。"""
     rows: list[tuple[datetime, str]] = []
-    moment = line.start
-    index = 0
-    while moment <= line.stop:
+    # 事件驱动的那档抖动：一次用例只跑 6 分钟、十九行，用周期采样器的小比例
+    # 相位根本扩散不开，秒位会一直卡在 00 / 20 / 40 三个值上。
+    for index, moment in enumerate(
+        loggen.clock_series(
+            line.start, line.stop + timedelta(microseconds=1), DEBUG_STEP_SECONDS,
+            salt=f"{spec.case_id}:debug", ratio=loggen.EVENT_WALK_RATIO,
+        )
+    ):
         rows.append((moment, loggen.debug_line(moment, spec.subsystem, spec.module, index)))
-        index += 1
-        moment = line.start + timedelta(seconds=index * DEBUG_STEP_SECONDS)
     if spec.status == "failed":
         # 失败用例的调试日志必须在故障时刻留下错误行：一轮调用链程序里 ERROR 级别的
         # 正文就那么一两行，时间线短的时候整段都可能覆盖不到，"异常行不误报"那条
@@ -355,14 +370,15 @@ def _debug_lines(spec: CaseSpec, line: CaseTimeline) -> tuple[bytes, int]:
 
 def _executor_lines(spec: CaseSpec, line: CaseTimeline) -> tuple[bytes, int]:
     rows = []
-    moment = line.start
-    index = 0
-    while moment <= line.stop:
+    for index, moment in enumerate(
+        loggen.clock_series(
+            line.start, line.stop + timedelta(microseconds=1), DEBUG_STEP_SECONDS,
+            salt=f"{spec.case_id}:executor", ratio=loggen.EVENT_WALK_RATIO,
+        )
+    ):
         rows.append(loggen.executor_line(
             moment, spec.subsystem, spec.module, index, inner=(index % 2 == 0)
         ))
-        index += 1
-        moment = line.start + timedelta(seconds=index * DEBUG_STEP_SECONDS)
     return ("\n".join(rows) + "\n").encode("utf-8"), len(rows)
 
 

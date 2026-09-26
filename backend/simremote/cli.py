@@ -40,6 +40,22 @@ def _django_setup() -> None:
     django.setup()
 
 
+def _purge_backend_caches() -> None:
+    """日志资产刚被重写，把后端基于旧资产建立的缓存清掉。
+
+    尽力而为：``init`` 只负责生成本地文件树，后端没装依赖 / Redis 没起 / 后端根本没
+    跑过，都不该让 ``init`` 失败，只提示一句。理由见 ``simremote/cache_reset.py`` 的模块
+    说明（``inode:size:mtime`` 指纹 + SFTP 整秒 mtime 会把上一代内容喂回来）。
+    """
+    try:
+        _django_setup()
+        from . import cache_reset
+
+        cache_reset.purge_log_caches()
+    except Exception as exc:  # noqa: BLE001 - 清理失败不影响资产生成
+        print(f"  [cache] 跳过缓存清理（{type(exc).__name__}: {exc}）")
+
+
 def _port_open(host: str, port: int, timeout: float = 0.4) -> bool:
     sock = socket.socket()
     sock.settimeout(timeout)
@@ -85,6 +101,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"生成完成（{time.time() - started:.1f}s）")
     print(f"  {report.summary()}")
     print(f"  本地根：{fleet.LOCAL_ROOT}")
+    _purge_backend_caches()
     return 0
 
 
@@ -209,8 +226,10 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 def cmd_seed(_args: argparse.Namespace) -> int:
     _django_setup()
-    from . import seed as seed_module
+    from . import cache_reset, seed as seed_module
 
+    # 先清旧缓存再扫描：目录索引一旦被旧资产写脏，后面每次查询都会命中它。
+    cache_reset.purge_log_caches()
     payload = seed_module.seed(refresh=True)
     print(f"  环境      : {payload['environment']} (#{payload['environment_id']}) 状态={payload['status_label']}")
     print(f"  软件版本  : {payload['software_version']}")
@@ -379,13 +398,24 @@ def cmd_stream_status(_args: argparse.Namespace) -> int:
     pid = _read_pid(STREAM_PID_FILE)
     alive = "运行中" if _pid_alive(pid) else "未运行"
     print(f"实时日志源  {alive}" + (f"（pid {pid}）" if pid else "（无 pidfile）"))
-    print(f"  剧本进度：第 {info['round']} 轮，行内游标 {info['cursor']}，累计 {info['ticks']} 行")
+    print(
+        f"  节奏：每条流 {info['interval_seconds']:g}s 一行"
+        f"（{len(info['targets'])} 条流每 tick 各一行 → 全局 {len(info['targets']) / info['interval_seconds']:g} 行/秒）"
+    )
+    print(
+        f"  剧本进度：第 {info['round']} 轮，轮内游标 {info['cursor_of_round']}，"
+        f"累计 {info['ticks']} 个 tick（{info['ticks'] * len(info['targets'])} 行）"
+    )
     print(f"  当前追踪：trace={info['trace'] or '-'} lot={info['lot'] or '-'} wafer=W{info['wafer']:02d}")
-    print(f"  活动文件上限：{info['max_lines']} 行（超出即轮转）")
+    print(
+        f"  滑动窗口：每条流活动文件上限 {info['max_lines']} 行，写满即轮转归档；"
+        f"当前段 + 最新归档 ≤ {info['max_lines'] * 2} 行"
+    )
     for row in info["targets"]:
         marker = "●" if row["lines"] else "○"
         print(
             f"  {marker} {row['subsystem']}/{row['module']}.log  {row['lines']} 行"
+            f"｜窗口 {row['window_lines']}/{info['max_lines'] * 2} 行"
             f"｜轮转 {row['rotations']} 次"
             + (f"｜归档 {Path(row['archived']).name}" if row["archived"] else "")
             + (f"｜已回收 {row['recycled']}" if row["recycled"] else "")
@@ -467,13 +497,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=livesim.DEFAULT_INTERVAL_SECONDS,
         help=(
-            f"每行间隔秒数（默认 {livesim.DEFAULT_INTERVAL_SECONDS:g}）。"
-            f"剧本是 {len(livesim.TARGETS)} 条流交错，每 tick 只落一行，"
-            f"所以单条流约 {len(livesim.TARGETS)} 倍间隔走一行；"
-            f"要单条流 1 秒一行就给 {1 / len(livesim.TARGETS):g}"
+            f"**每条流**的追加间隔秒数（默认 {livesim.DEFAULT_INTERVAL_SECONDS:g}）。"
+            f"{len(livesim.TARGETS)} 条流每个 tick 各落一行，"
+            f"所以每条日志都是这个间隔一行；活动文件写满 {livesim.MAX_LIVE_LINES} 行即轮转"
         ),
     )
-    stream_parser.add_argument("--lines", type=int, default=None, help="产够 N 行后退出（默认一直跑）")
+    stream_parser.add_argument(
+        "--lines", type=int, default=None, help="产够 N 个 tick 后退出（默认一直跑）"
+    )
     stream_parser.set_defaults(func=cmd_stream)
 
     for name, func, help_text in (

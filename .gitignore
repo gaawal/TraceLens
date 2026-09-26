@@ -6,6 +6,8 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+.workbuddy
+.pytest_cache
 
 # ---------------------------------------------------------------------------
 # Local secrets — never commit real credentials

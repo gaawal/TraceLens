@@ -32,6 +32,15 @@ def test_physical_resource_scoped_cache_identity():
     assert "fm-RSSSD" in a.redis_prefix
     assert a.file_index_key("/log/root/debug/rs/RSSSD.log") != a.file_index_key("/other/RSSSD.log")
 
+    # 同一 host 上的两台机器（同网段/NAT/模拟机群）必须落在不同命名空间，
+    # 否则一家的内容缓存会被另一家命中。
+    upper = Scope("10.0.0.8", "root", "debug", "rs", "RSSSD", 2222)
+    lower = Scope("10.0.0.8", "root", "debug", "rs", "RSSSD", 2223)
+    assert upper.redis_prefix != lower.redis_prefix
+    assert "host-10.0.0.8_2222" in upper.redis_prefix
+    # 不给端口时保持历史命名空间，旧缓存仍可读。
+    assert Scope("10.0.0.8", "root", "debug", "rs", "RSSSD", None).redis_prefix == a.redis_prefix
+
 
 def test_fingerprint_and_cache_contracts():
     source = (ROOT / "apps/logsources/services/file_index.py").read_text(encoding="utf-8")

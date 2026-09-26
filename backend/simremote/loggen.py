@@ -21,14 +21,19 @@
 时间锚点是**生成时刻**：放置久了 ``<fm>.log`` 的末行会停在旧时间上，前端查
 "最近 1 小时"就会空。这时重跑 ``init`` 或 ``scripts/sim_realign.sh``。
 
-行内容遵守项目固定的调用链规则：``[函数名] >()`` 是入口、``[函数名] <()`` 是出口，
+行内容遵守项目固定的调用链规则：``函数名() >()`` 是入口、``函数名() <()`` 是出口，
 同名 LIFO 配对（见下方"调用链规则"一节）。前端就是按这对方向符折叠函数卡片的，
-所以正文不能写成没有入口/出口的散句。
+所以正文不能写成没有入口/出口的散句。**函数方法名一定要带括号** —— 方向符前面那个词
+是被调用的函数，写成调用形状才是原生格式。
 """
 
 from __future__ import annotations
 
 import io
+import math
+import os
+import random
+import re
 import shutil
 import tarfile
 import zlib
@@ -44,24 +49,129 @@ ROTATED_STEP_SECONDS = 300
 NESTED_INNER_STEP_SECONDS = 600
 FLAT_ARCHIVE_STEP_SECONDS = 600
 
-# 受控环境里一次性删除大量文件会被安全保护拦截，因此清理保持小批量。
-# 正常情况（日期未滚动）残留为 0，不会触发删除。
-PURGE_BATCH = 20
+# --------------------------------------------------------------------------- 时间戳抖动
+#
+# 日志时间戳**不能落在整齐的网格上**。曾经是 ``start + i * step`` 的纯算术序列，
+# 结果是：毫秒位恒为 ``.000``，秒位在 60s/300s 步长下永远是 ``:00``，
+# 一分钟一行就真的每分钟第 0 秒一行 —— 一眼假，用户第一句话就是"太整齐了"。
+#
+# 真实机台不可能这样：写日志的进程会和别的线程抢 CPU、被 IO 阻塞、被调度器挪走，
+# 相邻两行的间隔会**忽快忽慢**。所以这里给时刻序列叠加一个**有界随机游走**：
+#
+#     moment_i = start + i * step + walk_i
+#     walk_{i+1} = reflect(walk_i + U(-swing, +swing))   在 [0, limit] 内
+#
+# * 用**游走**而不是每点独立随机：相邻间隔带惯性（连着几行偏慢、再连着几行偏快），
+#   像真的调度抖动；独立随机看起来是均匀噪声，反而不自然。
+# * 边界用**反射**而不是**钳位**（``min/max`` 夹住）。这是踩过的坑：钳位会让游走
+#   一头撞在 0 / limit 上"贴住"不动，时间戳就卡在同一个相位上 —— 实测 1361 行里
+#   有 114 行（8%）的毫秒位仍然是 ``000``，而且秒位只覆盖每分钟的前 15 秒
+#   （"从来没有 :30 之后的行"同样很假）。反射的平稳分布是均匀的，两个毛病一起消失。
+# * ``walk`` 是浮点数，所以亚秒尾巴（毫秒位）天然是散的，不需要额外造。
+#
+# 抖动由 ``salt`` 播种。同一天、同一个 (机器, 子系统, 模块, 文件种类) 恒定，
+# 所以自检与对齐脚本仍然可复现；但跨模块 / 跨子系统 / 跨天各不相同，
+# 整棵树看上去就不是"一个模子刻出来的"。
+
+#: 游走偏移的上限，取步长的这个比例 —— 要接近整个步长，时间戳的**秒位**才能铺满
+#: 60 秒（否则永远落在每分钟的头几秒，一眼就能看出规律）。
+WALK_LIMIT_RATIO = 0.9
+#: 上限的绝对值封顶（秒）。步长很大时（10 分钟）不必漂满整个周期。
+WALK_LIMIT_SECONDS = 300.0
+#: 每步游走幅度相对步长的比例。太小则相位扩散不动（一整份文件里时间戳只落在
+#: 每分钟的头几秒，又成了另一种"整齐"）；太大就成了均匀噪声，失掉"惯性"。
+#: 0.05 的含义：一分钟一行的流，相邻间隔在 57~63s 之间晃，同时相位能在
+#: 一份文件里铺满整个 60 秒周期。
+WALK_RATIO = 0.05
+#: **事件驱动**型日志（用例日志、测试 run log 之类）的比例。它们本来就不该有
+#: 稳定节拍 —— 日志是"跑到哪句打哪句"，间隔本来就忽长忽短，所以放大到 0.4。
+EVENT_WALK_RATIO = 0.4
+
+
+def clock_series(
+    start: datetime,
+    end: datetime,
+    step_seconds: int,
+    *,
+    salt: str = "",
+    ratio: float = WALK_RATIO,
+):
+    """``[start, end)`` 上按 ``step_seconds`` 递进、**带真实感抖动**的时刻序列。
+
+    见文件上方「时间戳抖动」一节：这是**反射边界**的有界随机游走，不是算术网格。
+    偏移恒为非负，所以序列里的每个时刻都不会早于 ``start``（调用方依赖这一点：
+    归档文件的覆盖区间、CPD 数据行必须落在报告时间窗内）。
+
+    ``ratio`` 决定"每步能晃多远"，也就是节奏有多不稳；默认是周期采样器的
+    小抖动，事件驱动的日志传 :data:`EVENT_WALK_RATIO`。
+    """
+    seed = f"{salt}|{start:%Y%m%d%H%M%S}|{step_seconds}|{ratio}"
+    rng = random.Random(seed)
+    limit = min(WALK_LIMIT_SECONDS, max(0.05, step_seconds * WALK_LIMIT_RATIO))
+    swing = min(max(0.02, step_seconds * ratio), limit / 2.0)
+    walk = rng.uniform(0.0, limit)
+    index = 0
+    while True:
+        moment = start + timedelta(seconds=index * step_seconds + walk)
+        if moment >= end:
+            return
+        yield moment
+        index += 1
+        walk += rng.uniform(-swing, swing)
+        if walk < 0.0:
+            walk = -walk
+        elif walk > limit:
+            walk = 2.0 * limit - walk
+
+
+def subsecond(moment: datetime, *, salt: str) -> datetime:
+    """只把**亚秒部分**随机化，秒级刻度不动。
+
+    给那些"时间点本身有业务含义"的地方用（测校的起止时刻、用例的起止时刻）：
+    整秒刻度是规格，毫秒尾巴才是调度抖动。
+    """
+    rng = random.Random(f"{salt}|{moment:%Y%m%d%H%M%S}")
+    return moment + timedelta(microseconds=rng.randrange(0, 1_000_000))
+
+# 受控环境里一次性删除大量文件会被安全保护拦截（阈值约 50 个/turn），因此**真删除**
+# 保持小批量，而且预算是**整轮共享**的（见 ``prune_tree``）。
 PURGE_BUDGET_PER_RUN = 40
+
+# 删除额度之外的残留不再"留给下次 init"，而是 ``os.replace`` **改名**搬进这里：
+# 改名不是删除，不消耗配额，工作树立刻干净。
+#
+# 为什么必须改名、不能只靠"留给下次"：``init`` 每轮新增的 CPD 批次是
+# 6 个模块 ×（4 份 ``.rpt`` + 4 份 ``.xlsx``）= **48 个**残留，而整轮删除预算只有
+# 40 个 —— 结构性追不上。更糟的是 ``cpd_report`` 与 ``cpd_data`` 是**两棵树分别
+# 清理**的：报告树 24 个残留会把额度吃光删干净，数据树的 93 个只删得掉前 16 个，
+# 于是"报告没了、表格还在" → 自检 ``CPD 报告与数据表格成对`` 报孤儿。
+# 改成"删不完就改名搬走"，两棵树的重合键都只剩本轮产物，对称差自然归零。
+PURGE_RECYCLE_DIR = Path(__file__).resolve().parent / "run" / "recycle" / "pruned"
 
 # --------------------------------------------------------------------------- 调用链规则
 #
 # 日志正文不是随手写的句子，而是遵守固定规则：
 #
-#     [函数名] >() enter <关键字> start <入参>     <- 函数入口
-#     [函数名] <某个正文>                          <- 函数体内的普通日志
-#     [函数名] <() leave <关键字> end <耗时/状态>   <- 函数出口
+#     函数名() >() enter <关键字> start <入参>     <- 函数入口
+#     函数名() <某个正文>                          <- 函数体内的普通日志
+#     函数名() <() leave <关键字> end <耗时/状态>   <- 函数出口
 #
-# 方向符 ``>()`` / ``<()`` 是这套规则的核心。TraceLens 的内置折叠规则
-# ``builtin-explicit-boundary``（``frontend/src/rendering/foldingRules.ts``，
-# startKeyword ``"> ()"`` / endKeyword ``"< ()"``；``App.tsx`` 里读作
-# 「函数开始 >()」「函数结束 <()」）会把 ``[函数名]`` **按名字 LIFO 配对**，把一对
-# 入口/出口之间的日志收成一张可折叠的函数卡片。
+# 两个要素缺一不可：
+#
+# * **方向符** ``>()`` / ``<()`` —— TraceLens 的内置折叠规则
+#   ``builtin-explicit-boundary``（``frontend/src/rendering/foldingRules.ts``，
+#   startKeyword ``"> ()"`` / endKeyword ``"< ()"``；``App.tsx`` 里读作
+#   「函数开始 >()」「函数结束 <()」）就是认这对符号；
+# * **函数方法名带括号** —— 方向符**前面**那个词是被调用的函数，写成调用形状
+#   ``ScanLot()``。前端的 ``logParser.ts`` 里 ``FUNCTION_PREFIX_REGEX``
+#   （``/^\s*([A-Za-z_~][\w:<>~.-]*\(\))/``）**首选**就是抓正文开头这个
+#   ``函数名()``，也就是说 ``函数名() >()`` 才是原生写法。
+#
+# 🔴 **不要退回方括号写法**：``[ScanLot] >()`` 那种是靠 ``parseBoundaryFunctionName``
+# 的兜底分支（取方向符前最后一个 ``[...]``）才勉强解析出来的历史格式。它的
+# ``functionName`` 是空、只有 ``boundaryFunctionName`` 有值，会让「连续同名函数日志」
+# 「闭合后的同名尾随日志」两条内置折叠规则失效。方括号只留给**纯数值/时间戳字段**
+# （``[2026-09-26 08:39:46.267]`` 那种），不要拿它当函数名。
 #
 # **关键字模板**：入口行在方向符之后先打一个**固定关键字**（见 PHASE_KEYWORDS），
 # 说明这一步在流程里干什么（``lot scan`` / ``exposure scan`` / ``coolant flow read``……），
@@ -77,15 +187,16 @@ PURGE_BUDGET_PER_RUN = 40
 #
 # 三个必须守住的约束：
 #
-# * **同名**：出口的 ``[函数名]`` 要和入口逐字相同 —— 配对键就是这个字符串，
+# * **同名**：出口的 ``函数名()`` 要和入口逐字相同 —— 配对键就是这个字符串，
 #   差一个字母就变成一条永远合不上的调用；
 # * **LIFO**：入口压栈、出口出栈，子函数必须先于父函数闭合，否则前端会画出
 #   错乱嵌套，或者把父函数标成「未闭合」；
 # * **关键字固定**：同一函数的入口/出口关键字必须一致，且不能随手改
 #   （改了等于把用户的检索习惯作废）。
 #
-# 另外用 ``[Stage_<阶段码>]`` 形式的框把一串调用包成**流程阶段**
-# （``Stage_EXPOSURE`` = 曝光阶段），这样日志既能看阶段、又能看阶段内部的调用链。
+# 另外用 ``Stage_<阶段码>()`` 形式的框把一串调用包成**流程阶段**
+# （``Stage_EXPOSURE()`` = 曝光阶段），这样日志既能看阶段、又能看阶段内部的调用链。
+# 阶段框走的是**同一个** :func:`log_message`，所以它也是 ``Stage_EXPOSURE() >() ...``。
 
 ENTRY_MARKER = ">()"
 EXIT_MARKER = "<()"
@@ -94,7 +205,16 @@ PHASE_ENTER = "enter"
 PHASE_BODY = "body"
 PHASE_LEAVE = "leave"
 
-#: 阶段框的函数名前缀：``[Stage_WAFER_LOAD] >() ...``。
+#: 被调用函数名后面必须补的括号 —— 方向符前要写成**调用形状**。
+CALL_SUFFIX = "()"
+
+#: 「函数方法名 + 括号」的校验用正则：``ScanLot()`` / ``Stage_WSP_UNLOAD_MOVE()``。
+#:
+#: 与前端 ``logParser.ts::FUNCTION_PREFIX_REGEX`` 的形状保持一致（首字符字母/下划线，
+#: 允许 ``:`` ``<>`` ``~`` ``.`` ``-`` 这些在执行器/模板里出现过的字符）。
+FUNCTION_CALL_PATTERN = re.compile(r"[A-Za-z_~][\w:<>~.\-]*\(\)")
+
+#: 阶段框的函数名前缀：``Stage_WAFER_LOAD() >() ...``。
 STAGE_FUNCTION_PREFIX = "Stage_"
 
 #: 函数 -> 入口/出口行的**固定关键字模板**。
@@ -116,6 +236,8 @@ PHASE_KEYWORDS: dict[str, str] = {
     "HaltScan": "scan halt",
     "RecoverStage": "stage recovery",
     "ResumeExposure": "exposure resume",
+    #: 跨行测量快照（正文一次落十几行字典，见 scan_metric_body）
+    "CaptureScanMetrics": "scan metric capture",
     # ---- 编码器 / 冷却 / 互锁子系统 ----
     "ServoLoop": "servo loop",
     "CheckEncoderFeedback": "encoder data read",
@@ -157,37 +279,146 @@ PHASE_KEYWORDS: dict[str, str] = {
 
 # --------------------------------------------------------------------------- 移动点位
 #
-# ``wsp``（工件台点位）组件的日志不是泛泛的"扫片正文"，而是**固定的绝对移动点位**：
+# ``wsp``（工件台点位）组件的日志不是泛泛的"扫片正文"，而是**固定的绝对移动点位**，
+# 并且是**完整六自由度**（工件台本来就是 6-DOF 台：三个平动 + 三个转动）：
 #
-#     move absolute { x:0.003, y:0.999, z:0.000, rz:0.0021, speed:120.0, mode:absolute, point:load_position, status:settled }
+#     move absolute { x:0.003, y:0.999, z:0.008, rx:0.0009, ry:-0.0013, rz:0.0021,
+#                     speed:120.0, mode:absolute, point:load_position, status:settled }
 #
 # 三个"固定"，是为了让它可被当检索锚点用：
-#   * 字段顺序固定（x / y / z / rz / speed / mode / point / status）；
-#   * 数值精度固定（位置 3 位小数、rz 4 位、speed 1 位）；
+#   * 字段顺序固定（x / y / z / rx / ry / rz / speed / mode / point / status）；
+#   * 数值精度固定（平动 3 位小数、三个转角 4 位、speed 1 位）；
 #   * 点位名固定（见 WSP_MOVE_POINTS，全表就这几个）。
 #
 # 生成与校验共用下面这一份定义：``move_point()`` 负责拼、``MOVE_POINT_PATTERN``
 # 负责校。改格式时两边一起改，不会出现"生成变了、校验还在按老格式找"。
 
-#: 固定的移动点位表：(点位名, x, y, z, rz, speed)。
-#: 单位：x/y/z = mm，rz = 度，speed = mm/s。点位名只许小写字母/数字/下划线。
-WSP_MOVE_POINTS: tuple[tuple[str, float, float, float, float, float], ...] = (
-    ("origin", 0.000, 0.000, 0.000, 0.0000, 50.0),
-    ("load_position", 0.003, 0.999, 0.000, 0.0021, 120.0),
-    ("align_mark_01", 0.031, 1.247, 0.000, 0.0018, 120.0),
-    ("align_mark_08", 0.263, 1.508, 0.000, 0.0034, 120.0),
-    ("exposure_start", 0.500, 2.000, 0.000, 0.0000, 300.0),
-    ("exposure_mid", 1.250, 2.400, 0.000, 0.0007, 300.0),
-    ("exposure_end", 2.000, 2.800, 0.000, 0.0012, 300.0),
-    ("unload_position", 0.004, 0.998, 0.000, 0.0023, 150.0),
+# ---- 曝光扫描轨迹：从场中心向外螺旋步进 -------------------------------------
+#
+# 曝光扫描不是"两点连一条直线"，而是**从曝光场中心出发、一圈圈向外螺旋步进**的
+# 阿基米德螺线：每步转过的角度固定（Δθ = 360°/每圈步数）、每步的径向增量固定，
+# 于是走满一圈半径就大一档，螺距恒定，轨迹由内向外盘出去：
+#
+#     中心 ──→ 第 1 圈 ──→ 第 2 圈 ──→ 第 3 圈（贴到曝光场边缘）
+#
+# 为什么是**椭圆**螺线而不是正圆：工件台在曝光场里的行程是矩形的
+# （x∈[0.5, 2.0]、y∈[2.0, 2.8]，见下面 exposure_start / exposure_end），正圆螺线
+# 会在长边方向留一大片空行程、短边方向又顶出行程。椭圆的两个半轴直接取曝光场的
+# 两个半幅，螺线就刚好由内向外铺满整个场，最后一圈贴在边缘上。
+#
+# 为什么**程序生成**而不是手写一张表：螺线的形状是可调的几何量（圈数 / 每圈步数 /
+# 两个半轴），手写二十几行数值既没法调参，也看不出"这是螺线"。生成用纯解析式、
+# 一个随机数都不掺 —— 夹具必须可复现（同一个 index 永远同一个坐标），否则
+# "落盘比对"型自检会随机失败。
+
+#: 螺线圈数与每圈步进数。步进 = 每一步转过的角度固定为 ``360°/每圈步数``。
+SPIRAL_TURNS = 3
+SPIRAL_STEPS_PER_TURN = 8
+
+#: 螺线总步数（不含中心点本身，中心是轨迹的起点 exposure_mid）。
+SPIRAL_STEPS = SPIRAL_TURNS * SPIRAL_STEPS_PER_TURN
+
+#: 螺线中心 = 曝光场中心，与 ``exposure_mid`` 同坐标（轨迹从这一点的位置起步）。
+SPIRAL_CENTER: tuple[float, float] = (1.250, 2.400)
+
+#: 螺线椭圆的半轴：分别铺满曝光场 x∈[0.5, 2.0] 与 y∈[2.0, 2.8]。
+SPIRAL_RADIUS_X = 0.750
+SPIRAL_RADIUS_Y = 0.400
+
+#: 扫描工作高度（与 exposure_* 点位同一平面）与目标速度。
+SPIRAL_Z = 0.015
+SPIRAL_SPEED = 300.0
+
+#: 螺线点位的名字前缀：``spiral_01`` … ``spiral_{SPIRAL_STEPS:02d}``。
+#: 检索"台的运动轨迹"就按 ``point:spiral_`` 捞 —— 按序读到的坐标序列就是轨迹。
+SPIRAL_POINT_PREFIX = "spiral_"
+
+
+def _snap(value: float, digits: int) -> float:
+    """四舍五入到指定小数位，并把 ``-0.0`` 归成 ``0.0``。
+
+    不归零的话 ``f"{-0.00004:.4f}"`` 会写出 ``-0.0000`` —— 一个"负零"坐标在日志里
+    很扎眼：格式正则虽然放行，但人一眼就知道这个数是凑出来的。
+    """
+    rounded = round(value, digits)
+    return 0.0 if rounded == 0 else rounded
+
+
+def spiral_points() -> tuple[tuple[str, float, float, float, float, float, float, float], ...]:
+    """曝光扫描的**螺旋步进轨迹**点位表（自中心起算的 ``SPIRAL_STEPS`` 个点）。
+
+    第 k 步（k = 1…``SPIRAL_STEPS``）::
+
+        θ_k = k · 2π / SPIRAL_STEPS_PER_TURN     # 等角度步进
+        t_k = k / SPIRAL_STEPS                   # 径向比例，末步 = 1（贴到边缘）
+        x_k = cx + SPIRAL_RADIUS_X · t_k · cos θ_k
+        y_k = cy + SPIRAL_RADIUS_Y · t_k · sin θ_k
+
+    所以第 0 步在中心、第 8/16/24 步分别是第 1/2/3 圈走完的时刻 ——
+    "从中点不断螺旋步进到外面"就是这个序列本身。
+
+    三个姿态自由度不是常数：曝光时工件台要**边扫边补**镜面倾斜与晶圆旋转残差，
+    外圈的补偿量比内圈大。这里按"线性随半径 × 正弦随角度"给一组确定量，
+    量级落在 1e-4 ~ 1e-3 度（真实补偿量的量级）。
+    """
+    rows: list[tuple[str, float, float, float, float, float, float, float]] = []
+    cx, cy = SPIRAL_CENTER
+    step_angle = 2.0 * math.pi / SPIRAL_STEPS_PER_TURN
+    for step in range(1, SPIRAL_STEPS + 1):
+        angle = step * step_angle
+        ratio = step / SPIRAL_STEPS
+        rows.append((
+            f"{SPIRAL_POINT_PREFIX}{step:02d}",
+            _snap(cx + SPIRAL_RADIUS_X * ratio * math.cos(angle), 3),
+            _snap(cy + SPIRAL_RADIUS_Y * ratio * math.sin(angle), 3),
+            SPIRAL_Z,
+            _snap(0.0002 + 0.00035 * math.sin(angle * 0.5) * ratio, 4),
+            _snap(-0.0004 - 0.00030 * math.cos(angle * 0.5) * ratio, 4),
+            _snap(0.00060 * math.sin(angle) * ratio, 4),
+            SPIRAL_SPEED,
+        ))
+    return tuple(rows)
+
+
+#: 螺旋轨迹点位（生成一次；点位名固定，可当检索锚点）。
+SPIRAL_POINTS = spiral_points()
+
+#: 曝光扫描阶段要走的**完整点序**：入场 → 螺旋中心 → 螺旋步进向外 → 退场。
+#: 批量程序与实时剧本都引用它 —— 改圈数/密度只动上面的常量，两边自动同步，
+#: 不会出现"剧本还在走老轨迹、点位表已经变了"。
+SCAN_TRAJECTORY_POINTS: tuple[str, ...] = (
+    "exposure_start",
+    "exposure_mid",
+    *(row[0] for row in SPIRAL_POINTS),
+    "exposure_end",
+)
+
+#: 固定的移动点位表：(点位名, x, y, z, rx, ry, rz, speed)。
+#: 单位：x/y/z = mm，rx/ry/rz = 度（绕 X/Y/Z 轴），speed = mm/s。
+#: 点位名只许小写字母/数字/下划线。
+WSP_MOVE_POINTS: tuple[tuple[str, float, float, float, float, float, float, float], ...] = (
+    ("origin", 0.000, 0.000, 0.000, 0.0000, 0.0000, 0.0000, 50.0),
+    ("load_position", 0.003, 0.999, 0.008, 0.0009, -0.0013, 0.0021, 120.0),
+    ("align_mark_01", 0.031, 1.247, 0.012, 0.0006, -0.0009, 0.0018, 120.0),
+    ("align_mark_08", 0.263, 1.508, 0.012, 0.0011, -0.0016, 0.0034, 120.0),
+    ("exposure_start", 0.500, 2.000, 0.015, 0.0000, 0.0000, 0.0000, 300.0),
+    # 螺旋中心：轨迹的起点，坐标与 SPIRAL_CENTER 同源（别只改一处）。
+    ("exposure_mid", SPIRAL_CENTER[0], SPIRAL_CENTER[1], SPIRAL_Z,
+     0.0003, -0.0005, 0.0007, SPIRAL_SPEED),
+    *SPIRAL_POINTS,
+    ("exposure_end", 2.000, 2.800, 0.015, 0.0005, -0.0008, 0.0012, 300.0),
+    ("unload_position", 0.004, 0.998, 0.006, 0.0010, -0.0014, 0.0023, 150.0),
 )
 
 _MOVE_POINT_BY_NAME = {row[0]: row[1:] for row in WSP_MOVE_POINTS}
 
+#: 六自由度的**轴顺序**。生成与校验都以它为准，避免哪天又被砍掉几个轴。
+MOVE_POINT_DOF: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
+
 #: 一条移动点位正文的**校验正则**，与 :func:`move_point` 的输出严格对应。
 MOVE_POINT_PATTERN = (
     r"move absolute \{ x:-?\d+\.\d{3}, y:-?\d+\.\d{3}, z:-?\d+\.\d{3}, "
-    r"rz:-?\d+\.\d{4}, speed:\d+\.\d, mode:absolute, "
+    r"rx:-?\d+\.\d{4}, ry:-?\d+\.\d{4}, rz:-?\d+\.\d{4}, speed:\d+\.\d, mode:absolute, "
     r"point:[a-z0-9_]+, status:[a-z]+ \}"
 )
 
@@ -202,14 +433,33 @@ def keyword_of(function: str) -> str:
     return PHASE_KEYWORDS.get(function, function)
 
 
+def call_signature(function: str) -> str:
+    """函数名 -> **调用形状**：``ScanLot`` -> ``ScanLot()``。
+
+    方向符 ``>()`` / ``<()`` 前面那个词是**被调用的函数**，必须写成调用形状带括号。
+    前端的 ``FUNCTION_PREFIX_REGEX`` 就是按 ``函数名()`` 抓的；写成光秃秃的
+    ``ScanLot >()`` 或方括号 ``[ScanLot] >()`` 都会掉进兜底解析，丢掉
+    ``functionName``（「连续同名函数日志」「闭合后的同名尾随日志」两条折叠规则就废了）。
+    """
+    return f"{function}{CALL_SUFFIX}"
+
+
 def log_message(function: str, phase: str, body: str) -> str:
-    """按调用链规则拼一行日志正文。"""
+    """按调用链规则拼一行日志正文。
+
+    三种相位的形状（注意函数名一律带括号）：
+
+    * ``PHASE_ENTER`` —— ``ScanLot() >() enter lot scan start lot=… wafers=25``
+    * ``PHASE_BODY``  —— ``ScanLot() exposure sequence resumed, lot … continues``
+    * ``PHASE_LEAVE`` —— ``ScanLot() <() leave lot scan end lot=… elapsed=52.5ms status=ok``
+    """
     keyword = keyword_of(function)
+    call = call_signature(function)
     if phase == PHASE_ENTER:
-        return f"[{function}] {ENTRY_MARKER} enter {keyword} start {body}"
+        return f"{call} {ENTRY_MARKER} enter {keyword} start {body}"
     if phase == PHASE_LEAVE:
-        return f"[{function}] {EXIT_MARKER} leave {keyword} end {body}"
-    return f"[{function}] {body}"
+        return f"{call} {EXIT_MARKER} leave {keyword} end {body}"
+    return f"{call} {body}"
 
 
 def move_point(
@@ -217,12 +467,17 @@ def move_point(
     x: float,
     y: float,
     z: float = 0.0,
+    rx: float = 0.0,
+    ry: float = 0.0,
     rz: float = 0.0,
     speed: float = 120.0,
     point: str = "scan",
     status: str = "settled",
 ) -> str:
     """一条「绝对移动点位」日志正文（wsp 组件的固定格式）。
+
+    平动 x/y/z + 转动 rx/ry/rz 共**六自由度**，顺序固定为
+    ``x, y, z, rx, ry, rz``（就是工件台的位置/姿态向量）。
 
     ⚠️ 正文里带 ``{ ... }`` 花括号，而剧本是要过 ``str.format`` 的（模板变量
     ``{trace}`` / ``{elapsed}``）。直接把它当模板存进去会被 ``format`` 当占位符解析并
@@ -231,7 +486,8 @@ def move_point(
     用 :func:`body_text` 反解。
     """
     text = (
-        f"move absolute {{ x:{x:.3f}, y:{y:.3f}, z:{z:.3f}, rz:{rz:.4f}, "
+        f"move absolute {{ x:{x:.3f}, y:{y:.3f}, z:{z:.3f}, "
+        f"rx:{rx:.4f}, ry:{ry:.4f}, rz:{rz:.4f}, "
         f"speed:{speed:.1f}, mode:absolute, point:{point}, status:{status} }}"
     )
     return text.replace("{", "{{").replace("}", "}}")
@@ -240,12 +496,61 @@ def move_point(
 def point_body(name: str, *, status: str = "settled") -> str:
     """按 :data:`WSP_MOVE_POINTS` 渲染指定点位的一条移动点位正文（已转义）。"""
     try:
-        x, y, z, rz, speed = _MOVE_POINT_BY_NAME[name]
+        x, y, z, rx, ry, rz, speed = _MOVE_POINT_BY_NAME[name]
     except KeyError:
         raise KeyError(
             f"点位 {name!r} 没登记在 WSP_MOVE_POINTS（已登记：{sorted(_MOVE_POINT_BY_NAME)}）"
         ) from None
-    return move_point(x=x, y=y, z=z, rz=rz, speed=speed, point=name, status=status)
+    return move_point(
+        x=x, y=y, z=z, rx=rx, ry=ry, rz=rz, speed=speed, point=name, status=status
+    )
+
+
+def move_call_rows(
+    name: str,
+    *,
+    profile: str = "rapid",
+    status: str = "ok",
+    note: str = "",
+) -> tuple[tuple[str, str, str, str], ...]:
+    """**一次绝对移动的完整调用**：入口 → 点位正文（+ 可选附注）→ 出口。
+
+    为什么**每个点位各成一次调用**，而不是"一次调用里连打十几条点位"：
+    项目的日志规范要求每个动作都有自己的入口/出口
+    （``函数名() >()`` … ``函数名() <()``，见 :data:`PHASE_ENTER` / :data:`PHASE_LEAVE`）。
+    一次 ``MoveAbsolute`` 里塞进整条轨迹的话，那几十条 ``move absolute { … }`` 正文
+    **谁都没有自己的边界** —— 前端折不出函数卡片，也没法回答"走到这个点位用了多久"，
+    读日志的人甚至分不清哪里是一次移动的结束。真机台的台控也不是那么打的：
+    它是走一个点位压一次栈。所以**轨迹有多少个点位，就有多少次 ``MoveAbsolute``
+    调用**（24 步螺旋 + 三个端点 = 27 组入口/出口）。
+
+    返回 :data:`_WSP_GROUPS` 用的四元组布局 ``(函数, 相位, 级别, 正文)``。
+    """
+    rows: list[tuple[str, str, str, str]] = [
+        ("MoveAbsolute", PHASE_ENTER, "INFO", f"dof=6 point={name} profile={profile}"),
+        ("MoveAbsolute", PHASE_BODY, "INFO", point_body(name)),
+    ]
+    if note:
+        rows.append(("MoveAbsolute", PHASE_BODY, "INFO", note))
+    rows.append((
+        "MoveAbsolute",
+        PHASE_LEAVE,
+        "INFO",
+        # 出口**带上点位名**：屏幕上几十条 ``<() leave … elapsed=… status=ok`` 长得
+        # 一模一样，不点名就分不清是哪一次移动合的；配上点位名之后一次调用三行
+        # 自成一体（入口点名、正文点位、出口点名）。
+        f"dof=6 point={name} elapsed={{elapsed}} status={status}",
+    ))
+    return tuple(rows)
+
+
+def dof_of_point(text: str) -> list[str]:
+    """从一条（还原后的）点位正文里按**出现顺序**抽出自由度字段名。
+
+    用来断言"六个轴一个都没少"。``rx:`` 要排在 ``x:`` 前面交替，否则 ``rx`` 会被
+    单字母分支先吃掉一个 ``x``。
+    """
+    return re.findall(r"(rx|ry|rz|[xyz]):", text)
 
 
 def body_text(body: str) -> str:
@@ -258,6 +563,90 @@ def body_text(body: str) -> str:
     if "{{" not in body and "}}" not in body:
         return body
     return body.replace("{{", "{").replace("}}", "}")
+
+
+# --------------------------------------------------------------------------- 测量快照
+#
+# 真实机台的测量 / 干涉模块习惯把**一次采样的整包读数**打成字典再落一条日志：
+# 一条记录横跨很多物理行，**只有第一行**带八字段前缀（时间戳在最前），后面各行
+# 都是没有时间戳的裸续行，一直持续到下一条记录的时间戳出现为止。
+#
+#     [2026-09-26 00:05:12.345] [INFO] [SPWSP] [20123] [30145] [spwsp] [normal]
+#         [spwsp:CaptureScanMetrics:412] [CaptureScanMetrics] scan metric snapshot …
+#       'position': {'x': 1.250, 'y': 2.400, …},
+#       'power_mW': 248.63,
+#       …
+#
+# ⚠️ 这种日志会**打穿「按行首时间戳切记录」的解析器**。本项目里就是
+# ``apps/logsources/services/remote_logs.py`` 的三条消费路径：
+# ``_stream_direct_forward_from_offset``、``_stream_direct`` 的 ``reverse_lines``
+# 分支、以及 ``_stream_tar_member`` —— 它们对 ``parse_line_time`` 返回 None 的行
+# 直接 ``continue``；tar 那条更早一步，shell 侧的 awk 预筛写着
+# ``substr($0,1,1) != "[" { next }``，续行连 Python 都没见到就被丢了。
+# 结果就是**正文只剩第一行，后半截被截断**。
+#
+# 下面这个夹具专门用来复现该场景，别把它"顺手修回"成单行。
+
+#: 激光器镜干涉仪的对比度测量通道：水平 4 路 + 垂直 3 路。
+INTERFEROMETER_CHANNELS: tuple[str, ...] = ("x1", "x2", "x3", "x4", "y1", "y2", "y3")
+
+#: 测量快照的正文首句标记。校验类代码用它认这条记录（正文只有首行带它）。
+SCAN_METRIC_MARKER = "scan metric snapshot"
+
+
+def channel_contrast(axis: str, *, base: float = 0.9137) -> float:
+    """干涉仪单个通道的对比度读数：以基准值为中心的一个稳定小偏移。
+
+    偏移量取自轴名的 ``crc32`` 而不是 ``random`` —— 夹具必须**可复现**：同一通道
+    每次生成的读数完全一致，否则"落盘比对"型的自检会随机失败。
+    """
+    offset = (zlib.crc32(axis.encode("utf-8")) % 61 - 30) / 1000.0
+    return base + offset
+
+
+def scan_metric_body(
+    name: str,
+    *,
+    power_mw: float = 248.63,
+    contrast: float = 0.9137,
+    status: str = "settled",
+) -> str:
+    """一条**跨多行**的扫片测量快照正文（花括号已转义，可直接进 ``str.format``）。
+
+    一次调用打印：工件台当前**六自由度位置** + 该位置采到的**功率 / 对比度** +
+    激光器镜干涉仪七路通道（``x1``…``x4`` / ``y1``…``y3``）的**对比度字典**，
+    形状就是真机台里 ``pprint`` 一个测量结果字典的样子。
+
+    返回的是**已转义**的模板片段（``{{ … }}``），理由同 :func:`move_point`：
+    正文要过 ``str.format``，不转义会被当成占位符解析并抛 ``KeyError``。
+    要取"最终写进日志的样子"，用 :func:`body_text` 反解。
+    """
+    try:
+        x, y, z, rx, ry, rz, speed = _MOVE_POINT_BY_NAME[name]
+    except KeyError:
+        raise KeyError(
+            f"点位 {name!r} 没登记在 WSP_MOVE_POINTS（已登记：{sorted(_MOVE_POINT_BY_NAME)}）"
+        ) from None
+
+    lines = [
+        f"{SCAN_METRIC_MARKER} point={name} dof=6 {{",
+        f"  'position': {{'x': {x:.3f}, 'y': {y:.3f}, 'z': {z:.3f}, "
+        f"'rx': {rx:.4f}, 'ry': {ry:.4f}, 'rz': {rz:.4f}}},",
+        f"  'power_mW': {power_mw:.2f},",
+        f"  'contrast': {contrast:.4f},",
+        "  'interferometer': {",
+    ]
+    lines += [
+        f"    '{axis}': {channel_contrast(axis, base=contrast):.4f},"
+        for axis in INTERFEROMETER_CHANNELS
+    ]
+    lines += [
+        "  },",
+        f"  'stage_speed_mm_s': {speed:.1f},",
+        f"  'status': '{status}',",
+        "}",
+    ]
+    return "\n".join(lines).replace("{", "{{").replace("}", "}}")
 
 
 def stage_codes_of(rows) -> tuple[str, ...]:  # noqa: ANN001 - 迭代即可
@@ -282,7 +671,7 @@ def expand_stage_groups(rows) -> tuple:  # noqa: ANN001 - 迭代即可
     开在曝光前、合在互锁恢复之后，中间夹着编码器 / 冷却 / 互锁各自的阶段）。
 
     阶段框本身也吃 ``PHASE_KEYWORDS`` 里的关键字模板，所以入口是
-    ``[Stage_EXPOSURE] >() enter exposure stage start ...``、出口是
+    ``Stage_EXPOSURE() >() enter exposure stage start ...``、出口是
     ``... exposure stage end ...``。
     """
     stream_order: list[str] = []
@@ -372,7 +761,7 @@ def call_mode(function: str) -> str:
 #:
 #: 相位序列必须是一条合法的调用栈轨迹（入口/出口同名配对、LIFO 闭合）：
 #:
-#:     ScanLot >()  ScanWafer >()  [Stage_WAFER_LOAD] >()  MoveWaferStage >() ... <()
+#:     ScanLot() >()  ScanWafer() >()  Stage_WAFER_LOAD() >()  MoveWaferStage() >() ... <()
 #:
 #: 阶段码为 ``None`` 表示**不套阶段框**：最外层的 ``ScanLot``/``ScanWafer`` 要跨
 #: 整轮，套进阶段框就会让子阶段先闭合、父帧被迫跨框（LIFO 直接破掉）。
@@ -452,9 +841,22 @@ ERROR_STEP_INDEX = next(
 # --------------------------------------------------------------------------- wsp 程序
 #
 # ``wsp``（工件台点位）组件的 fm 日志**不写通用扫片正文** —— 它记的是工件台自己的
-# 运动轨迹：回零 → 上片点 → 对准点 → 扫描点 → 停位检查 → 卸片点。每一行都是一条
-# 固定的绝对移动点位（见 ``move_point``），这样用户打开 ``wsp.log`` 一眼看到的就是
-# "点位日志"，而不是又一份扫片日志。
+# 运动轨迹：回零 → 上片点 → 对准点 → **曝光扫描（螺旋步进）** → 停位检查 → 卸片点。
+# 正文是一条固定的绝对移动点位（见 ``move_point``），这样用户打开 ``wsp.log``
+# 一眼看到的就是"点位日志"，而不是又一份扫片日志；把点位行按序读下来，读到的就是
+# 工件台的运动轨迹本身。
+#
+# ⚠️ **一个点位 = 一次 ``MoveAbsolute`` 调用**（``MoveAbsolute() >()`` 入口 /
+# ``move absolute { … }`` 正文 / ``MoveAbsolute() <()`` 出口，三行一组，见
+# :func:`move_call_rows`）。**别把整条轨迹塞进一次调用**：那样几十条点位正文谁都
+# 没有自己的入口/出口，既不合乎"每个动作都有边界"的日志规范，折不出函数卡片，
+# 也回答不了"走到这个点位用了多久"。台控本来就是走一个点位压一次栈。
+#
+# 曝光那一段不是"两点连一线"，而是 ``SCAN_TRAJECTORY_POINTS``：入场点 → 曝光场中心
+# → 从中心一圈圈向外螺旋步进的每一步（``spiral_01`` … ``spiral_24``，末步贴到曝光场
+# 边缘）→ 退场点。螺线是**椭圆**的，两个半轴直接取曝光场的两个半幅，于是螺线刚好
+# 由内向外铺满整个场；几何参数（圈数 / 每圈步数 / 半轴）都在 ``SPIRAL_*`` 常量里，
+# 点位由 :func:`spiral_points` 生成 —— 批量程序与实时剧本共用这一份点序。
 #
 # 级别约定与通用程序一致：**入口/出口固定 INFO，异常只落在正文行**。
 # 停位检查里刻意留了一条 WARN → ERROR → FATAL 的本地升级链，且根因挂在
@@ -462,52 +864,51 @@ ERROR_STEP_INDEX = next(
 # 跨模块因果链里（``trace=`` 与其它子系统同号）。
 _WSP_GROUPS: tuple[tuple[str | None, tuple[tuple[str, str, str, str], ...]], ...] = (
     ("WSP_HOME", (
-        ("HomeStage", PHASE_ENTER, "INFO", "axis=XY mode=absolute search=reference_mark"),
+        ("HomeStage", PHASE_ENTER, "INFO", "dof=6 mode=absolute search=reference_mark"),
         ("HomeStage", PHASE_BODY, "INFO", point_body("origin")),
         ("HomeStage", PHASE_BODY, "INFO", "reference mark acquired, encoder counter zeroed at origin"),
-        ("HomeStage", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+        ("HomeStage", PHASE_LEAVE, "INFO", "dof=6 elapsed={elapsed} status=ok"),
     )),
-    ("WSP_LOAD_MOVE", (
-        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=load_position profile=rapid"),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("load_position")),
-        ("MoveAbsolute", PHASE_BODY, "INFO", "in position window reached, settling servo loop"),
-        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    # 一个点位 = 一次 ``MoveAbsolute`` 调用（入口 / 点位正文 / 出口三行一组）。
+    # 用 :func:`move_call_rows` 生成而不是手抄三行：轨迹点数一改，三行自动跟着走，
+    # 也不会出现"某一次移动忘了写出口"这种半条调用。
+    ("WSP_LOAD_MOVE", move_call_rows(
+        "load_position",
+        profile="rapid",
+        note="in position window reached, settling servo loop",
     )),
-    ("WSP_ALIGN_MOVE", (
-        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=align_mark_01 profile=align"),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("align_mark_01")),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("align_mark_08")),
-        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    ("WSP_ALIGN_MOVE", tuple(
+        row
+        for name in ("align_mark_01", "align_mark_08")
+        for row in move_call_rows(name, profile="align")
     )),
-    ("WSP_SCAN_MOVE", (
-        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=exposure_start profile=scan"),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_start")),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_mid")),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("exposure_end")),
-        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
+    ("WSP_SCAN_MOVE", tuple(
+        # 曝光扫描轨迹：入场点 → 螺旋中心 → **从中心向外螺旋步进的每一步** → 退场点，
+        # 每一步各是一次调用。点序取自 ``SCAN_TRAJECTORY_POINTS``（几何参数在
+        # ``SPIRAL_*`` 常量），这里不手写 —— 改圈数 / 密度只动那几个常量，
+        # 点位表与轨迹自动同步。
+        row
+        for name in SCAN_TRAJECTORY_POINTS
+        for row in move_call_rows(name, profile="scan")
     )),
     ("WSP_SETTLE", (
-        ("CheckPositionError", PHASE_ENTER, "INFO", "axis=XY tolerance=0.020um"),
+        ("CheckPositionError", PHASE_ENTER, "INFO", "dof=6 tolerance=0.020um"),
         ("CheckPositionError", PHASE_BODY, "INFO", "position error within tolerance, stage has settled"),
         ("CheckPositionError", PHASE_BODY, "WARN",
-         "position error 0.031um exceeds tolerance 0.020um axis=XY "
+         "position error 0.031um exceeds tolerance 0.020um dof=6 "
          "code=ERR_WSP_POSITION_DEVIATION cause=ERR_MECORE_ENC_JITTER trace={trace}"),
         ("CheckPositionError", PHASE_BODY, "ERROR",
-         "settling window expired, position error not converged axis=XY "
+         "settling window expired, position error not converged dof=6 "
          "code=ERR_WSP_SETTLE_TIMEOUT cause=ERR_WSP_POSITION_DEVIATION trace={trace}"),
-        ("CheckPositionError", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=deviated"),
-        ("AbortMotion", PHASE_ENTER, "INFO", "axis=XY reason=settle_timeout"),
+        ("CheckPositionError", PHASE_LEAVE, "INFO", "dof=6 elapsed={elapsed} status=deviated"),
+        ("AbortMotion", PHASE_ENTER, "INFO", "dof=6 reason=settle_timeout"),
         ("AbortMotion", PHASE_BODY, "FATAL",
-         "motion aborted near soft limit, travel range guard triggered axis=XY "
+         "motion aborted near soft limit, travel range guard triggered dof=6 "
          "code=ERR_WSP_SOFT_LIMIT_PROXIMITY cause=ERR_WSP_SETTLE_TIMEOUT trace={trace}"),
         ("AbortMotion", PHASE_BODY, "INFO", "stage re-settled after motion abort, position error within tolerance"),
-        ("AbortMotion", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=aborted"),
+        ("AbortMotion", PHASE_LEAVE, "INFO", "dof=6 elapsed={elapsed} status=aborted"),
     )),
-    ("WSP_UNLOAD_MOVE", (
-        ("MoveAbsolute", PHASE_ENTER, "INFO", "axis=XY point=unload_position profile=rapid"),
-        ("MoveAbsolute", PHASE_BODY, "INFO", point_body("unload_position")),
-        ("MoveAbsolute", PHASE_LEAVE, "INFO", "axis=XY elapsed={elapsed} status=ok"),
-    )),
+    ("WSP_UNLOAD_MOVE", move_call_rows("unload_position", profile="rapid")),
 )
 
 #: wsp 程序的阶段序（按首次出现）。
@@ -578,6 +979,8 @@ class GenerationReport:
     lines: int = 0
     bytes_written: int = 0
     pruned: int = 0
+    #: 删除额度用完之后、靠 ``os.replace`` **改名**搬进回收站的残留数（不是删除）。
+    recycled: int = 0
     machines: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
@@ -586,6 +989,7 @@ class GenerationReport:
         detail = ", ".join(f"{key}={value}" for key, value in sorted(self.machines.items()))
         return (
             f"锚点 {anchor}｜文件 {self.files}｜日志行 {self.lines}｜写入 {size}｜清理 {self.pruned}"
+            + (f"｜改名回收 {self.recycled}" if self.recycled else "")
             + (f"｜{detail}" if detail else "")
         )
 
@@ -598,14 +1002,22 @@ def _stamp(moment: datetime) -> str:
     return f"{moment:%Y-%m-%d %H:%M:%S}.{moment.microsecond // 1000:03d}"
 
 
-def _program_values(moment: datetime, seq: int, function: str, length: int) -> dict[str, str]:
+def _program_values(
+    moment: datetime, seq: int, function: str, length: int, template: str = ""
+) -> dict[str, str]:
     """调用链程序的模板变量。第几轮（``seq // length``）决定晶圆/批次。
 
     ``length`` 是**该子系统自己的程序长度** —— 用通用程序长度去除，wsp 这种短程序
     会每隔几行就跳一个批次号，看着像数据错乱。
+
+    ``template`` 参与 ``elapsed`` 的取数：耗时本来就应该**逐次调用各不相同**，
+    只按函数名取的话，wsp 那 27 次 ``MoveAbsolute`` 的出口会整整齐齐印 27 遍
+    「elapsed=121.5ms」—— 一眼就是克隆出来的。用整条模板当盐，同一次调用的
+    入口/正文/出口各算各的（只有出口用得上 ``elapsed``），而不同点位因为出口模板
+    里写着各自的点位名，耗时自然也就各不相同。
     """
     round_index = seq // max(1, length)
-    elapsed = 6 + zlib.crc32(function.encode("utf-8")) % 180
+    elapsed = 6 + zlib.crc32(f"{function}|{template}".encode("utf-8")) % 180
     # 批次也要有自己的追踪号：wsp 的点位异常链要写 ``trace=``，没有这个键就会
     # ``KeyError: 'trace'``。同一轮里所有行同号，形状与实时源的 ``TR-0001-ABCD``
     # 一致，前端按它检索时两种日志可以一起命中。
@@ -620,7 +1032,7 @@ def _program_values(moment: datetime, seq: int, function: str, length: int) -> d
 
 
 def debug_line(moment: datetime, subsystem: str, module: str, seq: int) -> str:
-    """八字段调试日志，匹配 DEBUG_PATTERN；正文带 ``[函数名] >()`` / ``<()`` 调用链边界。
+    """八字段调试日志，匹配 DEBUG_PATTERN；正文带 ``函数名() >()`` / ``<()`` 调用链边界。
 
     内容按**子系统**选程序：通用扫片子系统走 ``_DEBUG_PROGRAM``，wsp 走点位程序。
     """
@@ -634,7 +1046,9 @@ def debug_line(moment: datetime, subsystem: str, module: str, seq: int) -> str:
     thread_id = 30000 + zlib.crc32(module.encode("utf-8")) % 500
     rpc = f"{module}:{function}:{source_line(function)}"
     message = log_message(
-        function, phase, template.format(**_program_values(moment, seq, function, len(program)))
+        function,
+        phase,
+        template.format(**_program_values(moment, seq, function, len(program), template)),
     )
     return (
         f"[{_stamp(moment)}] [{level}] [{subsystem.upper()}] [{process_id}] "
@@ -655,7 +1069,9 @@ def executor_line(moment: datetime, subsystem: str, module: str, seq: int, *, in
     thread_id = 50000 + zlib.crc32(module.encode("utf-8")) % 300
     rpc = f"{module}:{function}:{source_line(function)}"
     message = log_message(
-        function, phase, template.format(**_program_values(moment, seq, function, len(program)))
+        function,
+        phase,
+        template.format(**_program_values(moment, seq, function, len(program), template)),
     )
     if inner:
         context = f"ctx{(seq % 8) + 1}"
@@ -690,15 +1106,18 @@ def run_line(moment: datetime, seq: int) -> str:
 # --------------------------------------------------------------------------- 渲染
 
 
-def _stamps(start: datetime, end: datetime, step_seconds: int):
-    current = start
-    while current < end:
-        yield current
-        current += timedelta(seconds=step_seconds)
+def _stamps(start: datetime, end: datetime, step_seconds: int, *, salt: str = ""):
+    """兼容旧名；实际实现在 :func:`clock_series`（带抖动）。"""
+    return clock_series(start, end, step_seconds, salt=salt)
 
 
-def _render(start: datetime, end: datetime, step_seconds: int, builder) -> tuple[bytes, int]:
-    lines = [builder(moment, index) for index, moment in enumerate(_stamps(start, end, step_seconds))]
+def _render(
+    start: datetime, end: datetime, step_seconds: int, builder, *, salt: str = ""
+) -> tuple[bytes, int]:
+    lines = [
+        builder(moment, index)
+        for index, moment in enumerate(_stamps(start, end, step_seconds, salt=salt))
+    ]
     if not lines:
         return b"", 0
     return ("\n".join(lines) + "\n").encode("utf-8"), len(lines)
@@ -725,13 +1144,23 @@ def debug_family(module: str, subsystem: str, *, now: datetime, today: datetime)
     node = Path(subsystem)
     outputs: list[Artifact] = []
 
+    # 抖动种子带上"哪一类文件"：同一个模块的当前段 / 轮转段 / 嵌套包 / 日包
+    # 各自一套节奏，免得看起来像同一份数据复制出来的。
+    tag = f"{subsystem}:{module}"
+
     # 1) 当前段
-    payload, count = _render(today, now, CURRENT_STEP_SECONDS, lambda m, i: debug_line(m, subsystem, module, i))
+    payload, count = _render(
+        today, now, CURRENT_STEP_SECONDS,
+        lambda m, i: debug_line(m, subsystem, module, i), salt=f"{tag}:current",
+    )
     outputs.append((node / f"{module}.log", payload, count))
 
     # 2) 轮转段：关闭边界 = 今天 00:00
     day_1 = today - timedelta(days=1)
-    payload, count = _render(day_1, today, ROTATED_STEP_SECONDS, lambda m, i: debug_line(m, subsystem, module, i + 3))
+    payload, count = _render(
+        day_1, today, ROTATED_STEP_SECONDS,
+        lambda m, i: debug_line(m, subsystem, module, i + 3), salt=f"{tag}:rotated",
+    )
     outputs.append((node / f"{module}_{today:%Y%m%d}000000.log", payload, count))
 
     # 3) 嵌套日包：D-2 / D-3，每小时一个内层包，包名 = 小时段结束时刻（关闭边界）
@@ -744,6 +1173,7 @@ def debug_family(module: str, subsystem: str, *, now: datetime, today: datetime)
             payload, count = _render(
                 segment_start, segment_end, NESTED_INNER_STEP_SECONDS,
                 lambda m, i, _s=subsystem, _mod=module, _h=hour: debug_line(m, _s, _mod, i + _h),
+                salt=f"{tag}:nested:{offset}:{hour}",
             )
             inner_bytes, _ = _pack_tar([(f"{module}.log", payload, count)], segment_end)
             inner_members.append((f"{module}_{segment_end:%Y%m%d%H%M%S}.tar.gz", inner_bytes, count))
@@ -755,6 +1185,7 @@ def debug_family(module: str, subsystem: str, *, now: datetime, today: datetime)
     payload, count = _render(
         day_4, day_4 + timedelta(days=1), FLAT_ARCHIVE_STEP_SECONDS,
         lambda m, i: debug_line(m, subsystem, module, i + 7),
+        salt=f"{tag}:flat",
     )
     flat_bytes, _ = _pack_tar([(f"{module}.log", payload, count)], day_4)
     outputs.append((node / f"{module}_{day_4:%Y%m%d}.tar.gz", flat_bytes, count))
@@ -765,16 +1196,23 @@ def debug_family(module: str, subsystem: str, *, now: datetime, today: datetime)
 def run_family(*, now: datetime, today: datetime) -> list[Artifact]:
     """运行日志是扁平的：<run root>/event.log + 归档。"""
     outputs: list[Artifact] = []
-    payload, count = _render(today, now, CURRENT_STEP_SECONDS, lambda m, i: run_line(m, i))
+    payload, count = _render(
+        today, now, CURRENT_STEP_SECONDS, lambda m, i: run_line(m, i), salt="run:current"
+    )
     outputs.append((Path("event.log"), payload, count))
 
     day_1 = today - timedelta(days=1)
-    payload, count = _render(day_1, today, ROTATED_STEP_SECONDS, lambda m, i: run_line(m, i + 2))
+    payload, count = _render(
+        day_1, today, ROTATED_STEP_SECONDS, lambda m, i: run_line(m, i + 2), salt="run:rotated"
+    )
     outputs.append((Path(f"event_{today:%Y%m%d}000000.log"), payload, count))
 
     for offset in (2, 3):
         day = today - timedelta(days=offset)
-        payload, count = _render(day, day + timedelta(days=1), FLAT_ARCHIVE_STEP_SECONDS, lambda m, i: run_line(m, i + 4))
+        payload, count = _render(
+            day, day + timedelta(days=1), FLAT_ARCHIVE_STEP_SECONDS,
+            lambda m, i: run_line(m, i + 4), salt=f"run:flat:{offset}",
+        )
         blob, _ = _pack_tar([("event.log", payload, count)], day)
         outputs.append((Path(f"event_{day:%Y%m%d}.tar.gz"), blob, count))
     return outputs
@@ -790,12 +1228,20 @@ def executor_family(
     def builder(moment: datetime, index: int) -> str:
         return executor_line(moment, subsystem, module, index + slot, inner=(index % 2 == 0))
 
+    # 每个执行器槽位（_cp_01.._cp_NN）也是一条独立的流，抖动种子必须带上 slot，
+    # 否则同一模块的 8 个 slot 会走出完全一样的毫秒尾巴。
+    tag = f"{lower_host}:{subsystem}:{module}:cp{slot:02d}"
+
     outputs: list[Artifact] = []
-    payload, count = _render(today, now, CURRENT_STEP_SECONDS, builder)
+    payload, count = _render(
+        today, now, CURRENT_STEP_SECONDS, builder, salt=f"{tag}:current"
+    )
     outputs.append((node / filename, payload, count))
 
     day_1 = today - timedelta(days=1)
-    payload, count = _render(day_1, today, ROTATED_STEP_SECONDS, builder)
+    payload, count = _render(
+        day_1, today, ROTATED_STEP_SECONDS, builder, salt=f"{tag}:rotated"
+    )
     outputs.append((node / f"{module}_cp_{slot:02d}_{today:%Y%m%d}000000.log", payload, count))
     return outputs
 
@@ -803,32 +1249,143 @@ def executor_family(
 # --------------------------------------------------------------------------- 清理与入口
 
 
-def prune_tree(root: Path, keep: set[Path], report: GenerationReport) -> None:
-    """删除不属于本轮产物的残留。小批量进行，避免触发受控环境的安全删除保护。"""
-    if not root.exists():
-        return
-    stale = [path for path in root.rglob("*") if path.is_file() and path.resolve() not in keep]
-    if not stale:
-        return
-    # ``rglob`` 的顺序取决于文件系统，只按它切预算的话，某些目录会永远排在窗口之外，
-    # 越积越多（同一天多次 init 时 CPD 批次就会这样）。按 mtime 升序先删最旧的：
-    # 顺序确定，也符合"老批次先过期"的直觉。
-    stale.sort(key=lambda item: item.stat().st_mtime)
-    budget = min(len(stale), PURGE_BUDGET_PER_RUN)
-    for path in stale[:budget]:
+#: 清理时**永远跳过**的目录名。``.ssh`` 是 ``deploy.py`` 铺的互信产物（私钥、
+#: 公钥、authorized_keys、known_hosts），不属于"本轮资产生成"的范畴。以前它会被
+#: 当残留删掉，后果是每跑一次 ``init`` 就得重新 ``sim.sh deploy`` 一次，否则
+#: 「公钥免密登录可用」那条自检必然 FAIL —— 而且删除本身还在消耗受控环境的
+#: 文件删除配额，直接导致 init 在半途被拦下。
+PRUNE_SKIP_DIRS = frozenset({".ssh"})
+
+
+def _recycle_root(root: Path) -> Path:
+    """残留回收站里代表 ``root`` 的子目录。
+
+    目录名带 ``root`` 的 crc32 指纹：两台机器的 debug 根**同名**（都叫 ``debug``），
+    只按名字分会互相覆盖。
+    """
+    fingerprint = zlib.crc32(str(root).encode("utf-8")) % 0xFFFF
+    return PURGE_RECYCLE_DIR / f"{root.name}-{fingerprint:04X}"
+
+
+def _recycle_spill(root: Path, files: list[Path]) -> int:
+    """把删除额度之外的残留**改名**搬进回收站，返回搬运成功的个数。
+
+    🔴 用 ``os.replace`` 而**不是** ``unlink``：受控环境的安全删除保护只统计删除，
+    改名不计数，所以这条通道不会在半途被拦下 —— 也不会让 `init` 报"资产生成失败"。
+
+    回收站里的名字是 ``<槽位>_<原名>``：同一个槽位每轮被新的残留覆盖，
+    所以目录大小天然有界（≈ 单轮残留峰值），不需要再删一遍（删除额度本来就不够）。
+    """
+    bucket = _recycle_root(root)
+    moved = 0
+    for slot, path in enumerate(files):
         try:
-            path.unlink(missing_ok=True)
-            report.pruned += 1
+            relative = path.relative_to(root)
+        except ValueError:
+            relative = Path(path.name)
+        # 槽位前缀锁定文件名，跨轮覆盖；原名保留在槽位之后，便于人工辨认。
+        destination = bucket / f"{slot:04d}_{relative.name}"
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, destination)
+            moved += 1
         except OSError:
+            # 目标被占用 / 跨设备 / 权限 —— 单个文件失败不影响其余，更不让 init 失败。
             continue
-    for directory in sorted({item.parent for item in stale[:budget]}, key=lambda item: -len(item.parts)):
+    return moved
+
+
+def _drop_empty_dirs(root: Path) -> None:
+    """自底向上收掉 ``root`` 下的**空目录**（``root`` 本身保留）。
+
+    残留清完之后，形如 ``debug/<子系统>/`` 的目录会先变空；只按"残留文件的祖先"
+    去收，``debug`` 那一层还留着 —— 一台机器放弃整棵树之后会留下一个空壳目录。
+    空目录不承载数据，却会让"这台机器有没有这棵树"的探测（``[ -d ]``）误判，
+    所以统一清掉。只删**空**目录，任何还有内容的目录都原样保留。
+
+    ``root`` 自己也会尝试删除（只在它真的空了的时候才成功）—— 一台机器彻底放弃
+    某棵树之后，连根目录也不该留个空壳。
+    """
+    for directory in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda item: -len(item.parts),
+    ):
+        if PRUNE_SKIP_DIRS.intersection(directory.parts):
+            continue
         try:
             directory.rmdir()
         except OSError:
             continue
-    remaining = len(stale) - budget
-    if remaining > 0:
-        print(f"  [loggen] 另有 {remaining} 个残留待清理，再跑一次 init 即可（小批量保护）")
+    if not PRUNE_SKIP_DIRS.intersection(root.parts):
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+
+
+def prune_tree(root: Path, keep: set[Path], report: GenerationReport) -> None:
+    """清走不属于本轮产物的残留。**删除小批量，删不完的就改名搬走。**
+
+    分两段，因为两种手段的成本完全不同：
+
+    1. **真删除** —— 最多 ``PURGE_BUDGET_PER_RUN`` 个（整轮共享）。受控环境的
+       "一个 turn 内删除超过阈值"保护一旦触发，会抛出一个既不是 ``OSError``
+       也不可恢复的异常，以前它会一路冒泡出去，让 `init` 报"资产生成失败" ——
+       明明日志树 / CPD 都写好了，只因为扫尾没扫干净，连后面的 ATLog 站都不再生成了。
+       现在记一条提示就继续。
+    2. **改名回收** —— 额度之外的全部 ``os.replace`` 进 ``run/recycle/pruned/``，
+       不消耗配额。这一步保证**工作树里只剩本轮产物**，是 ``CPD 报告与数据表格成对``
+       能通过的前提（报告树与数据树都清干净了，重合键才一致）。
+    """
+    if not root.exists():
+        return
+    stale = [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.resolve() not in keep
+        and not PRUNE_SKIP_DIRS.intersection(path.parts)
+    ]
+    if not stale:
+        _drop_empty_dirs(root)
+        return
+    # ``rglob`` 的顺序取决于文件系统，只按它切预算的话，某些目录会永远排在窗口之外，
+    # 越积越多（同一天多次 init 时 CPD 批次就会这样）。按 mtime 升序先删最旧的：
+    # 顺序确定，也符合"老批次先过期"的直觉；也保证两棵树搬走的是**同一批**旧批次。
+    stale.sort(key=lambda item: item.stat().st_mtime)
+    # 预算按**整轮**算，不是每个根各给一份。曾经是每个 base 各 40 个，而一台机器
+    # 有 debug（含 elog 子树）/ run / cpd_report / cpd_data / home 五个根 ——
+    # 一轮最多尝试删两百个，必然越过受控环境的 50 个阈值，init 就半途而废。
+    # 现在整轮最多 40 个，稳稳落在阈值以内。
+    remaining_budget = max(0, PURGE_BUDGET_PER_RUN - report.pruned)
+    budget = min(len(stale), remaining_budget)
+    spill: list[Path] = []
+    blocked = False
+    for index, path in enumerate(stale[:budget]):
+        try:
+            path.unlink(missing_ok=True)
+            report.pruned += 1
+        except OSError:
+            # 删不掉（占用 / 权限）就交给改名回收，别让它留在工作树里。
+            spill.append(path)
+        except Exception as exc:  # noqa: BLE001 - 受控环境的安全删除保护
+            blocked = True
+            print(f"  [loggen] 清理被安全保护拦下（{type(exc).__name__}: {exc}）；"
+                  f"本轮产物已全部写入，剩下的残留改用改名回收继续腾位置")
+            # 保护触发后本 turn 内后续删除都会失败，整段直接转回收。
+            spill.extend(stale[index:])
+            break
+    if not blocked:
+        spill.extend(stale[budget:])
+
+    recycled = _recycle_spill(root, spill) if spill else 0
+    if recycled:
+        report.recycled += recycled
+        print(f"  [loggen] {root.name}：删除额度已用尽，{recycled} 个残留改名搬进 "
+              f"{PURGE_RECYCLE_DIR.name}/（改名不消耗删除配额）")
+
+    # 残留都已经离场（删掉或搬走），空目录顺手收掉。
+    _drop_empty_dirs(root)
 
 
 def _sim_script(action: str) -> bytes:
@@ -843,15 +1400,22 @@ def _sim_script(action: str) -> bytes:
 
 
 def plan_machine(spec: fleet.MachineSpec, *, now: datetime) -> list[tuple[str, Path, bytes, int]]:
-    """一台机器的全部**日志**产物：(远端根, 相对路径, 内容, 行数)。"""
+    """一台机器的全部**日志**产物：(远端根, 相对路径, 内容, 行数)。
+
+    只有**上位机**拥有 ``<debug root>/<子系统>/<fm>.log`` 与 ``<run root>/event.log``
+    这两棵检索树 —— 见 ``fleet.hosts_subsystem_logs`` 的说明。下位机在本模拟里只出
+    ``home/SW``（版本 + 启停脚本）与部署日志，它的机台日志已经作为 executor 目录发布在
+    上位机的 ``<debug root>/elog/<下位机地址>/<子系统>/`` 下。
+    """
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     plan: list[tuple[str, Path, bytes, int]] = []
-    for subsystem, module in fleet.all_modules():
-        for relative, payload, count in debug_family(module, subsystem, now=now, today=today):
-            plan.append((spec.debug_root, relative, payload, count))
-    for relative, payload, count in run_family(now=now, today=today):
-        plan.append((spec.run_root, relative, payload, count))
+    if fleet.hosts_subsystem_logs(spec):
+        for subsystem, module in fleet.all_modules():
+            for relative, payload, count in debug_family(module, subsystem, now=now, today=today):
+                plan.append((spec.debug_root, relative, payload, count))
+        for relative, payload, count in run_family(now=now, today=today):
+            plan.append((spec.run_root, relative, payload, count))
 
     # 版本文件：后端 ResourceSettings.version_file_path 默认 ~/SW/version
     plan.append((
@@ -890,6 +1454,11 @@ def write_plan(
 
     注意：elog root 是 debug root 的子目录（/log/<user>/debug/elog），
     所以清理时必须用**跨根共享**的保留清单，否则 debug 的清理会把 elog 产物当残留删掉。
+
+    清理范围要覆盖"这台机器**可能**承载的全部根"，而不只是本轮计划里出现过的根 ——
+    否则某棵树一旦不再由这台机器产出（例如子系统日志树改成只有上位机承载），
+    它就再也不会出现在计划里、永远不被清理，旧内容一直躺在磁盘上被后端读到。
+    见 ``fleet.managed_roots``。
     """
     keep: set[Path] = set()
     bases: list[Path] = []
@@ -909,6 +1478,13 @@ def write_plan(
         report.lines += count
 
     if prune:
+        # 把这台机器"可能承载"的根也纳入清理范围（见 fleet.managed_roots）。
+        # 已经出现过的根不重复追加，保持"计划内的根排在前面"的顺序：
+        # 它们有 keep 清单、残留少，先扫它们更省。
+        for remote_root in fleet.managed_roots(spec):
+            base = fleet.remote_to_local(spec, remote_root)
+            if base not in bases:
+                bases.append(base)
         for base in bases:
             prune_tree(base, keep, report)
 

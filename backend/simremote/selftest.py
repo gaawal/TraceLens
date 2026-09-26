@@ -10,6 +10,7 @@ tar 列表与嵌套解压管道、awk 时间窗过滤、长驻 tail 转发，以
 from __future__ import annotations
 
 import fnmatch
+import math
 import os
 import re
 import tempfile
@@ -27,16 +28,29 @@ _RESULTS: list[tuple[str, bool, str]] = []
 # （``/>\s*\(\s*\)/`` 入口、``/<\s*\(\s*\)/`` 出口）。
 ENTRY_MARKER_REGEX = re.compile(r">\s*\(\s*\)")
 EXIT_MARKER_REGEX = re.compile(r"<\s*\(\s*\)")
-#: 与前端 ``logParser.ts::parseBoundaryFunctionName`` 同一条规则：取方向符之前
-#: 最后一个 ``[函数名]``。名字必须以字母/下划线开头，所以 ``[2026-09-24 ...]``
-#: 这类时间戳方括号不会被误认成函数名。
-BOUNDARY_NAME_REGEX = re.compile(r"\[([A-Za-z_~][\w:<>~.\-]*)]")
+#: 方向符**前面**必须是被调用的函数名，而且要写成**调用形状** ``函数名()``。
+#:
+#: 与前端 ``logParser.ts::FUNCTION_PREFIX_REGEX``
+#: （``/^\s*([A-Za-z_~][\w:<>~.-]*\(\))/``）同形状 —— 那是它**首选**的解析路径：
+#: 正文以 ``ScanLot()`` 开头，``functionName`` 直接拿到值。首字符限制为字母/下划线，
+#: 所以 ``[2026-09-24 22:50:00.000]`` 这类时间戳方括号不会被误认成函数名。
+BOUNDARY_NAME_REGEX = re.compile(r"[A-Za-z_~][\w:<>~.\-]*\(\)")
+#: **旧写法（禁止）**：方括号包函数名 + 方向符，例如 ``[ScanLot] >()``。
+#:
+#: 它只能靠前端 ``parseBoundaryFunctionName`` 的兜底分支勉强解析出来：``functionName``
+#: 是空、只有 ``boundaryFunctionName`` 有值，于是「连续同名函数日志」「闭合后的同名
+#: 尾随日志」两条内置折叠规则对阶段框/边界行全部失效。渲染出这种形状即判失败。
+LEGACY_BRACKET_CALL_REGEX = re.compile(r"\[[A-Za-z_~][\w:<>~.\-]*]\s*[<>]\s*\(\s*\)")
+#: 日志行的 ``rpc`` 字段 ``[模块:函数:行号]`` —— 它给出这一行**属于哪个函数**。
+#: 正文行没有方向符，"这条正文有没有落在它自己那一次调用的边界里"只能靠 rpc 反查
+#: 函数名再跟栈顶比（见 ``check_wsp_point_call_boundaries``）。
+RPC_FUNCTION_REGEX = re.compile(r"\[[a-z][a-z0-9_]*:([A-Za-z_][A-Za-z0-9_]*):\d+\]")
 
 #: 实时 tail 的等待窗口（秒）。
 #:
-#: 远端 ``tail -F`` 的 stdout 是**管道**不是 tty，stdio 走全缓冲，要攒满几 KB 才
-#: flush 一次；剧本是 5 条流交错、总体 1s 一行，单条流约 3s 才走一行，所以订阅后
-#: 头一行往往要等一分钟上下才冒出来。窗口开短了就会隔几次假失败一次 ——
+#: 远端 ``tail -F`` 的 stdout 是**管道**不是 tty，stdio 走全缓冲，要攒满约 4KB 才
+#: flush 一次；日志源是 5 条流各 0.5s 一行，单行 ~150B，所以一条流要攒满 ~27 行
+#: （约 14s）才会把第一批行推给订阅方。窗口开短了就会隔几次假失败一次 ——
 #: 真实机台也是这个行为，不是模拟器卡住了。
 LIVE_TAIL_WINDOW_SECONDS = 100
 #: 日志源没在跑时的探针模式窗口（自己写一行探针，不用等积攒）
@@ -46,6 +60,41 @@ LIVE_TAIL_PROBE_WINDOW_SECONDS = 6
 def _record(name: str, ok: bool, detail: str = "") -> bool:
     _RESULTS.append((name, bool(ok), detail))
     return bool(ok)
+
+
+def _physical_lines(text: str) -> list[str]:
+    """文本 -> 非空物理行。"""
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def _group_records(lines: list[str]) -> list[list[str]]:
+    """把物理行按「行首时间戳」归组成**记录**：带时间戳的是新记录的首行，其后所有
+    不带时间戳的行都是它的续行。
+
+    为什么校验类代码必须按**记录**判、不能按**物理行**判：真机台的测量 / 干涉模块
+    会把一次采样的整包读数打成字典落一条日志 —— **一条记录横跨十几行，只有首行带
+    八字段前缀**（构造见 ``loggen.scan_metric_body``）。逐行要求"每一行都是八字段"
+    会把这种完全合法的日志判成格式错误，而它恰恰是解析器必须处理的真实形态
+    （也正是"按行首时间戳切记录"会截断正文的那个场景）。
+
+    调用方常常只取尾部若干行、或把几条流的文本拼在一起，起点因此可能落在某条记录
+    **中间**。开头那段没有可归属记录的续行直接跳过 —— 它们没有时间戳，无法当作
+    记录校验，不能拿来报"首行不合规"。
+    """
+    from apps.logsources.services.file_index import parse_line_time
+
+    records: list[list[str]] = []
+    for line in lines:
+        if parse_line_time(line) is not None:
+            records.append([line])
+        elif records:
+            records[-1].append(line)
+    return records
+
+
+def _record_head(line: str) -> str:
+    """一条记录的正文：前 8 个 ``[...]`` 是固定字段，第 9 段才是正文。"""
+    return line.split("] ", 8)[-1]
 
 
 def _connect(spec: fleet.MachineSpec) -> paramiko.SSHClient:
@@ -247,6 +296,111 @@ def check_close_boundary() -> None:
     )
 
 
+def check_timestamp_jitter() -> None:
+    """日志时间戳**不许落在整齐的网格上**。
+
+    这条是用户提的：「日期太整齐了，要随机给点时间尾巴不一样，有时间不断变化的感觉，
+    现在的日志都是 000 结尾，太假了」。曾经的生成方式是 ``start + i * step`` 的纯算术
+    序列，后果是
+
+    * 毫秒位恒为 ``.000``；
+    * 步长 60s / 300s 时秒位恒为 ``:00``，一分钟一行就真的每分钟第 0 秒一行。
+
+    所以这里查三件事，任何一件退回去都要当场失败：
+
+    1. **毫秒位要散**：结尾 ``.000`` 的行占比必须很低（真机台不可能整秒落笔）；
+    2. **秒位要铺开**：一分钟六十个秒值，一份上千行的文件至少要覆盖到两位数；
+    3. **事件驱动型（用例日志）毫秒位要各不相同** —— 那几条本来就不是周期采样。
+
+    三个来源分别覆盖：批量调试日志（当前段 + 轮转段）、运行事件日志、ATLog 用例日志。
+    只查一类是不够的：它们各自走 ``clock_series`` 的不同 ratio，改坏一个不会影响另一个。
+    """
+
+    def collect(paths: list[Path]) -> list[str]:
+        """按真实查询路径取样：**当前段 + 最新归档**一起读。
+
+        只读当前段会有一个假失败源：活动文件写满 ``MAX_LIVE_LINES`` 行就轮转，刚轮转过的
+        那几十秒里当前段只有几行，"秒位要铺开"自然凑不出来。真实查询本来就是
+        两段一起读的。
+        """
+        stamps: list[str] = []
+        for path in paths:
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("["):
+                        # 前 23 个字符 = YYYY-MM-DD HH:MM:SS.mmm
+                        stamps.append(line[1:24])
+        return stamps
+
+    def newest(directory: Path, pattern: str, current: Path) -> Path | None:
+        candidates = [item for item in directory.glob(pattern) if item != current and item.is_file()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item.stat().st_mtime)
+
+    def scan(label: str, paths: list[Path], *, min_seconds: int, max_zero_ratio: float) -> None:
+        stamps = collect(paths)
+        if not stamps:
+            _record(label, False, "取样为空：" + "、".join(item.name for item in paths))
+            return
+        zero = sum(1 for item in stamps if item.endswith(".000"))
+        seconds = {item[17:19] for item in stamps}
+        _record(
+            label,
+            zero / len(stamps) <= max_zero_ratio and len(seconds) >= min_seconds,
+            f"{len(stamps)} 行 · 结尾 .000 占 {zero / len(stamps):.1%} · 秒位 {len(seconds)}/60 种",
+        )
+
+    debug_root = fleet.remote_to_local(fleet.UPPER, fleet.UPPER.debug_root)
+    run_root = fleet.remote_to_local(fleet.UPPER, fleet.UPPER.run_root)
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    spwsp_dir = debug_root / "spwsp"
+    spwsp_current = spwsp_dir / "spwsp.log"
+    rotated = spwsp_dir / f"spwsp_{today:%Y%m%d}000000.log"
+    scan(
+        "调试日志时间戳不落整秒网格",
+        [spwsp_current, rotated],
+        min_seconds=25,
+        max_zero_ratio=0.02,
+    )
+    scan("轮转段时间戳不落整秒网格", [rotated], min_seconds=25, max_zero_ratio=0.02)
+
+    event_current = run_root / "event.log"
+    event_archive = newest(run_root, "event_*.log", event_current)
+    scan(
+        "运行事件时间戳不落整秒网格",
+        [event_current] + ([event_archive] if event_archive else []),
+        min_seconds=25,
+        max_zero_ratio=0.05,
+    )
+
+    # 用例日志：只有十九行、六分钟，靠的是"事件驱动"那一档抖动。
+    # 判据放宽到"毫秒位基本不重复"，因为样本本来就少。
+    case = next((item for item in atlog_site.CASES if item.status == "failed"), atlog_site.CASES[0])
+    case_log = (
+        atlog_site.SITE_ROOT / atlog_site._case_relative_dir(case)
+        / "full_logs" / "log" / "debug" / case.subsystem / f"{case.module}.log"
+    )
+    stamps = collect([case_log])
+    if stamps:
+        millis = {item.rsplit(".", 1)[-1] for item in stamps}
+        zero = sum(1 for item in stamps if item.endswith(".000"))
+        # ⚠️ 别用 `zero == 0`：微秒位是**均匀随机**的，19 行里至少出现一条 ``.000``
+        # 的概率约 1.9% —— 那会变成"每 50 次 init 假失败一次"的骰子，而不是判据。
+        # 判据的本意是"不落整秒网格"（即不是整分/整秒对齐），用比例表达才稳定：
+        # 真网格是 100% 命中，这里只允许零星一两条。
+        _record(
+            "用例日志时间戳不落整秒网格",
+            zero / len(stamps) <= 0.06 and len(millis) >= max(3, len(stamps) // 2),
+            f"{len(stamps)} 行 · 毫秒位 {len(millis)} 种 · 结尾 .000 {zero} 条",
+        )
+    else:
+        _record("用例日志时间戳不落整秒网格", False, f"缺少 {case_log}")
+
+
 def check_awk_window(client: paramiko.SSHClient) -> None:
     now = datetime.now()
     start = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
@@ -265,7 +419,7 @@ def check_awk_window(client: paramiko.SSHClient) -> None:
     _record("cat 读取当前日志", code == 0 and out.count(b"\n") == 3, f"{out.count(b'\n')} 行")
 
     window_start = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-    # 实时日志源的活动文件写满 1000 行就轮转，刚轮转过的那一小会儿当前段只有
+    # 实时日志源的活动文件写满 MAX_LIVE_LINES 行就轮转，刚轮转过的那一小会儿当前段只有
     # 几行 —— 只查当前段会误报"窗口没命中"。真实查询路径本来就是
     # 「当前段 + 覆盖窗口的归档」一起读，这里跟着一起读。
     command = (
@@ -334,19 +488,18 @@ def check_line_formats() -> None:
             _record(f"{category} 日志行匹配内置正则 · {relative}", False, "文件不存在")
             continue
         pattern = _compile(rules[category]["pattern"])
-        matched = 0
-        total = 0
+        # 按**记录**校验，不按物理行：跨行记录（spwsp 的测量快照字典）只有首行带
+        # 八字段前缀，续行既没有时间戳也没有字段 —— 那是真实机台的形态，不是格式
+        # 错误。逐行判会把合法日志误报成失败。抽样口径不变（仍是前 200 行）。
         with local.open(encoding="utf-8") as handle:
-            for index, line in enumerate(handle):
-                if index >= 200:
-                    break
-                total += 1
-                if pattern.match(line.rstrip("\n")):
-                    matched += 1
+            head_lines = [line.rstrip("\n") for _, line in zip(range(200), handle)]
+        records = _group_records(_physical_lines("\n".join(head_lines)))
+        bad = [lines[0] for lines in records if not pattern.match(lines[0])]
         _record(
-            f"{category} 日志行匹配内置正则 · {relative}",
-            total > 0 and matched == total,
-            f"{matched}/{total}",
+            f"{category} 日志记录匹配内置正则 · {relative}",
+            bool(records) and not bad,
+            f"{len(records)} 条记录 / {len(head_lines)} 行，首行不合规 {len(bad)}"
+            + (f"：{bad[0][:110]}" if bad else ""),
         )
 
     executor_root = fleet.UPPER.elog_root
@@ -442,8 +595,12 @@ def check_live_tail() -> None:
         time.sleep(0.6)
         if not running:
             for probe, _channel in opened:
+                # 探针行也要带真实的毫秒尾巴：写死 ``.000`` 的话，这条自己人写的行
+                # 混进日志里反而比模拟数据更显眼（"就这一行是整的"）。
+                moment = datetime.now()
                 line = (
-                    f"[{datetime.now():%Y-%m-%d %H:%M:%S}.000] [INFO] [{probe.subsystem.upper()}] "
+                    f"[{moment:%Y-%m-%d %H:%M:%S}.{moment.microsecond // 1000:03d}] "
+                    f"[INFO] [{probe.subsystem.upper()}] "
                     f"[1] [2] [{probe.module}] [normal] [{probe.module}:selftest:1] {marker}\n"
                 )
                 with probe.local_path.open("a", encoding="utf-8") as handle:
@@ -501,7 +658,7 @@ def check_live_tail() -> None:
 
 
 def check_live_stream() -> None:
-    """实时日志源：3 类互相关联的异常 + 正常节拍（单模块视角也齐备），活动文件不超过 1000 行。"""
+    """实时日志源：3 类互相关联的异常 + 正常节拍（单模块视角也齐备），活动文件不越界。"""
     from . import livesim
     from apps.logsources.services.log_format_parser import DEBUG_PATTERN
 
@@ -534,19 +691,33 @@ def check_live_stream() -> None:
             except OSError:
                 pass
     _record(
-        "实时日志源活动文件与归档 ≤ 1000 行",
+        f"实时日志源活动文件与归档 ≤ {livesim.MAX_LIVE_LINES} 行",
         not oversize,
         "、".join(oversize) or f"{len(contents)} 条流均在上限 {livesim.MAX_LIVE_LINES} 内",
     )
     if not contents:
         return
 
-    # 2) 行格式必须匹配后端八字段调试日志（否则前端解析不出 level/module）
+    # 2) **记录首行**必须匹配后端八字段调试日志（否则前端解析不出 level/module）。
+    #    按记录判而不按物理行判：spwsp 的测量快照一次落十几行、只有首行带八字段
+    #    前缀（``loggen.scan_metric_body``），续行本来就是裸文本 —— 逐行判会把
+    #    这条**故意**用来复现解析截断的夹具误报成格式违规。
     pool = [line for text in contents.values() for line in text.splitlines() if line.strip()]
-    bad = [line for line in pool if not pattern.match(line)]
-    _record("实时日志源行格式合规", bool(pool) and not bad, f"{len(pool)} 行，不合规 {len(bad)}")
+    # 逐条流**分别**归组：跨流拼在一起的话，某条流开头的续行会被错记成上一条流
+    # 末尾那条记录的续行，违规就有机会被吞掉。
+    records = [
+        record
+        for text in contents.values()
+        for record in _group_records(_physical_lines(text))
+    ]
+    bad = [lines[0] for lines in records if not pattern.match(lines[0])]
+    _record(
+        "实时日志源记录首行格式合规",
+        bool(records) and not bad,
+        f"{len(records)} 条记录 / {len(pool)} 物理行，首行不合规 {len(bad)}",
+    )
 
-    # 采样窗口：**整段**活动文件（上限 1000 行，本来就装得下一轮）+ 整段归档。
+    # 采样窗口：**整段**活动文件（上限见 MAX_LIVE_LINES，本来就装得下一轮）+ 整段归档。
     # 不能只取尾部几十行：一轮剧本会在 5 条流上各写十几行，窗口太小会恰好卡在
     # 两轮之间，"同一 trace 横跨几条流"这种跨轮判断就取不到完整样本；
     # 某个流刚轮转时活动段可能只有几行，靠归档段把这一轮剧本补齐。
@@ -619,8 +790,8 @@ def check_live_stream() -> None:
                 f"级别 {observer_levels} · 正常 {observer_normal} 行",
             )
 
-        # 4c) 日志内容规则：正文必须带 [函数名] >() / <() 调用链边界，
-        #     前端折叠函数卡片认的就是这对方向符。
+        # 4c) 日志内容规则：正文必须以 ``函数名() >()`` / ``函数名() <()`` 成对出现，
+        #     前端折叠函数卡片认的就是"方向符 + 前面那个带括号的函数名"。
         marker_in = sum(1 for line in sample_lines if ENTRY_MARKER_REGEX.search(line))
         marker_out = sum(1 for line in sample_lines if EXIT_MARKER_REGEX.search(line))
         _record(
@@ -643,12 +814,162 @@ def check_live_stream() -> None:
         _record("实时日志源轮转原子性", ok, f"{probe.name} 归零 / 归档 {archived.name} 保留原内容")
 
 
+def check_live_cadence() -> None:
+    """实时日志源：**每条流 0.5s 一行**，且窗口滑动后总量恒定有界。
+
+    这条对着用户提的两个要求逐条量：
+
+    1. **0.5 秒加一条** —— 从盘上的真实文件量相邻两行时间戳的间隔中位数。
+       注意老实现是一条扁平游标、一个 tick 只落一行，5 条轮流写，所以任何一条
+       都要等 5 个 tick 才轮到自己；现在 ``emit_tick`` 每 tick 让每条流各落一行，
+       间隔中位数应当落在 0.5s 附近（节拍抖动 ±35%，再叠加每条流各自的 ±120ms
+       落笔抖动与写盘开销）。
+       ⚠️ 只量**文件尾部的连续实时段**：当前段里 ``init`` 写进去的历史段是
+       "一分钟一行"的慢节奏，直接取最后 N 个间隔会在刚 init / 刚重启日志源的
+       几十秒里全取到历史段，把中位数拉成 ~60s（假失败）。样本不足就报跳过，
+       不报失败。
+    2. **滑动窗口 / 不无限追加** —— 每条流的落盘行数必须恒定有界：
+       当前段 ≤ cap、最新归档 ≤ cap、回收站固定槽位 ≤ cap，
+       所以"当前段 + 最新归档"永远 ≤ 2 cap，挂多久都不会越攒越多。
+    3. **各流各有各的时钟** —— 5 条流是同一个进程写的，如果都用同一个
+       ``datetime.now()``，跨模块查询里它们的时间戳会逐列对齐到同一毫秒
+       （一眼看出是模拟数据）。这里查最近若干行的时刻集合没有公共交集。
+
+    日志源没在跑时不量节奏（盘上的行是上一轮留下的，间隔已经失真），
+    直接报跳过。
+    """
+    from . import livesim
+
+    cap = livesim.MAX_LIVE_LINES
+    interval = livesim.DEFAULT_INTERVAL_SECONDS
+    state = livesim.load_state()
+    running = _stream_running()
+
+    def stamps_of(target: livesim.StreamTarget) -> list[float]:
+        """按真实查询路径取时刻：最新归档在前、当前段在后（时间上正好连续）。"""
+        slot = state.target(target.key)
+        chunks: list[str] = []
+        if slot.archived and Path(slot.archived).exists():
+            chunks.append(Path(slot.archived).read_text(encoding="utf-8", errors="replace"))
+        path = target.local_path
+        if path.exists():
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        values: list[float] = []
+        for text in chunks:
+            for line in text.splitlines():
+                if not line.startswith("[") or len(line) < 24:
+                    continue
+                try:
+                    moment = datetime.strptime(line[1:24], "%Y-%m-%d %H:%M:%S.%f")
+                except ValueError:
+                    continue
+                values.append(moment.timestamp())
+        return values
+
+    # ---- 1) 节奏：每条流最后若干行的间隔中位数 ----
+    if not running:
+        _record(
+            "实时日志源每条流 0.5s 一行",
+            True,
+            "日志源没在运行，节奏检查跳过（先 scripts/sim.sh start stream）",
+        )
+    else:
+        slowest: list[str] = []
+        samples: list[str] = []
+        problems: list[str] = []
+        skipped: list[str] = []
+        for target in livesim.TARGETS:
+            values = stamps_of(target)
+            gaps = [round(b - a, 3) for a, b in zip(values[:-1], values[1:])]
+            # 只量**文件尾部的连续实时段**。
+            #
+            # ⚠️ 当前段里其实混着两种节奏：``init`` 写进去的历史段是"一分钟一行"
+            # 的慢节奏，紧接着才是日志源实时追加的 0.5s 行。直接取"最后 120 个间隔"
+            # 会在**刚 init / 刚重启日志源**的几十秒里全取到历史段 —— 中位数被拉成
+            # ~60s，报一条看着很吓人的假失败（实测 58.27s）。从尾部往前走到第一个
+            # 明显不属于实时节拍的间隔就停，剩下的就是实时段。
+            tail: list[float] = []
+            for gap in reversed(gaps):
+                if gap > interval * 4:
+                    break
+                tail.append(gap)
+            tail.reverse()
+            if len(tail) < 20:
+                # 日志源刚起来、实时段还没攒够样本。不作为失败：断言的主体
+                # （实时日志源的节拍）此刻还没有足够的观测，报"跳过"更诚实。
+                skipped.append(f"{target.module} {len(tail)} 个间隔")
+                continue
+            ordered = sorted(tail)
+            median = ordered[len(ordered) // 2]
+            samples.append(f"{target.module} {median:.2f}s")
+            # 节拍抖动 ±35% + 落笔抖动 ±120ms，取个宽松上下界；
+            # 中位数本身应当稳定在 interval 上（均值不变）。
+            if not interval * 0.5 <= median <= interval * 2.0:
+                slowest.append(f"{target.module}={median:.2f}s")
+        _record(
+            f"实时日志源每条流 {interval:g}s 一行",
+            not slowest and not problems,
+            "、".join(problems + slowest)
+            or f"间隔中位数 [{'、'.join(samples)}]（应≈{interval:g}s）"
+            + (f" · 实时段样本不足已跳过：{'、'.join(skipped)}" if skipped else ""),
+        )
+
+        # ---- 1b) 各流各有各的时钟：最近若干行的落笔时刻不该完全重合 ----
+        recent: dict[str, set[float]] = {}
+        for target in livesim.TARGETS:
+            values = stamps_of(target)
+            if values:
+                recent[target.module] = {round(item, 3) for item in values[-20:]}
+        if len(recent) >= 2:
+            shared = set.intersection(*recent.values())
+            first = livesim.TARGETS[0].module
+            last = livesim.TARGETS[-1].module
+            offset = ""
+            if first in recent and last in recent:
+                offset = f" · {first}/{last} 最新一行相差 {abs(max(recent[first]) - max(recent[last])) * 1000:.0f}ms"
+            _record(
+                "实时日志源各模块时钟不重合",
+                not shared,
+                f"公共时刻 {len(shared)} 个（应为 0）{offset}"
+                if shared
+                else f"{len(recent)} 条流的最近 20 行时刻互不重合{offset}",
+            )
+
+    # ---- 2) 滑动窗口：落盘量恒定有界 ----
+    window_rows: list[str] = []
+    over: list[str] = []
+    for target in livesim.TARGETS:
+        slot = state.target(target.key)
+        current = livesim.count_lines(target.local_path)
+        archived = livesim.count_lines(Path(slot.archived)) if slot.archived else 0
+        recycled = livesim.count_lines(livesim.RECYCLE_DIR / f"{target.module}_prev.log")
+        window = current + archived
+        window_rows.append(f"{target.module} {window}（当前 {current} + 归档 {archived}）")
+        if current > cap or archived > cap or recycled > cap or window > cap * 2:
+            over.append(f"{target.module}: 当前 {current} / 归档 {archived} / 回收站 {recycled}")
+    _record(
+        f"实时日志源滑动窗口恒定 ≤ {cap * 2} 行/流",
+        not over,
+        "、".join(over) or "；".join(window_rows),
+    )
+
+    # ---- 3) 窗口确实滑过：至少有一条流已经轮转过 ----
+    rotations = {target.module: state.target(target.key).rotations for target in livesim.TARGETS}
+    total = sum(rotations.values())
+    _record(
+        "实时日志源窗口已滑动（写满即轮转）",
+        bool(total) or not running,
+        "、".join(f"{name}×{count}" for name, count in rotations.items() if count)
+        or f"还没有任何一条流写满 {cap} 行（日志源刚启动，缩小容量实测见下一条）",
+    )
+
+
 def check_live_rotation_cycle() -> None:
     """高速驱动一份缩小容量的副本，验证「写满即轮转、只留最新归档、活动文件永不越界」。
 
-    在真实日志树上等 spwsp 写到 1000 行要十几分钟，所以这里把日志根指向临时目录、
-    容量压到 50 行，用零间隔把同一套 ``run_forever`` / ``emit_once`` / ``rotate``
-    代码路径跑满若干轮 —— 验的是行为本身，不是被压小的那个数字。
+    在真实日志树上等 spwsp 写到 ``MAX_LIVE_LINES`` 行要十几分钟，所以这里把日志根
+    指向临时目录、容量压到 50 行，用零间隔把同一套 ``run_forever`` / ``emit_tick`` /
+    ``rotate`` 代码路径跑满若干轮 —— 验的是行为本身，不是被压小的那个数字。
     """
     from . import livesim
 
@@ -707,9 +1028,13 @@ def check_live_rotation_cycle() -> None:
             + (f" · 越界 {'、'.join(oversize)}" if oversize else ""),
         )
         _record(
-            "实时日志源归档正好卡在上限",
-            bool(archived_sizes) and all(size == capacity for size in archived_sizes),
-            f"归档行数 {sorted(set(archived_sizes))}（应为 [{capacity}]）",
+            # 判据是"**不超过**上限"，不是"正好写满"：记录宽度不再恒为 1 行 ——
+            # spwsp 的测量快照一条就落十几行（loggen.scan_metric_body），轮转只能
+            # 在"加上这一笔会越界"时提前触发，所以归档落在 (0, capacity] 区间内。
+            # 真正要守的是**有界**：既不许越界，也不许攒着不收档。
+            "实时日志源归档不超过上限",
+            bool(archived_sizes) and all(0 < size <= capacity for size in archived_sizes),
+            f"归档行数 {sorted(set(archived_sizes))}（上限 {capacity} 行）",
         )
         _record(
             "实时日志源只保留最新归档",
@@ -727,7 +1052,7 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
     pairs = 0
     boundary_levels: set[str] = set()
     # 入口/出口行必须带**固定关键字模板**：
-    #   ``[ScanWafer] >() enter wafer scan start ...``  /  ``... wafer scan end ...``
+    #   ``ScanWafer() >() enter wafer scan start ...``  /  ``... wafer scan end ...``
     # 关键字让人一眼看出这一步在做什么；出口复用同一个关键字，不用回头翻入口
     # 就能配对上。缺失就说明 PHASE_KEYWORDS 漏登记（会退回函数名当关键字）。
     template_problems: list[str] = []
@@ -737,12 +1062,13 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
         level = item[3] if len(item) > 3 else "INFO"
         rendered = log_message(function, phase, body_text(body))
         keyword = keyword_of(function)
+        call = f"{function}()"
         if phase == PHASE_ENTER:
             match = ENTRY_MARKER_REGEX.search(rendered)
             if not match:
                 problems.append(f"{function} 入口缺 >()")
-            elif BOUNDARY_NAME_REGEX.findall(rendered[: match.start()])[-1:] != [function]:
-                problems.append(f"{function} 入口的函数名没紧邻 >()")
+            elif BOUNDARY_NAME_REGEX.findall(rendered[: match.start()])[-1:] != [call]:
+                problems.append(f"{function} 入口的函数名没紧邻 >()（应为 {call}）")
             else:
                 boundary_levels.add(level)
                 stack.append(function)
@@ -752,8 +1078,8 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
             match = EXIT_MARKER_REGEX.search(rendered)
             if not match:
                 problems.append(f"{function} 出口缺 <()")
-            elif BOUNDARY_NAME_REGEX.findall(rendered[: match.start()])[-1:] != [function]:
-                problems.append(f"{function} 出口的函数名没紧邻 <()")
+            elif BOUNDARY_NAME_REGEX.findall(rendered[: match.start()])[-1:] != [call]:
+                problems.append(f"{function} 出口的函数名没紧邻 <()（应为 {call}）")
             if not stack or stack[-1] != function:
                 problems.append(f"{function} 出口对不上（栈顶 {stack[-1] if stack else '空'}）")
             else:
@@ -765,6 +1091,10 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
         else:
             if ENTRY_MARKER_REGEX.search(rendered) or EXIT_MARKER_REGEX.search(rendered):
                 problems.append(f"{function} 正文行带了方向符")
+            else:
+                head = BOUNDARY_NAME_REGEX.match(rendered)
+                if head is None or head.group(0) != call:
+                    problems.append(f"{function} 正文行没以 {call} 开头：{rendered[:60]}")
 
     if stack:
         problems.append("未闭合：" + "、".join(stack))
@@ -790,7 +1120,7 @@ def _validate_call_chain(label: str, steps) -> None:  # noqa: ANN001 - 迭代器
 
 
 def _validate_stage_frames(label: str, steps, codes) -> None:  # noqa: ANN001 - 迭代器即可
-    """阶段框：``[Stage_XXX] >() enter <阶段名> start step=n/N ...`` 成对且序号递增。
+    """阶段框：``Stage_XXX() >() enter <阶段名> start step=n/N ...`` 成对且序号递增。
 
     这是"日志体现不同流程阶段"的落点：每到一个新阶段就开一个框，阶段内所有
     子调用都嵌在框里。两条硬约束：
@@ -835,8 +1165,166 @@ def _validate_stage_frames(label: str, steps, codes) -> None:  # noqa: ANN001 - 
     )
 
 
+def check_machine_log_ownership() -> None:
+    """可检索的日志树只能由**一台**机器承载，否则检索结果会把同一份日志读两遍。
+
+    背景：后端 ``debug`` / ``run`` 两条日志路径配置的 scope 是 ``each_machine``，
+    会遍历环境里的上位机与所有下位机。模拟机群里两台机器共用同一个日志根模板
+    （``/log/{username}/debug``），host 又常常落成同一个地址，所以只要两台都生成
+    同构的 ``<子系统>/<fm>.log``，同一份日志就会被读两遍 —— 检索结果里每个
+    ``>() enter`` / ``<() leave`` 都出现两次（时间戳、线程号完全相同），前端按路径
+    归并后就是用户看到的"同一个出口打印两遍"。
+
+    这里断言 ``fleet.hosts_subsystem_logs`` 的归属以及 ``loggen.plan_machine``
+    的实际产物：下位机不得再产出 ``<debug root>/`` 与 ``<run root>/`` 下的任何文件。
+    """
+    from . import loggen
+
+    upper_owns = fleet.hosts_subsystem_logs(fleet.UPPER)
+    lower_owns = fleet.hosts_subsystem_logs(fleet.LOWER1)
+    _record(
+        "可检索日志树只归属上位机",
+        upper_owns and not lower_owns,
+        f"上位机={upper_owns} 下位机={lower_owns}",
+    )
+
+    now = datetime.now()
+    debug_root = fleet.UPPER.debug_root
+    run_root = fleet.UPPER.run_root
+    queryable_roots = {debug_root, run_root}
+
+    lower_plan = loggen.plan_machine(fleet.LOWER1, now=now)
+    lower_leaks = sorted(
+        f"{root}/{relative}"
+        for root, relative, _payload, _count in lower_plan
+        if root in queryable_roots
+    )
+    _record(
+        "下位机不产出可检索日志",
+        not lower_leaks,
+        f"{len(lower_plan)} 项产物，无 debug/run" if not lower_leaks else f"泄漏 {lower_leaks[:3]}",
+    )
+
+    upper_plan = loggen.plan_machine(fleet.UPPER, now=now)
+    upper_queryable = {
+        (root, str(relative))
+        for root, relative, _payload, _count in upper_plan
+        if root in queryable_roots
+    }
+    lower_queryable = {
+        (root, str(relative))
+        for root, relative, _payload, _count in lower_plan
+        if root in queryable_roots
+    }
+    _record(
+        "上位机仍有可检索日志",
+        len(upper_queryable) > 0,
+        f"{len(upper_queryable)} 个可检索产物",
+    )
+    _record(
+        "两台机器的可检索产物不相交",
+        not (upper_queryable & lower_queryable),
+        f"交集 {len(upper_queryable & lower_queryable)} 项",
+    )
+
+
+def check_call_signature_shape() -> None:
+    """调用链边界必须写成 ``函数名() >()`` —— 函数方法名带括号，且不许退回方括号写法。
+
+    用户点名纠正过：
+
+        对：``Stage_WSP_UNLOAD_MOVE() >() enter unload move stage start step=6/6 wafer=W04 …``
+        错：``[Stage_WSP_UNLOAD_MOVE] >() enter unload move stage start step=6/6 wafer=W04 …``
+
+    方向符 ``>()`` / ``<()`` **前面**那个词是**被调用的函数**，所以要写成调用形状。
+    这不只是观感问题：前端 ``logParser.ts`` 首选 ``FUNCTION_PREFIX_REGEX``
+    （``^函数名\\(``）去取 ``functionName``，方括号写法只能落进
+    ``parseBoundaryFunctionName`` 的兜底分支 —— 那种情况下 ``functionName`` 是空的、
+    只有 ``boundaryFunctionName`` 有值，「连续同名函数日志」「闭合后的同名尾随日志」
+    两条内置折叠规则就失效（阶段框最明显：它整行的身份就靠这个标识）。
+
+    量两路：
+
+    * **剧本层** —— ``loggen.ALL_PROGRAMS``（各子系统批量程序）与 ``livesim._SCRIPT``
+      （实时剧本）逐行渲染。两者**都已经过** ``expand_stage_groups``，所以阶段框
+      （``Stage_XXX()``）也在里面，不用再单独展开一遍。要求：正文以 ``函数名()``
+      开头；带方向符的行，方向符紧跟在 ``函数名()`` 之后；整行不得出现
+      ``[函数名] >()`` / ``[函数名] <()`` 这种旧写法；
+    * **落盘层** —— 真实文件（当前段 + 归档）按**记录**正文抽查同样两条。剧本对
+      不代表写出来的对：改过正文格式却没 ``init`` 重建日志树时，盘上还是旧格式
+      （这条会直接把"忘了重建"顶出来，而不是让用户在前端看到混合写法）。
+    """
+    from . import livesim, loggen
+    from .loggen import PHASE_BODY, body_text, log_message
+
+    problems: list[str] = []
+    total = 0
+
+    def _inspect(label: str, function: str, phase: str, body: str) -> None:
+        nonlocal total
+        rendered = log_message(function, phase, body_text(body))
+        call = f"{function}()"
+        total += 1
+        if LEGACY_BRACKET_CALL_REGEX.search(rendered):
+            problems.append(f"{label} {function} 用了方括号旧写法：{rendered[:70]}")
+            return
+        for marker in (ENTRY_MARKER_REGEX, EXIT_MARKER_REGEX):
+            match = marker.search(rendered)
+            if match is None:
+                continue
+            if BOUNDARY_NAME_REGEX.findall(rendered[: match.start()])[-1:] != [call]:
+                problems.append(f"{label} {function} 方向符前不是 {call}：{rendered[:70]}")
+        if phase == PHASE_BODY:
+            head = BOUNDARY_NAME_REGEX.match(rendered)
+            if head is None or head.group(0) != call:
+                problems.append(f"{label} {function} 正文没以 {call} 开头：{rendered[:70]}")
+
+    for label, program in loggen.ALL_PROGRAMS:
+        for function, phase, _level, body in program:
+            _inspect(label, function, phase, body)
+    for _key, _level, function, phase, body in livesim._SCRIPT:
+        _inspect("实时剧本", function, phase, body)
+    _record(
+        "调用链边界写成 函数名() >()（剧本层）",
+        not problems,
+        "；".join(problems[:3]) if problems
+        else f"{total} 行均为 函数名() 调用形状（{len(loggen.ALL_PROGRAMS)} 份批量程序 + 实时剧本）",
+    )
+
+    # ---- 落盘层：真实文件里按**记录**抽查（续行没有八字段前缀，不能当记录首行） ----
+    landed: list[str] = []
+    records_seen = 0
+    for module in ("spwsp", "wsp"):
+        target = livesim._TARGET_BY_KEY[module]
+        slot = livesim.load_state().target(module)
+        paths = [target.local_path]
+        if slot.archived:
+            paths.append(Path(slot.archived))
+        for path in paths:
+            if not path.exists():
+                continue
+            lines = [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+            for record in _group_records(lines):
+                message = _record_head(record[0])
+                records_seen += 1
+                if LEGACY_BRACKET_CALL_REGEX.search(message):
+                    landed.append(f"{path.name} 方括号旧写法：{message[:70]}")
+                    continue
+                head = BOUNDARY_NAME_REGEX.match(message)
+                if head is None:
+                    landed.append(f"{path.name} 正文没以 函数名() 开头：{message[:70]}")
+    _record(
+        "调用链边界写成 函数名() >()（落盘层）",
+        not landed and records_seen > 0,
+        "；".join(landed[:3]) if landed
+        else f"{records_seen} 条记录全部以 函数名() 开头、无方括号旧写法"
+        if records_seen
+        else "没有可抽查的日志文件（先跑 cli init / 启动日志源）",
+    )
+
+
 def check_log_call_chain() -> None:
-    """日志内容规则：``[函数名] >()`` 入口 / ``[函数名] <()`` 出口，同名 LIFO 配对。
+    """日志内容规则：``函数名() >()`` 入口 / ``函数名() <()`` 出口，同名 LIFO 配对。
 
     这是前端折叠函数卡片的唯一依据（``foldingRules.ts`` 的内置规则
     ``builtin-explicit-boundary``，关键字就是 ``> ()`` / ``< ()``）。名字不一致
@@ -844,7 +1332,7 @@ def check_log_call_chain() -> None:
 
     这里直接校验三份剧本本身（通用批量 ``loggen._DEBUG_PROGRAM``、各子系统专属
     批量程序、实时 ``livesim._SCRIPT`` 的每条流），不用等日志落盘，也不用等
-    1000 行轮转。
+    写满一轮窗口（``livesim.MAX_LIVE_LINES`` 行）轮转。
     """
     from . import livesim, loggen
 
@@ -933,14 +1421,86 @@ def check_log_call_chain() -> None:
         _record("日志正文含调用链边界", False, f"{sample} 不存在")
         return
     lines = [line for line in sample.read_text(encoding="utf-8", errors="replace").splitlines()[-400:] if line.strip()]
+    records = _group_records(lines)
     entries = sum(1 for line in lines if ENTRY_MARKER_REGEX.search(line))
     exits = sum(1 for line in lines if EXIT_MARKER_REGEX.search(line))
-    # 第 9 段才是正文（前 8 个 [...] 是固定字段），所以从正文里找 [函数名]
-    named = sum(1 for line in lines if BOUNDARY_NAME_REGEX.search(line.split("] ", 8)[-1]))
+    # 第 9 段才是正文（前 8 个 [...] 是固定字段），所以就从这一段的**行首**找
+    # ``函数名()``。只查**每条记录的首行**：spwsp 的测量快照是跨行正文，续行没有
+    # 八字段前缀、也没有函数名，要求"每一物理行都带函数名"会把这条合法记录判成失败
+    # （而它是故意留的夹具）。
+    named = sum(
+        1
+        for lines_of_record in records
+        if BOUNDARY_NAME_REGEX.search(_record_head(lines_of_record[0]))
+    )
     _record(
         "日志正文含调用链边界",
-        entries > 0 and exits > 0 and named == len(lines),
-        f"最近 {len(lines)} 行：入口 {entries} / 出口 {exits} / 带函数名 {named}",
+        entries > 0 and exits > 0 and bool(records) and named == len(records),
+        f"最近 {len(records)} 条记录 / {len(lines)} 物理行：入口 {entries} / 出口 {exits} / 带函数名 {named}",
+    )
+
+
+def check_multiline_record_fixture() -> None:
+    """跨行记录夹具：spwsp 的测量快照必须真的**跨多行**，且七路干涉仪通道一个不少。
+
+    这条守的是"复现解析截断"的那个场景本身（正文构造见
+    ``loggen.scan_metric_body``）：一条记录横跨十几行，**只有首行带八字段前缀**
+    （时间戳在最前），后面各行都是没有时间戳的续行。后端按"行首时间戳"切记录，
+    续行会被丢掉，正文因此被截断 —— 这正是要能稳定复现的形态。
+
+    为什么值得单独钉一条：
+
+    * 夹具若被"顺手改成单行"，截断就复现不出来了，而所有既有的行格式断言反而会
+      **变绿**（逐行判八字段重新成立）—— 场景消失了却没有任何告警；
+    * 六自由度 / 功率 / 对比度 / 七路通道是用户点名要的字段，缺一个夹具就不完整；
+    * 还要查"剧本里真的有人用它"，否则夹具写了却没接线，日志里根本不会出现。
+
+    三条一起查：**形态**（物理行数 > 1，且续行不以 ``[`` 开头）、**内容**（六自由度 +
+    功率 + 对比度 + ``x1``…``x4`` / ``y1``…``y3`` 全在）、**接线**（spwsp 实时剧本里
+    确实有一行正文用了它）。
+    """
+    from . import livesim, loggen
+
+    body = loggen.body_text(loggen.scan_metric_body("exposure_mid"))
+    rows = body.splitlines()
+    problems: list[str] = []
+
+    if len(rows) <= 1:
+        problems.append(f"正文只有 {len(rows)} 个物理行，不是跨行形态")
+    # 续行一旦以 "[" 开头，就会被解析器当成新记录 / 被 awk 预筛放行，
+    # 就复现不出"续行被丢掉"的效果了。
+    heading_continuations = [row for row in rows[1:] if row.lstrip().startswith("[")]
+    if heading_continuations:
+        problems.append(f"续行以 '[' 开头，不再是无时间戳的裸续行：{heading_continuations[:2]}")
+
+    missing_dof = [axis for axis in loggen.MOVE_POINT_DOF if f"'{axis}':" not in body]
+    if missing_dof:
+        problems.append(f"缺自由度 {missing_dof}")
+    for token in ("'power_mW':", "'contrast':", "'interferometer':"):
+        if token not in body:
+            problems.append(f"缺字段 {token}")
+
+    channels = [axis for axis in loggen.INTERFEROMETER_CHANNELS if f"'{axis}':" in body]
+    if channels != list(loggen.INTERFEROMETER_CHANNELS):
+        problems.append(
+            f"干涉仪通道 {channels} 与 {list(loggen.INTERFEROMETER_CHANNELS)} 不符"
+        )
+
+    wired = any(
+        loggen.SCAN_METRIC_MARKER in loggen.body_text(step_body)
+        for key, _level, _function, _phase, step_body in livesim._SCRIPT
+        if key == "spwsp"
+    )
+    if not wired:
+        problems.append("spwsp 实时剧本里没有任何一行使用该正文")
+
+    _record(
+        "跨行测量快照夹具完整（截断场景可复现）",
+        not problems,
+        "；".join(problems)
+        if problems
+        else f"{len(rows)} 行记录 · 六自由度/功率/对比度齐全 · "
+        f"干涉仪 {'/'.join(loggen.INTERFEROMETER_CHANNELS)} 七路 · 已接入 spwsp 实时流",
     )
 
 
@@ -949,7 +1509,13 @@ def check_wsp_move_points() -> None:
 
     形如::
 
-        move absolute { x:0.003, y:0.999, z:0.000, rz:0.0021, speed:120.0, mode:absolute, point:load_position, status:settled }
+        move absolute { x:0.003, y:0.999, z:0.008, rx:0.0009, ry:-0.0013,
+                        rz:0.0021, speed:120.0, mode:absolute,
+                        point:load_position, status:settled }
+
+    工件台是 **6-DOF 台**，所以点位行必须给全 ``x, y, z, rx, ry, rz``
+    六个自由度（而且顺序就是这个）；少写几个轴会被本条与
+    ``wsp 点位行六自由度齐全`` 一起拦下来。
 
     字段顺序、数值精度、点位名都固定（点位表在 ``loggen.WSP_MOVE_POINTS``），
     这样才能当检索锚点用 —— 用户按 ``x:`` / ``point:load_position`` 就能捞出来。
@@ -1032,6 +1598,28 @@ def check_wsp_move_points() -> None:
         else f"{target.remote_path} 里没有点位行（先跑 scripts/sim.sh init）",
     )
 
+    # 2b) 六自由度：点位行必须按 x, y, z, rx, ry, rz 的顺序给全六个轴。
+    #     工件台是 6-DOF 台，只写平动或只写一个转角都会让这行"看起来像点位、其实不是"。
+    #     正则在 :func:`loggen.dof_of_point` 里（``rx`` 要排在 ``x`` 前面交替，
+    #     否则 ``rx:`` 会被单字母分支先吃掉一个 ``x``），这里只比轴序。
+    dof_texts: list[str] = []
+    for _label, program in loggen.ALL_PROGRAMS:
+        dof_texts += [loggen.body_text(body) for _f, _p, _l, body in program if "move absolute" in body]
+    dof_texts += [
+        loggen.body_text(body)
+        for _key, _level, _function, _phase, body in livesim._SCRIPT
+        if "move absolute" in body
+    ]
+    expected_dof = list(loggen.MOVE_POINT_DOF)
+    dof_seen = {tuple(loggen.dof_of_point(text)) for text in dof_texts}
+    dof_bad = sorted(item for item in dof_seen if list(item) != expected_dof)
+    _record(
+        "wsp 点位行六自由度齐全",
+        bool(dof_texts) and not dof_bad,
+        f"轴序不符 {dof_bad[:2]}（应为 {expected_dof}）" if dof_bad
+        else f"{len(dof_texts)} 条点位行 · 轴序 {','.join(expected_dof)}",
+    )
+
     # 3) 挂载层：子系统 / 实时流 / 专属程序都得在
     anchored = (
         "wsp" in fleet.SUBSYSTEM_MODULES
@@ -1047,6 +1635,316 @@ def check_wsp_move_points() -> None:
             f"实时流 {'在' if 'wsp' in livesim._TARGET_BY_KEY else '缺'}",
             f"专属程序 {'在' if loggen.program_for('wsp') is not loggen._DEBUG_PROGRAM else '缺（仍在用通用扫片程序）'}",
         ]),
+    )
+
+
+def check_wsp_spiral_trajectory() -> None:
+    """``wsp`` 的曝光扫描轨迹必须是**从场中心向外螺旋步进**的螺线。
+
+    这是"用户要的那条轨迹"的形状断言。少了它，把螺线**退化成别的形状**不会触发
+    任何既有断言 —— 行格式照样合规、六自由度照样齐全、点位覆盖照样完整，
+    场景没了却零告警：改成同心圆（半径阶跃）、改成一条直线、或者把点序打乱，
+    三样都能一路全绿。
+
+    查四件事：
+
+    * **形态**：``spiral_01`` … ``spiral_NN`` 一个号不缺，点数 = 圈数 × 每圈步数；
+      椭圆半径比例**逐步递增**（逐步递增才是螺旋，阶跃就是同心圆），
+      且末步贴到 1.0（曝光场边缘）；
+    * **范围与起点**：每一步都落在曝光场矩形内；轨迹第一个点（``exposure_mid``）
+      就在螺线中心上；
+    * **剧本按序**：批量程序与实时剧本里，``SCAN_TRAJECTORY_POINTS`` 必须作为
+      **连续一段**按同一顺序出现 —— 顺序乱了、或者中间夹进别的点位，"轨迹"就断了，
+      而 LIFO 配对 / 阶段框序号那些断言一个都不会察觉；
+    * **无负零**：坐标里不许出现 ``-0.000`` 这种凑出来的"负零"。
+    """
+    from . import loggen
+
+    cx, cy = loggen.SPIRAL_CENTER
+    radius_x, radius_y = loggen.SPIRAL_RADIUS_X, loggen.SPIRAL_RADIUS_Y
+    total = loggen.SPIRAL_STEPS
+
+    # ---- 1) 形态：连续性 + 逐步向外 + 末步贴边缘 ----
+    # 半径比例 t = √(((x-cx)/RX)² + ((y-cy)/RY)²)：把椭圆坐标归一化回"到中心的
+    # 相对半径"，于是不必分别关心长短轴，只比这一个数就能判"是不是在向外盘"。
+    # 坐标落盘时被截到 3 位小数，反算有约 1.5e-3 的量化误差，容差取 1e-2。
+    names = [row[0] for row in loggen.SPIRAL_POINTS]
+    expected_names = [
+        f"{loggen.SPIRAL_POINT_PREFIX}{step:02d}" for step in range(1, total + 1)
+    ]
+    ratios = [
+        math.hypot((row[1] - cx) / radius_x, (row[2] - cy) / radius_y)
+        for row in loggen.SPIRAL_POINTS
+    ]
+    expected_ratios = [step / total for step in range(1, total + 1)]
+    shape_problems: list[str] = []
+    if names != expected_names:
+        shape_problems.append(f"点位名序不符（缺 {sorted(set(expected_names) - set(names))[:3]}）")
+    if total != loggen.SPIRAL_TURNS * loggen.SPIRAL_STEPS_PER_TURN:
+        shape_problems.append(f"点数 {total} ≠ 圈数 × 每圈步数")
+    out_of_line = [
+        names[index]
+        for index, (got, want) in enumerate(zip(ratios, expected_ratios))
+        if abs(got - want) > 1e-2
+    ]
+    if out_of_line:
+        shape_problems.append(f"半径不成等差外扩（{out_of_line[:3]}）")
+    if not all(b > a for a, b in zip(ratios[:-1], ratios[1:])):
+        shape_problems.append("半径非单调递增（更像同心圆，不是向外螺旋）")
+    if abs(ratios[-1] - 1.0) > 1e-2:
+        shape_problems.append(f"末步半径 {ratios[-1]:.3f} 没贴到边缘 1.0")
+    _record(
+        "wsp 螺旋轨迹由中心向外步进",
+        not shape_problems,
+        "；".join(shape_problems)
+        or f"{total} 步 = {loggen.SPIRAL_TURNS} 圈 × {loggen.SPIRAL_STEPS_PER_TURN} 步，"
+        f"半径比例 {ratios[0]:.3f} → {ratios[-1]:.3f}（等差外扩，末步贴边缘）",
+    )
+
+    # ---- 2) 范围与起点 ----
+    # 曝光场矩形直接取 exposure_start / exposure_end 两点的包围盒 —— 轨迹的合法
+    # 范围就是这两点框出来的行程，不再另抄一份边界值（否则两边会各改各的）。
+    field = loggen._MOVE_POINT_BY_NAME
+    x_bounds = sorted((field["exposure_start"][0], field["exposure_end"][0]))
+    y_bounds = sorted((field["exposure_start"][1], field["exposure_end"][1]))
+    outside = [
+        row[0]
+        for row in loggen.SPIRAL_POINTS
+        if not (
+            x_bounds[0] - 1e-9 <= row[1] <= x_bounds[1] + 1e-9
+            and y_bounds[0] - 1e-9 <= row[2] <= y_bounds[1] + 1e-9
+        )
+    ]
+    center = field["exposure_mid"]
+    off_center = math.hypot(center[0] - cx, center[1] - cy)
+    _record(
+        "wsp 螺旋轨迹落在曝光场内且起于中心",
+        not outside and off_center < 1e-9,
+        f"越界 {outside[:3]}" if outside
+        else f"中心偏差 {off_center:.4f}mm（应为 0）" if off_center >= 1e-9
+        else f"x∈[{x_bounds[0]:.3f},{x_bounds[1]:.3f}] y∈[{y_bounds[0]:.3f},{y_bounds[1]:.3f}] · "
+             f"{len(loggen.SPIRAL_POINTS)} 步全在范围内 · 起点 = 场中心",
+    )
+
+    # ---- 3) 剧本按序（连续一段）----
+    def _point_order(rows) -> list[str]:  # noqa: ANN001 - 迭代即可
+        order: list[str] = []
+        for item in rows:
+            body = item[-1]
+            if "move absolute" not in body:
+                continue
+            order.append(loggen.body_text(body).split("point:", 1)[1].split(",", 1)[0])
+        return order
+
+    def _contains_run(haystack: list[str], needle: list[str]) -> bool:
+        span = len(needle)
+        return any(
+            haystack[index:index + span] == needle
+            for index in range(len(haystack) - span + 1)
+        )
+
+    expected_order = list(loggen.SCAN_TRAJECTORY_POINTS)
+    orders = {
+        "批量程序": _point_order(loggen.program_for("wsp")),
+        "实时剧本": _point_order([row for row in livesim._SCRIPT if row[0] == "wsp"]),
+    }
+    order_problems = [
+        f"{label} {len(order)} 项里找不到连续点序"
+        for label, order in orders.items()
+        if not _contains_run(order, expected_order)
+    ]
+    _record(
+        "wsp 螺旋轨迹剧本按序连续",
+        not order_problems,
+        "；".join(order_problems)
+        or f"批量 / 实时均为连续 {len(expected_order)} 项（入场 → 中心 → 螺旋 {total} 步 → 退场）",
+    )
+
+    # ---- 4) 无"负零"坐标 ----
+    # f"{-0.00004:.4f}" 会写出 "-0.0000"：格式正则放行，但人一眼就知道这个数是凑的。
+    negative_zero = [
+        text
+        for text in (
+            loggen.body_text(loggen.point_body(row[0])) for row in loggen.SPIRAL_POINTS
+        )
+        if re.search(r"-0\.0+(?![0-9])", text)
+    ]
+    _record(
+        "wsp 螺旋轨迹坐标无负零",
+        not negative_zero,
+        f"{len(negative_zero)} 步带 -0.000（如 {negative_zero[0][:70]}）" if negative_zero
+        else f"{len(loggen.SPIRAL_POINTS)} 步坐标均无 -0.000",
+    )
+
+
+def check_wsp_point_call_boundaries() -> None:
+    """``wsp`` 的每条点位正文都必须落在**它自己那一次** ``MoveAbsolute`` 调用里。
+
+    这是用户提的那条要求：``MoveAbsolute() move absolute { … }`` 不能是一串
+    **没有入口/出口的散行**。日志规范要求每个动作都有自己的边界
+    （``函数名() >()`` / ``函数名() <()``），所以轨迹里每个点位都是一次独立调用，
+    三行一组：
+
+        MoveAbsolute() >() enter stage absolute move start dof=6 point=spiral_07 profile=scan
+        MoveAbsolute() move absolute { x:…, point:spiral_07, status:settled }
+        MoveAbsolute() <() leave stage absolute move end dof=6 point=spiral_07 elapsed=… status=ok
+
+    ⚠️ 少了这条断言，**退回"一次调用里连打几十条点位"不会触发任何既有断言**：
+    行格式照样合规、六自由度照样齐全、点位覆盖照样完整、LIFO 也照样闭合
+    （一对括号包住几十条正文本来就是合法的嵌套）—— 但那些点位正文就没有自己的
+    边界了：前端折不出"这一次移动"，也答不出"走到这个点位用了多久"。
+
+    量三路，缺一路就可能"剧本对了但落盘没对"：
+
+    * **构造层** —— ``loggen.move_call_rows()`` 必须是三行一组（入口 / 点位正文 /
+      出口），函数名逐行一致，且入口与出口都点名同一个点位；
+    * **剧本层** —— 批量 wsp 程序与实时 wsp 剧本压栈统计：每次 ``MoveAbsolute``
+      调用**恰好带 1 条点位正文**，且不存在"栈里没有同名调用"的点位正文；
+    * **落盘层** —— 真实 ``wsp.log``（当前段 + 最新归档）按 ``rpc`` 字段的函数名
+      压栈：每条点位正文所在行的函数必须是栈顶。剧本对、落盘也对，才算真的对。
+    """
+    from . import loggen
+
+    # ---- 1) 构造层：三行一组，点名一致 ----
+    build_problems: list[str] = []
+    for row in loggen.WSP_MOVE_POINTS:
+        name = row[0]
+        rows = loggen.move_call_rows(name, profile="scan")
+        phases = [phase for _f, phase, _l, _b in rows]
+        functions = {function for function, _p, _l, _b in rows}
+        if len(rows) < 3 or phases[0] != loggen.PHASE_ENTER or phases[-1] != loggen.PHASE_LEAVE:
+            build_problems.append(f"{name} 不是「入口 … 出口」的形状：{phases}")
+            continue
+        if any(phase != loggen.PHASE_BODY for phase in phases[1:-1]):
+            build_problems.append(f"{name} 入口与出口之间夹了非正文行：{phases}")
+        if functions != {"MoveAbsolute"}:
+            build_problems.append(f"{name} 三行的函数名不统一：{sorted(functions)}")
+        if f"point={name}" not in loggen.body_text(rows[0][3]):
+            build_problems.append(f"{name} 入口没点名")
+        if f"point={name}" not in rows[-1][3]:
+            build_problems.append(f"{name} 出口没点名（几十条出口会长得一模一样）")
+    _record(
+        "wsp 每个点位各成一次 MoveAbsolute 调用（构造层）",
+        bool(loggen.WSP_MOVE_POINTS) and not build_problems,
+        "；".join(build_problems[:3])
+        or f"{len(loggen.WSP_MOVE_POINTS)} 个点位均为「入口 / 点位正文 / 出口」三行一组",
+    )
+
+    # ---- 2) 剧本层：每次调用恰好 1 条点位正文 ----
+    def _calls(rows) -> tuple[list[int], int]:  # noqa: ANN001 - 迭代即可
+        """按同名 LIFO 压栈，回报 (每次 MoveAbsolute 调用带的点位正文条数, 无边界条数)。"""
+        stack: list[list] = []
+        widths: list[int] = []
+        orphan = 0
+        for function, phase, body in rows:
+            if phase == loggen.PHASE_ENTER:
+                stack.append([function, 0])
+                continue
+            if phase == loggen.PHASE_LEAVE:
+                if stack and stack[-1][0] == function:
+                    name, count = stack.pop()
+                    if name == "MoveAbsolute":
+                        widths.append(count)
+                continue
+            if "move absolute" not in body:
+                continue
+            # 正文要落在**它自己那个函数**的调用里：wsp 的回零正文也写
+            # ``move absolute { point:origin … }``（记的是参考点坐标），
+            # 它属于 ``HomeStage`` 调用，不算"没有边界"。
+            if stack and stack[-1][0] == function:
+                stack[-1][1] += 1
+            else:
+                orphan += 1
+        return widths, orphan
+
+    programs = {
+        "批量程序": [
+            (function, phase, body) for function, phase, _level, body in loggen.program_for("wsp")
+        ],
+        "实时剧本": [
+            (function, phase, body)
+            for key, _level, function, phase, body in livesim._SCRIPT
+            if key == "wsp"
+        ],
+    }
+    script_problems: list[str] = []
+    counts: list[str] = []
+    for label, rows in programs.items():
+        widths, orphan = _calls(rows)
+        counts.append(f"{label} {len(widths)} 次")
+        if not widths:
+            script_problems.append(f"{label} 里没有一次 MoveAbsolute 调用")
+        crowded = sorted({count for count in widths if count != 1})
+        if crowded:
+            script_problems.append(f"{label} 有调用带了 {crowded} 条点位正文（应为 1）")
+        if orphan:
+            script_problems.append(f"{label} 有 {orphan} 条点位正文没有同名调用包着")
+    _record(
+        "wsp 每条点位正文都在自己的调用里（剧本层）",
+        not script_problems,
+        "；".join(script_problems)
+        or f"每次 MoveAbsolute 恰好 1 条点位正文（{'、'.join(counts)}）",
+    )
+
+    # ---- 3) 落盘层：真实文件里的位置关系 ----
+    target = livesim._TARGET_BY_KEY["wsp"]
+    state = livesim.load_state()
+    paths = [target.local_path]
+    slot = state.target("wsp")
+    if slot.archived and Path(slot.archived).exists():
+        paths.append(Path(slot.archived))
+
+    unwrapped: list[str] = []
+    crowded_lines: list[str] = []
+    scanned = 0
+    calls_seen = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        stack: list[list] = []
+        started = False
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = RPC_FUNCTION_REGEX.search(line)
+            if not match:
+                continue
+            function = match.group(1)
+            if not started:
+                # 文件头往往正是上一次轮转的断口（那一次的入口留在上一份文件里），
+                # 从第一条 ``MoveAbsolute`` 入口才开始看 —— 别把断口当成"缺边界"。
+                if function == "MoveAbsolute" and ENTRY_MARKER_REGEX.search(line):
+                    started = True
+                else:
+                    continue
+            scanned += 1
+            if ENTRY_MARKER_REGEX.search(line):
+                stack.append([function, 0])
+                continue
+            if EXIT_MARKER_REGEX.search(line):
+                if stack and stack[-1][0] == function:
+                    name, count = stack.pop()
+                    if name == "MoveAbsolute":
+                        calls_seen += 1
+                        if count != 1:
+                            crowded_lines.append(f"一次调用带 {count} 条点位正文")
+                continue
+            if "move absolute" not in line:
+                continue
+            if stack and stack[-1][0] == function:
+                stack[-1][1] += 1
+            else:
+                unwrapped.append(line.strip())
+    landed_problems: list[str] = []
+    if unwrapped:
+        landed_problems.append(
+            f"{len(unwrapped)} 条点位正文没有同名调用包着（如 {unwrapped[0][:80]}）"
+        )
+    if crowded_lines:
+        landed_problems.append(f"有调用带多条点位正文：{sorted(set(crowded_lines))}")
+    _record(
+        "wsp 每条点位正文都在自己的调用里（落盘层）",
+        scanned > 0 and not landed_problems,
+        "；".join(landed_problems) if landed_problems
+        else f"扫过 {scanned} 行 / {calls_seen} 次调用，每条点位正文都落在自己的入口与出口之间",
     )
 
 
@@ -1606,6 +2504,8 @@ def run_all() -> int:
         check_awk_window(client)
         check_version_file(client)
         check_close_boundary()
+        check_timestamp_jitter()
+        check_machine_log_ownership()
         check_live_tail()
     finally:
         client.close()
@@ -1631,9 +2531,14 @@ def run_all() -> int:
             check_cpd_report_site,
             check_report_file_analysis,
             check_live_stream,
+            check_live_cadence,
             check_live_rotation_cycle,
             check_log_call_chain,
+            check_call_signature_shape,
             check_wsp_move_points,
+            check_wsp_point_call_boundaries,
+            check_wsp_spiral_trajectory,
+            check_multiline_record_fixture,
         ):
             try:
                 check()

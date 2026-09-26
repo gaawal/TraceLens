@@ -16,7 +16,7 @@ from django.conf import settings
 
 from apps.common.services.ssh import SshOperationError
 from apps.logsources.services.archive_selector import LogArtifact, parse_archive_timestamp, parse_log_name
-from apps.logsources.services.cache_identity import LogCacheScope
+from apps.logsources.services.cache_identity import LogCacheScope, machine_ssh_port
 from apps.logsources.services.redis_store import RedisLogStore
 from apps.logsources.services.search_progress import LogSearchProgressStore
 
@@ -1016,6 +1016,7 @@ class LogFileIndexService:
             source_category=target.source_category,
             subsystem=subsystem,
             fm=fm,
+            port=_machine_ssh_port(target.machine),
         )
 
     def _load_or_probe_direct(self, *, environment, target, lease, subsystem: str, fm: str, stat: RemoteFileStat, kind: str, operation_id: str = "") -> dict:
