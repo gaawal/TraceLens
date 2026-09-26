@@ -11,6 +11,7 @@ import {
   type EnvironmentSummary, type LogAuditList, type LogAuditRecord, type LogWindowRequest,
 } from '../api/resourceApi';
 import { SmartDateTimeInput } from './SmartDateTimeInput';
+import { OperationAuditPanel } from './OperationAuditPanel';
 
 interface Props {
   onRetry: (environment: EnvironmentSummary, request: LogWindowRequest, audit: LogAuditRecord) => void;
@@ -191,7 +192,7 @@ function AuditTable({ rows, environments, onRetry, onOpenData, sortOrder, onSort
   </div>;
 }
 
-export function LogAuditPage({ onRetry, onOpenData }: Props) {
+function LogSearchAuditView({ onRetry, onOpenData }: Props) {
   const initialRange = defaultRange(1);
   const imeGuard = useImeCompositionGuard();
   const [filters, setFilters] = useState<Filters>({ ...initialRange, result: '', subsystem: '', module: '', sourceCategory: '', query: '' });
@@ -317,9 +318,9 @@ export function LogAuditPage({ onRetry, onOpenData }: Props) {
     return registerPageContextReader(handler, 10);
   }, [applied, viewMode, sortOrder, data, page, pageSize]);
 
-  return <main className="audit-page">
+  return <>
     <section className="audit-header">
-      <div><div className="eyebrow">LOG AUDIT</div><h1>日志审计</h1><p>记录谁在什么时间检索了哪个环境的日志、使用了哪些条件，以及最终成功、失败或停止的原因。</p></div>
+      <div><div className="eyebrow">LOG SEARCH AUDIT</div><h1>日志检索审计</h1><p>记录谁在什么时间检索了哪个环境的日志、使用了哪些条件，以及最终成功、失败或停止的原因。</p></div>
       <div className="audit-header-stats"><span><strong>{data.count}</strong> 条记录</span><button type="button" className="button ghost" onClick={() => void load()} disabled={busy}><RefreshCw className={busy ? 'spin' : ''} size={15}/> 刷新</button></div>
     </section>
 
@@ -355,5 +356,27 @@ export function LogAuditPage({ onRetry, onOpenData }: Props) {
     {busy && !data.results.length ? <div className="audit-loading"><LoaderCircle className="spin" size={24}/><span>正在读取审计记录…</span></div> : viewMode === 'overview' ? <AuditTable rows={data.results} environments={environments} onRetry={onRetry} onOpenData={onOpenData} sortOrder={sortOrder} onSortToggle={() => { setPage(1); setSortOrder((current) => current === 'desc' ? 'asc' : 'desc'); }}/> : <div className="audit-groups">{grouped.map(([name, rows]) => <section className="audit-group" key={name}><header><div><FolderTree size={16}/><strong>{name}</strong><span>{rows.length} 条</span></div></header><AuditTable rows={rows} environments={environments} onRetry={onRetry} onOpenData={onOpenData} sortOrder={sortOrder} onSortToggle={() => { setPage(1); setSortOrder((current) => current === 'desc' ? 'asc' : 'desc'); }}/></section>)}{!grouped.length && <AuditTable rows={[]} environments={environments} onRetry={onRetry} onOpenData={onOpenData} sortOrder={sortOrder} onSortToggle={() => { setPage(1); setSortOrder((current) => current === 'desc' ? 'asc' : 'desc'); }}/>}</div>}
 
     <footer className="audit-pagination"><button type="button" className="button ghost" disabled={safePage <= 1 || busy} onClick={() => setPage((current) => Math.max(1, current - 1))}><ChevronLeft size={15}/> 上一页</button><span>第 <strong>{safePage}</strong> / {totalPages} 页</span><button type="button" className="button ghost" disabled={safePage >= totalPages || busy} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页 <ChevronRight size={15}/></button></footer>
+  </>;
+}
+
+/**
+ * 审计页：两个页签。
+ *
+ * - **操作审计**（默认）：功能级留痕 —— 每个用户点出来的功能一条记录，显示功能名、操作记录、
+ *   会话 / 来源 IP、结果（不显示 URL）；
+ * - **日志检索审计**：原来的检索诊断视图（查了什么范围、命中哪些文件），保留不动。
+ */
+export function LogAuditPage({ onRetry, onOpenData }: Props) {
+  const [tab, setTab] = useState<'operations' | 'searches'>('operations');
+  const [pendingSearchAuditId, setPendingSearchAuditId] = useState<number | null>(null);
+  return <main className="audit-page">
+    <nav className="audit-tab-bar" aria-label="审计视图">
+      <button type="button" className={tab === 'operations' ? 'active' : ''} onClick={() => setTab('operations')}><ServerCog size={15}/> 操作审计</button>
+      <button type="button" className={tab === 'searches' ? 'active' : ''} onClick={() => setTab('searches')} title="日志检索的详细诊断：检索范围、命中文件、失败原因"><Search size={15}/> 日志检索审计</button>
+      {pendingSearchAuditId ? <span className="audit-tab-hint">已带你到日志检索页签（记录 #{pendingSearchAuditId}）</span> : null}
+    </nav>
+    {tab === 'operations'
+      ? <OperationAuditPanel onOpenSearchAudit={(id) => { setPendingSearchAuditId(id); setTab('searches'); }}/>
+      : <LogSearchAuditView onRetry={onRetry} onOpenData={onOpenData}/>}
   </main>;
 }

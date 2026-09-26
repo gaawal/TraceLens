@@ -17969,3 +17969,62 @@ html.workstation-docked {
   .data-field-main-row { flex-wrap: wrap; }
   .data-field-unit-toggle { margin-left: 0; }
 }
+
+/* ===== 操作审计（功能级留痕）=====
+   审计页现在两个页签：「操作审计」是功能级留痕（功能名 / 操作记录 / 会话 / 来源 IP / 结果），
+   「日志检索审计」是原来的检索诊断。新表格单独一套列宽，别跟 13 列的检索表互相打架。 */
+.audit-tab-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.audit-tab-bar button {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 13px; border-radius: 8px;
+  border: 1px solid #dfe5ec; background: #fff; color: #475467;
+  font-size: 12.5px; font-weight: 650; cursor: pointer;
+}
+.audit-tab-bar button:hover { border-color: #b9c6d4; color: #1d2939; }
+.audit-tab-bar button.active { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+.audit-tab-hint { color: #667085; font-size: 11.5px; }
+
+.operation-audit-table th:nth-child(1) { width: 148px; }
+.operation-audit-table th:nth-child(2) { width: 150px; }
+.operation-audit-table th:nth-child(3) { width: auto; }
+.operation-audit-table th:nth-child(4) { width: 210px; }
+.operation-audit-table th:nth-child(5) { width: 88px; }
+.operation-audit-table th:nth-child(6) { width: 66px; }
+.operation-audit-table th:nth-child(7) { width: 160px; }
+
+.operation-audit-row td { height: 40px; }
+.operation-feature-cell strong { display: block; color: #101828; font-size: 12.5px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.operation-feature-cell span { display: block; margin-top: 1px; color: #98a2b3; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.operation-summary-cell { color: #344054; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.operation-actor-cell { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.operation-session { color: #475467; font-size: 11.5px; white-space: nowrap; }
+.operation-ip {
+  padding: 1px 6px; border-radius: 999px; background: #f2f4f7; color: #344054;
+  font: 11px "Cascadia Code", Consolas, monospace; white-space: nowrap;
+}
+.operation-ai-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 6px; border-radius: 999px; background: #f2edff; color: #6941c6; font-size: 10px; font-weight: 650;
+}
+.operation-stat-failed strong { color: #b42318; }
+.operation-ip-filter input {
+  height: 30px; width: 130px; border: 1px solid #dfe5ec; border-radius: 7px;
+  padding: 0 8px; font-size: 12px; background: #fff; color: #344054;
+}
+.operation-auto-refresh { display: inline-flex; align-items: center; gap: 6px; color: #475467; font-size: 12px; cursor: pointer; }
+.operation-auto-refresh input { width: 14px; height: 14px; margin: 0; accent-color: #1d4ed8; }
+
+.operation-detail-panel { display: grid; gap: 10px; padding: 12px 14px; background: #fbfcfe; }
+.operation-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px 18px; }
+.operation-detail-grid div { display: grid; gap: 2px; min-width: 0; }
+.operation-detail-grid span { color: #98a2b3; font-size: 10.5px; }
+.operation-detail-grid strong { color: #1d2939; font-size: 12px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.operation-detail-error { display: flex; align-items: flex-start; gap: 6px; padding: 7px 9px; border-radius: 7px; background: #fef3f2; color: #b42318; font-size: 12px; }
+.operation-detail-payload { display: grid; gap: 4px; }
+.operation-detail-payload > span { color: #98a2b3; font-size: 10.5px; }
+.operation-detail-payload pre {
+  margin: 0; padding: 8px 10px; border-radius: 7px; background: #0f172a; color: #d5e2f0;
+  font: 11.5px/1.5 "Cascadia Code", Consolas, monospace; max-height: 190px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
+.operation-user { color: #101828; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+.operation-user::after { content: '·'; margin-left: 5px; color: #98a2b3; }

@@ -7,8 +7,18 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.audits.models import AuditResult, DataExtractionRecord, LogSearchAudit
-from apps.audits.serializers import DataExtractionRecordSerializer, LogSearchAuditSerializer
+from apps.audits.models import (
+    AuditResult,
+    DataExtractionRecord,
+    LogSearchAudit,
+    OperationAudit,
+    OperationOutcome,
+)
+from apps.audits.serializers import (
+    DataExtractionRecordSerializer,
+    LogSearchAuditSerializer,
+    OperationAuditSerializer,
+)
 from apps.audits.services import record_log_search_client_result
 from apps.common.pagination import StandardResultsSetPagination
 
@@ -142,3 +152,108 @@ class DataExtractionRecordViewSet(viewsets.ModelViewSet):
                 | Q(source_operation_id__icontains=query)
             )
         return qs
+
+
+class OperationAuditViewSet(viewsets.ReadOnlyModelViewSet):
+    """功能级操作审计的查询接口。
+
+    过滤器：时间范围 / 功能分组 / 具体功能 / 结果 / 发起方 / 用户 / IP / 关键字。
+    列表响应同时返回 ``facets``（分组、功能、用户、IP 的候选值 + 汇总计数），
+    前端筛选器直接用它，不用再各拉一次。
+    """
+
+    serializer_class = OperationAuditSerializer
+    pagination_class = StandardResultsSetPagination
+    queryset = OperationAudit.objects.select_related("environment").all()
+
+    def _filtered(self, params):
+        from django.db.models import Q
+
+        qs = OperationAudit.objects.select_related("environment").all()
+        start = _parse_filter_datetime(params.get("start_time"))
+        end = _parse_filter_datetime(params.get("end_time"))
+        if start:
+            qs = qs.filter(created_at__gte=start)
+        if end:
+            qs = qs.filter(created_at__lte=end)
+
+        group = str(params.get("group") or "").strip()
+        if group:
+            qs = qs.filter(feature_group=group)
+        feature = str(params.get("feature") or "").strip()
+        if feature:
+            qs = qs.filter(feature_name=feature)
+        outcome = str(params.get("outcome") or "").strip()
+        if outcome:
+            qs = qs.filter(outcome=outcome)
+        trigger = str(params.get("trigger") or "").strip()
+        if trigger:
+            qs = qs.filter(trigger=trigger)
+        operator = str(params.get("operator") or "").strip()
+        if operator:
+            qs = qs.filter(operator_username__icontains=operator)
+        client_ip = str(params.get("client_ip") or "").strip()
+        if client_ip:
+            qs = qs.filter(client_ip__icontains=client_ip)
+        environment_id = str(params.get("environment_id") or "").strip()
+        if environment_id.isdigit():
+            qs = qs.filter(environment_id=int(environment_id))
+        query = str(params.get("query") or "").strip()
+        if query:
+            qs = qs.filter(
+                Q(feature_name__icontains=query)
+                | Q(feature_group__icontains=query)
+                | Q(summary__icontains=query)
+                | Q(operator_username__icontains=query)
+                | Q(client_ip__icontains=query)
+                | Q(environment_name__icontains=query)
+                | Q(target_name__icontains=query)
+                | Q(error_message__icontains=query)
+            )
+        order = str(params.get("order") or "desc").strip().lower()
+        if order == "asc":
+            return qs.order_by("created_at", "id")
+        return qs.order_by("-created_at", "-id")
+
+    def get_queryset(self):
+        return self._filtered(self.request.query_params)
+
+    @staticmethod
+    def _facets(qs):
+        from django.db.models import Count
+
+        def values(field: str, limit: int = 60):
+            return [
+                {"value": row[field], "count": row["count"]}
+                for row in qs.values(field).annotate(count=Count("id")).order_by("-count", field)[:limit]
+                if str(row[field] or "").strip()
+            ]
+
+        total = qs.count()
+        failed = qs.filter(outcome=OperationOutcome.FAILED).count()
+        return {
+            "summary": {
+                "total": total,
+                "failed": failed,
+                "success": total - failed,
+                "operators": qs.exclude(operator_username="").values("operator_username").distinct().count(),
+                "client_ips": qs.exclude(client_ip="").values("client_ip").distinct().count(),
+            },
+            "groups": values("feature_group"),
+            "features": values("feature_name", limit=120),
+            "operators": values("operator_username"),
+            "client_ips": values("client_ip"),
+            "triggers": values("trigger"),
+        }
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page if page is not None else queryset, many=True)
+        if page is not None:
+            response = self.get_paginated_response(serializer.data)
+            response.data["facets"] = self._facets(self._filtered(request.query_params))
+            return response
+        return Response(
+            {"count": len(serializer.data), "results": serializer.data, "facets": self._facets(queryset)}
+        )

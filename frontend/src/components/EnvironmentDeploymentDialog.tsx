@@ -603,7 +603,7 @@ export function EnvironmentDeploymentDialog({ environment, initialTask, onClose,
       if (pending) return;
       pending = true;
       try {
-        const value = await getEnvironmentDeployment(environment.id, id, selectedStepKey);
+        const value = await getEnvironmentDeployment(environment.id, id, selectedStepKey, { action: 'auto' });
         if (!stale && taskRef.current?.id === id) {
           const current = taskRef.current;
           // A snapshot may race newer SSE chunks. Keep whichever contains more output.

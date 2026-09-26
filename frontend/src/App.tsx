@@ -65,6 +65,7 @@ import type { AbnormalCase, AbnormalCaseEvidence } from './api/resourceApi';
 import { KnowledgeBasePage } from './components/KnowledgeBasePage';
 import { ToolCenterPage } from './components/ToolCenterPage';
 import { createTracePilotActionRegistry } from './assistant/actionRegistry';
+import { beginAiDrivenApiAction, endAiDrivenApiAction } from './api/resourceApi';
 import { afterPaint, type UiReceipt } from './assistant/workstation';
 import { saveTracePilotAgentContext } from './assistant/agentContext';
 import { setLiveMonitoring } from './services/liveMonitoring';
@@ -4140,6 +4141,9 @@ export default function App() {
   const [errorRules, setErrorRules] = useState<ErrorMatchRule[]>(loadErrorRules);
   const [displayRules, setDisplayRules] = useState<DisplayRule[]>(() => localDisplayRuleStore.load());
   const displayRulesBackendReadyRef = useRef(false);
+  /** 首轮同步只对齐不回写；之后内容没变也不 PATCH（见下面的同步 effect）。 */
+  const displayRulesPrimeRef = useRef(true);
+  const displayRulesSyncedRef = useRef('');
   const [semanticLabelsEnabled, setSemanticLabelsEnabled] = useState(loadSemanticLabelsEnabled);
   const [rawLogMode, setRawLogMode] = useState(loadRawLogModePreference);
   const [maskingRules, setMaskingRules] = useState<MaskingRule[]>(loadMaskingRules);
@@ -4148,6 +4152,8 @@ export default function App() {
   const effectiveFoldingRules = useMemo(() => foldingEnabled ? foldingRules : foldingRules.map((rule) => ({ ...rule, enabled: false })), [foldingEnabled, foldingRules]);
   const [dataExtractionRules, setDataExtractionRules] = useState<DataExtractionRule[]>(loadDataExtractionRules);
   const dataExtractionRulesBackendReadyRef = useRef(false);
+  const dataExtractionRulesPrimeRef = useRef(true);
+  const dataExtractionRulesSyncedRef = useRef('');
   const logFormatRulesRef = useRef<LogFormatParserRuleConfig[]>([]);
   const [dataSourceOperationFilter, setDataSourceOperationFilter] = useState('');
   const [dataExtractionDialog, setDataExtractionDialog] = useState<{
@@ -4431,7 +4437,7 @@ export default function App() {
 
         // 尚未初始化时优先恢复旧浏览器规则；主 key 被旧版本清空时再尝试非破坏性备份。
         if (recoveryRules.length > 0) {
-          await updateResourceSettings({ display_rules: recoveryRules });
+          await updateResourceSettings({ display_rules: recoveryRules }, { action: 'auto' });
           if (cancelled) return;
           setDisplayRules(recoveryRules);
           localDisplayRuleStore.save(recoveryRules);
@@ -4446,7 +4452,17 @@ export default function App() {
   useEffect(() => {
     localDisplayRuleStore.save(displayRules);
     if (!displayRulesBackendReadyRef.current) return undefined;
+    // 首轮同步只是把后端读回来的内容对齐到本地（读回来又原样写回去属于**同步动作，不是用户操作**），
+    // 以前打开页面就会往操作审计里写一条"修改平台路径设置"；内容没变也不发请求。真的改了规则照旧保存。
+    const serialized = JSON.stringify(displayRules);
+    if (displayRulesPrimeRef.current) {
+      displayRulesPrimeRef.current = false;
+      displayRulesSyncedRef.current = serialized;
+      return undefined;
+    }
+    if (serialized === displayRulesSyncedRef.current) return undefined;
     const timer = window.setTimeout(() => {
+      displayRulesSyncedRef.current = serialized;
       void updateResourceSettings({ display_rules: displayRules }).catch(() => undefined);
     }, 250);
     return () => window.clearTimeout(timer);
@@ -4484,7 +4500,7 @@ export default function App() {
         // 升级兼容：只有数据库仍为 null 时，才允许把旧 localStorage 提取器迁移到共享数据库。
         // 这样某个用户把共享提取器删空后，其他用户的旧浏览器缓存不会把已删除规则“复活”。
         if (localRules.length > 0) {
-          await updateResourceSettings({ data_extraction_rules: localRules });
+          await updateResourceSettings({ data_extraction_rules: localRules }, { action: 'auto' });
           if (cancelled) return;
           setDataExtractionRules(localRules);
         }
@@ -4501,7 +4517,16 @@ export default function App() {
     // localStorage 仅作为离线/升级缓存；数据库中的 ResourceSettings 才是共享主数据源。
     saveDataExtractionRules(dataExtractionRules);
     if (!dataExtractionRulesBackendReadyRef.current) return undefined;
+    // 同上：首轮只对齐不回写，内容没变也不发请求（否则每次开页面都会多一条审计）。
+    const serialized = JSON.stringify(dataExtractionRules);
+    if (dataExtractionRulesPrimeRef.current) {
+      dataExtractionRulesPrimeRef.current = false;
+      dataExtractionRulesSyncedRef.current = serialized;
+      return undefined;
+    }
+    if (serialized === dataExtractionRulesSyncedRef.current) return undefined;
     const timer = window.setTimeout(() => {
+      dataExtractionRulesSyncedRef.current = serialized;
       void updateResourceSettings({ data_extraction_rules: dataExtractionRules }).catch(() => undefined);
     }, 250);
     return () => window.clearTimeout(timer);
@@ -6577,10 +6602,14 @@ export default function App() {
       if (!type || !actionRegistry.has(type)) return;
       const complete = detail.__complete as ((receipt: UiReceipt) => void) | undefined;
       detail.__claimed = true;
+      // 这一段是 AI 在替用户操作页面：期间页面发出的接口请求都要在操作审计里标成「AI 代操作」，
+      // 别和用户自己点出来的混在一起（见 api/resourceApi.ts 的 API_ACTION_HEADER）。
+      beginAiDrivenApiAction();
       void actionRegistry.execute(detail, { signal: detail.__signal as AbortSignal | undefined }).then(async (result) => {
         await afterPaint();
         complete?.({ status: 'success', detail: String((result as { detail?: string } | undefined)?.detail || '页面操作已应用'), result });
-      }).catch((error: unknown) => complete?.({ status: 'failed', detail: error instanceof Error ? error.message : String(error) }));
+      }).catch((error: unknown) => complete?.({ status: 'failed', detail: error instanceof Error ? error.message : String(error) }))
+        .finally(() => endAiDrivenApiAction());
     };
     window.addEventListener('tracelens:assistant-ui', handler as EventListener);
     return () => window.removeEventListener('tracelens:assistant-ui', handler as EventListener);

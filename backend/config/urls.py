@@ -25,7 +25,7 @@ from apps.logsources.views import (
 from apps.logsources.watch_views import LogWatchViewSet, watch_event_stream
 from apps.machines.views import MachineViewSet
 from apps.reports.views import CpdReportViewSet
-from apps.audits.views import DataExtractionRecordViewSet, LogSearchAuditViewSet
+from apps.audits.views import DataExtractionRecordViewSet, LogSearchAuditViewSet, OperationAuditViewSet
 from apps.knowledge.views import AbnormalCaseViewSet
 from apps.tooling.views import ToolViewSet
 from apps.atlog.views import AtLogAnalysisViewSet
@@ -52,6 +52,7 @@ router.register("log-subsystems", LogSubsystemDefinitionViewSet, basename="log-s
 router.register("log-fms", LogFmDefinitionViewSet, basename="log-fm")
 router.register("cpd-reports", CpdReportViewSet, basename="cpd-report")
 router.register("log-audits", LogSearchAuditViewSet, basename="log-audit")
+router.register("operation-audits", OperationAuditViewSet, basename="operation-audit")
 router.register("data-extractions", DataExtractionRecordViewSet, basename="data-extraction")
 router.register("abnormal-cases", AbnormalCaseViewSet, basename="abnormal-case")
 router.register("tools", ToolViewSet, basename="tool")

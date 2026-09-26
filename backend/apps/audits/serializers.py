@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from apps.audits.models import DataExtractionRecord, LogSearchAudit, LogSearchAuditTarget
+from apps.audits.models import DataExtractionRecord, LogSearchAudit, LogSearchAuditTarget, OperationAudit
 
 
 class LogSearchAuditTargetSerializer(serializers.ModelSerializer):
@@ -43,3 +43,21 @@ class DataExtractionRecordSerializer(serializers.ModelSerializer):
         if operation_id:
             validated_data["source_audit"] = LogSearchAudit.objects.filter(operation_id=operation_id).order_by("-id").first()
         return super().create(validated_data)
+
+
+class OperationAuditSerializer(serializers.ModelSerializer):
+    """**注意：不输出 URL。** 界面只展示功能名，接口路径属于后端留档。"""
+
+    outcome_display = serializers.CharField(source="get_outcome_display", read_only=True)
+    trigger_display = serializers.CharField(source="get_trigger_display", read_only=True)
+
+    class Meta:
+        model = OperationAudit
+        fields = [
+            "id", "created_at", "operation_id", "operator_username", "client_ip", "session_id",
+            "trigger", "trigger_display",
+            "feature_group", "feature_name", "summary",
+            "environment", "environment_name", "target_kind", "target_name",
+            "log_search_audit", "http_method", "status_code",
+            "outcome", "outcome_display", "error_message", "duration_ms", "request_payload",
+        ]

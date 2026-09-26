@@ -619,6 +619,85 @@ export async function updateLogAuditClientResult(operationId: string, resultCoun
 }
 
 
+// --- 功能级操作审计 ---------------------------------------------------------
+
+export interface OperationAuditFacets {
+  summary: { total: number; failed: number; success: number; operators: number; client_ips: number };
+  groups: Array<{ value: string; count: number }>;
+  features: Array<{ value: string; count: number }>;
+  operators: Array<{ value: string; count: number }>;
+  client_ips: Array<{ value: string; count: number }>;
+  triggers: Array<{ value: string; count: number }>;
+}
+
+export interface OperationAuditRecord {
+  id: number;
+  created_at: string;
+  operation_id: string;
+  operator_username: string;
+  client_ip: string;
+  session_id: string;
+  trigger: 'user' | 'ai' | 'system' | string;
+  trigger_display: string;
+  feature_group: string;
+  /** 功能名，例如「部署环境」「启动/停止环境进程」。界面上**不显示 URL**。 */
+  feature_name: string;
+  summary: string;
+  environment?: number | null;
+  environment_name: string;
+  target_kind: string;
+  target_name: string;
+  log_search_audit?: number | null;
+  http_method: string;
+  status_code: number;
+  outcome: 'success' | 'failed' | string;
+  outcome_display: string;
+  error_message: string;
+  duration_ms?: number | null;
+  request_payload?: Record<string, unknown>;
+}
+
+export interface OperationAuditList {
+  count: number;
+  next?: string | null;
+  previous?: string | null;
+  results: OperationAuditRecord[];
+  facets?: OperationAuditFacets;
+}
+
+export async function listOperationAudits(params: {
+  page: number;
+  pageSize: number;
+  startTime?: string;
+  endTime?: string;
+  group?: string;
+  feature?: string;
+  outcome?: string;
+  trigger?: string;
+  operator?: string;
+  clientIp?: string;
+  environmentId?: number;
+  query?: string;
+  order?: 'asc' | 'desc';
+  /** 页面上的自动刷新要传 auto：否则每刷一次都会往审计里写一条"用户操作"。 */
+  auto?: boolean;
+}): Promise<OperationAuditList> {
+  const search = new URLSearchParams({ page: String(params.page), page_size: String(params.pageSize) });
+  if (params.startTime) search.set('start_time', params.startTime.replace(' ', 'T'));
+  if (params.endTime) search.set('end_time', params.endTime.replace(' ', 'T'));
+  if (params.group) search.set('group', params.group);
+  if (params.feature) search.set('feature', params.feature);
+  if (params.outcome) search.set('outcome', params.outcome);
+  if (params.trigger) search.set('trigger', params.trigger);
+  if (params.operator) search.set('operator', params.operator);
+  if (params.clientIp) search.set('client_ip', params.clientIp);
+  if (params.environmentId) search.set('environment_id', String(params.environmentId));
+  if (params.query) search.set('query', params.query);
+  search.set('order', params.order === 'asc' ? 'asc' : 'desc');
+  return api(`/operation-audits/?${search.toString()}`, { method: 'GET' }, { action: params.auto ? 'auto' : 'user' });
+}
+
+
 
 export interface DataExtractionResultSummary {
   rule_id: string;
@@ -957,23 +1036,56 @@ function getTraceLensSessionId(): string {
   return id;
 }
 
-export function buildApiHeaders(extra?: HeadersInit, sessionIdOverride?: string): Headers {
+/**
+ * 请求发起方的三类标记，配合后端操作审计（后端只记 ``user`` / ``ai``，``auto`` 直接跳过）：
+ * - ``user``：用户点出来的（默认）；
+ * - ``auto``：页面自己的轮询/自动刷新/量化重算——**不是用户操作**，审计里不该出现；
+ * - ``ai``：AI 助手代替用户操作页面时由页面发出的请求。
+ */
+export type ApiActionKind = 'user' | 'auto' | 'ai';
+
+export const API_ACTION_HEADER = 'X-TraceLens-Action';
+
+let aiDrivenActionDepth = 0;
+
+/** AI 代操作页面时包一层：期间发出的请求都会被标记成 ai（审计里显示"AI 代操作"）。 */
+export function beginAiDrivenApiAction(): void {
+  aiDrivenActionDepth += 1;
+}
+
+export function endAiDrivenApiAction(): void {
+  aiDrivenActionDepth = Math.max(0, aiDrivenActionDepth - 1);
+}
+
+export function currentApiAction(): ApiActionKind {
+  return aiDrivenActionDepth > 0 ? 'ai' : 'user';
+}
+
+export function buildApiHeaders(extra?: HeadersInit, sessionIdOverride?: string, action?: ApiActionKind): Headers {
   const headers = new Headers(extra);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const sessionId = sessionIdOverride || getTraceLensSessionId();
   if (sessionId && !headers.has('X-Session-Id')) {
     headers.set('X-Session-Id', sessionId);
   }
+  if (!headers.has(API_ACTION_HEADER)) {
+    headers.set(API_ACTION_HEADER, action ?? currentApiAction());
+  }
   return headers;
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
+export interface ApiRequestOptions {
+  /** 自动刷新/轮询请显式传 ``auto``，否则会被当成用户操作记进审计。 */
+  action?: ApiActionKind;
+}
+
+async function api<T>(path: string, init?: RequestInit, options?: ApiRequestOptions): Promise<T> {
   const detail = { path, method: String(init?.method || 'GET').toUpperCase() };
   emitApiActivity('start', detail);
   try {
     const response = await fetch(`${API_BASE}${path}`, {
       ...init,
-      headers: buildApiHeaders(init?.headers),
+      headers: buildApiHeaders(init?.headers, undefined, options?.action),
     });
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`;
@@ -1645,9 +1757,14 @@ export async function getLatestEnvironmentDeployment(id: number): Promise<Enviro
   return api(`/environments/${id}/latest-deployment/`);
 }
 
-export async function getEnvironmentDeployment(id: number, deploymentId: number, stepKey?: string): Promise<EnvironmentDeployment> {
+export async function getEnvironmentDeployment(
+  id: number,
+  deploymentId: number,
+  stepKey?: string,
+  options?: ApiRequestOptions,
+): Promise<EnvironmentDeployment> {
   const query = stepKey ? `?step_key=${encodeURIComponent(stepKey)}` : '';
-  return api(`/environments/${id}/deployments/${deploymentId}/${query}`);
+  return api(`/environments/${id}/deployments/${deploymentId}/${query}`, { method: 'GET' }, options);
 }
 
 export async function retryEnvironmentDeploymentStep(id: number, deploymentId: number, stepKey: string): Promise<EnvironmentDeployment> {
@@ -1763,8 +1880,8 @@ export async function getResourceSettings(): Promise<ResourceSettings> {
   return api('/resource-settings/current/');
 }
 
-export async function updateResourceSettings(payload: Record<string, unknown>): Promise<ResourceSettings> {
-  return api('/resource-settings/current/', { method: 'PATCH', body: JSON.stringify(payload) });
+export async function updateResourceSettings(payload: Record<string, unknown>, options?: ApiRequestOptions): Promise<ResourceSettings> {
+  return api('/resource-settings/current/', { method: 'PATCH', body: JSON.stringify(payload) }, options);
 }
 
 
