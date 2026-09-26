@@ -427,3 +427,42 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(stripFunctionPrefixFromMessage('', 'Stage_WSP_HOME()'), '', '空正文不炸');
   console.log('Workstation checks passed: 折叠展开后的入口正文去掉重复的函数名前缀与 >() 边界符.');
 }
+
+// --- 折叠栏展开后要还原成日志里的入口形态 ----------------------------------
+// Regression: 展开后只显示函数名 `MoveAbsolute()`，看不出这一段是按入口 `>()` 还是出口 `<()`
+// 折出来的；用户要求"依据什么折的就显示什么"——还原入口原文，没有边界符的折叠保持纯函数名。
+{
+  const {foldEntrySignature} = await import('../src/rendering/logMessage');
+  const entry = (message: string) => ({message});
+  assert.equal(
+    foldEntrySignature(entry('MoveAbsolute() >() enter stage absolute move start dof=6'), 'MoveAbsolute()'),
+    'MoveAbsolute() >()',
+    '入口折叠要还原成 `Name() >()`',
+  );
+  assert.equal(
+    foldEntrySignature(entry('MoveAbsolute() <() leave stage absolute move end dof=6'), 'MoveAbsolute()'),
+    'MoveAbsolute() <()',
+    '出口折叠要还原成 `Name() <()`，不能一律补成 >()',
+  );
+  assert.equal(
+    foldEntrySignature(entry('MoveAbsolute() > ( ) enter stage'), 'MoveAbsolute()'),
+    'MoveAbsolute() >()',
+    '日志里写成 `> ( )` 也归一成 >()',
+  );
+  assert.equal(
+    foldEntrySignature(entry('Stage_WSP_HOME load wafer=W01'), 'Stage_WSP_HOME()'),
+    'Stage_WSP_HOME()',
+    '连续行/尾随行折叠没有边界符，保持纯函数名',
+  );
+  assert.equal(
+    foldEntrySignature(entry('>() enter stage'), 'MoveAbsolute()'),
+    'MoveAbsolute() >()',
+    '边界符前面没写函数名时用折叠出来的函数名兜底',
+  );
+  assert.equal(
+    foldEntrySignature(undefined, 'MoveAbsolute()'),
+    'MoveAbsolute()',
+    '没有入口行时不炸',
+  );
+  console.log('Workstation checks passed: 折叠栏展开后按折叠依据还原入口形态 (>() / <()).');
+}

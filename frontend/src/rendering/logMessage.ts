@@ -1,3 +1,5 @@
+import type { LogEntry } from '../types';
+
 /**
  * 折叠起来的函数卡片，展开后要在同一行显示入口日志的正文。
  *
@@ -30,4 +32,29 @@ export function stripFunctionPrefixFromMessage(message: string, functionName?: s
 
   const trimmed = text.trim();
   return trimmed || raw;
+}
+
+/** 入口行的边界符：`>()` 表示调用进入、`<()` 表示退出；允许日志里写成 `> ( )` 这种带空格的形态。 */
+const BOUNDARY_MARKER_REGEX = /[<>]\s*\(\s*\)/;
+
+/**
+ * 折叠栏（函数名那个位置）**展开后**要显示什么。
+ *
+ * 折叠是**按入口行里的「函数名 + 边界符」**成立的：`MoveAbsolute() >()` 是进入、
+ * `MoveAbsolute() <()` 是退出，而连续行 / 尾随行的折叠根本没有边界符。
+ * 所以展开后就把**折叠依据的那一段原样还原**出来：
+ *
+ *   折叠: `MoveAbsolute()`            （只有函数名，说明"这里折了一段"）
+ *   展开: `MoveAbsolute() >()`        （还原成日志里真实的入口形态）
+ *
+ * 依据什么折的就显示什么 —— 是 `<()` 就显示 `<()`，没有边界符就保持纯函数名，
+ * 不要一律补成 `>()`（那会把出口折成的块写成入口）。
+ */
+export function foldEntrySignature(entry: LogEntry | undefined, fallbackName: string): string {
+  const name = String(fallbackName ?? '').trim();
+  const message = String(entry?.message ?? '');
+  const matched = message.match(BOUNDARY_MARKER_REGEX);
+  if (!matched) return name;
+  const prefix = message.slice(0, matched.index ?? 0).trim();
+  return `${prefix || name} ${matched[0].replace(/\s+/g, '')}`;
 }

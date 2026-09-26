@@ -120,7 +120,7 @@ import {
 import type { DisplayRule, DisplayRuleEditorRequest, DisplayRuleParameter, ParameterMark } from './rendering/displayRules';
 import { isEntryMasked, loadMaskingRules, saveMaskingRules, type MaskingRule } from './rendering/maskingRules';
 import { loadFoldingRules, saveFoldingRules, type FoldingRule } from './rendering/foldingRules';
-import { stripFunctionPrefixFromMessage } from './rendering/logMessage';
+import { foldEntrySignature, stripFunctionPrefixFromMessage } from './rendering/logMessage';
 import { createEmptyDataExtractionRule, detectStructuredDataCandidates, extractDataRow, inferDataSourceUnit, inferDataValueType, loadDataExtractionRules, saveDataExtractionRules, validateDataExtractionRule, type DataExtractionField, type DataExtractionRule, type DataValueType } from './rendering/dataExtractionRules';
 import { extractFromLoadedEntries, type ExtractionProgress } from './rendering/dataExtractionRuntime';
 import { downloadMergedTemporaryRuleData, downloadTemporaryRuleData, saveTemporaryExtractionSession, temporarySessionKey } from './rendering/extractedDataStore';
@@ -3337,7 +3337,9 @@ function FunctionItem({
               <span className="function-entry-time" title={node.startEntry.timestamp}>{node.startEntry.timestamp}</span>
               <ComponentBadge component={node.component} compact />
               <span className={classNames('function-name-semantic', expanded && 'is-expanded')}>
-                <span className="function-name" title={node.name}>{node.name}</span>
+                {/* 展开后把函数名还原成日志里的入口形态（`MoveAbsolute() >()` / `<()`）：
+                    折叠依据什么就显示什么，没有边界符的折叠保持纯函数名。 */}
+                <span className="function-name" title={node.name}>{expanded ? foldEntrySignature(node.startEntry, node.name) : node.name}</span>
                 {node.origin === 'repeated' && <span className="function-repeat-badge">×{node.repeatCount ?? children.length}</span>}
                 {/* 展开时把入口日志的信息接在函数名后面（级别 + 正文，正文剥掉重复的函数名/边界符），
                     语义说明自然被挤到这一行最后，整行读起来是：组件 函数名 级别 正文 语义。 */}
