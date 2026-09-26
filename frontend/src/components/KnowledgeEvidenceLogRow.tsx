@@ -1,3 +1,4 @@
+import { componentStyle } from '../rendering/componentColor';
 import { useMemo, useState, type CSSProperties, type MouseEvent, type ReactNode } from 'react';
 import { Copy, FileSearch } from 'lucide-react';
 import type { AbnormalCaseAnomalyRule, AbnormalCaseEvidence } from '../api/resourceApi';
@@ -14,17 +15,6 @@ interface Props {
   messageOverride?: string;
 }
 
-function componentHue(component: string): number {
-  let hash = 0;
-  for (let index = 0; index < component.length; index += 1) {
-    hash = (hash * 31 + component.charCodeAt(index)) % 360;
-  }
-  return hash;
-}
-
-function componentStyle(component: string): CSSProperties {
-  return { '--component-hue': componentHue(component) } as CSSProperties;
-}
 
 function sourceCategoryMeta(category?: string): { label: string; className: string } | undefined {
   switch (category) {

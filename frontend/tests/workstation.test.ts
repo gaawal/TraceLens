@@ -554,3 +554,51 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(missing?.text, '回零位流程第 {step} 步，晶圆 {wafer}');
   console.log('Workstation checks passed: 关键字规则的 {参数} 占位符会就地取值替换.');
 }
+
+// --- 时间线调色板按模块下标取色（不再 hash 撞色）-----------------------------
+// Regression: 以前 `|hash| % 档数` 分配颜色，两个模块的 hash 差成档数整数倍就同色；
+// 模块一多几乎必撞，"按模块上色"就失去意义。
+{
+  const {registerTimelinePaletteComponents, timelinePaletteIndex, timelinePaletteSnapshot} =
+    await import('../src/rendering/componentColor');
+  const SIZE = 8;
+  registerTimelinePaletteComponents(['wsp', 'CPFR', 'mecore', 'sil', 'spwsp', 'hmi']);
+  const indexes = ['wsp', 'cpfr', 'mecore', 'sil', 'spwsp', 'hmi'].map((name) => timelinePaletteIndex(name, SIZE));
+  assert.equal(new Set(indexes).size, indexes.length, `6 个模块必须拿到 6 个不同下标，实际 ${indexes}`);
+  assert.deepEqual(indexes, [5, 0, 2, 3, 4, 1], '按名称排序后依次取 0..n-1（大小写不敏感）');
+
+  // 与登记顺序无关：换一批顺序仍然按名称排序分配
+  registerTimelinePaletteComponents(['mecore', 'wsp', 'cpfr']);
+  assert.deepEqual(timelinePaletteSnapshot(), { cpfr: 0, mecore: 1, wsp: 2 });
+
+  // 表外模块退回 hash，且永远落在 [0, size)
+  const unknown = timelinePaletteIndex('some-new-module', SIZE);
+  assert.ok(Number.isInteger(unknown) && unknown >= 0 && unknown < SIZE, `表外模块下标要合法，实际 ${unknown}`);
+
+  // 模块数超过档数时也必须落在合法区间（允许环绕）
+  registerTimelinePaletteComponents(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']);
+  assert.ok(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].every((name) => {
+    const index = timelinePaletteIndex(name, 8);
+    return index >= 0 && index < 8;
+  }));
+  console.log('Workstation checks passed: 时间线调色板按模块下标分配（不撞色、与顺序无关）.');
+}
+
+// --- 模块色相要撒得开（不再"两个模块看着同色"）-------------------------------
+// Regression: `hash % 360` 时两个模块名只差一两个字节，色相也只差一两度（实测 215°/217°）。
+{
+  const {componentHue} = await import('../src/rendering/componentColor');
+  const names = ['wsp', 'cpfr', 'mecore', 'cpcore', 'sil', 'spwsp', 'lgsw', 'hmi', 'swlib'];
+  const hues = names.map((name) => componentHue(name));
+  let minDistance = 360;
+  for (let left = 0; left < hues.length; left += 1) {
+    for (let right = left + 1; right < hues.length; right += 1) {
+      const gap = Math.abs(hues[left] - hues[right]);
+      minDistance = Math.min(minDistance, Math.min(gap, 360 - gap));
+    }
+  }
+  assert.ok(minDistance >= 15, `真实模块名的两两色相至少差 15°，实际最小 ${minDistance}°`);
+  assert.equal(componentHue('CPFR'), componentHue('cpfr'), '大小写不敏感');
+  assert.ok(hues.every((hue) => Number.isFinite(hue) && hue >= 0 && hue < 360));
+  console.log(`Workstation checks passed: 模块色相撒得开（最小间距 ${minDistance}°）.`);
+}

@@ -1,6 +1,6 @@
 import { registerPageContextReader } from './assistant/contextRegistry';
 import { buildLogEvidence } from './assistant/logEvidence';
-import { componentHue, componentStyle } from './rendering/componentColor';
+import { componentHue, componentStyle, registerTimelinePaletteComponents, timelinePaletteIndex } from './rendering/componentColor';
 import { createAbnormalEvidence } from './rendering/abnormalKnowledge';
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -1077,8 +1077,9 @@ const TIMELINE_COMPONENT_PALETTE = [
 
 function timelineComponentStyle(component: string): React.CSSProperties {
   const palette = TIMELINE_COMPONENT_PALETTE;
-  const index = Math.abs(componentHue(component)) % palette.length;
-  const tone = palette[index];
+  // 下标由"当前时间线里的模块清单"分配（见 registerTimelinePaletteComponents）：
+  // 用 hash % 档数 会让两个模块撞同一个颜色，模块一多就分不清了。
+  const tone = palette[timelinePaletteIndex(component, palette.length)];
   return {
     '--timeline-fill': tone.fill,
     '--timeline-border': tone.border,
@@ -1870,7 +1871,7 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
       grouped.set(row.process.component, rows);
     });
 
-    return Array.from(grouped.entries()).map(([component, rows]) => {
+    const groups = Array.from(grouped.entries()).map(([component, rows]) => {
       const sortedRows = rows.slice().sort((left, right) => compareEntries(left.range.start, right.range.start));
       const startRow = sortedRows.reduce((earliest, row) => row.range.startNs < earliest.range.startNs ? row : earliest, sortedRows[0]);
       const endRow = sortedRows.reduce((latest, row) => row.range.endNs > latest.range.endNs ? row : latest, sortedRows[0]);
@@ -1890,6 +1891,9 @@ const ProcessTimelineOverview = memo(function ProcessTimelineOverview({
         traceCount: sortedRows.reduce((sum, row) => sum + row.traceRows.length, 0),
       };
     }).sort((left, right) => compareEntries(left.range.start, right.range.start));
+    // 登记调色板下标表：同一批模块按名称排序后依次取色，保证互不相同（子组件渲染时读取）。
+    registerTimelinePaletteComponents(groups.map((group) => group.component));
+    return groups;
   }, [processRows]);
 
   function resolveTimelineBounds() {
