@@ -3198,10 +3198,13 @@ function LogRow({
         {visibleCustomLabels.length > 0 && <span className="log-custom-labels" aria-label="自定义标签">
           {visibleCustomLabels.map((match) => <span
             key={`${match.ruleId}-${match.customLabelText}`}
-            className="log-custom-label"
+            className={`log-custom-label style-${match.customLabelStyle || 'soft'}`}
             style={{ '--custom-label-color': match.customLabelColor || '#2563eb' } as React.CSSProperties}
             title={`${match.ruleName}\n${match.customLabelText}`}
-          >{clampLogLabel(match.customLabelText || '')}</span>)}
+          >
+            {match.customLabelSymbol && <i className="log-custom-label-symbol" aria-hidden="true">{match.customLabelSymbol}</i>}
+            {clampLogLabel(match.customLabelText || '')}
+          </span>)}
           {hiddenCustomLabelCount > 0 && <span className="log-custom-label more" title={customLabelMatches.slice(3).map((match) => match.customLabelText).join('\n')}>+{hiddenCustomLabelCount}</span>}
         </span>}
         {sourceText ? <button

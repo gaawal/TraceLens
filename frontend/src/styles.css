@@ -17833,3 +17833,75 @@ html.workstation-docked {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── 日志标签色盘（规则编辑器）──────────────────────────────────────────────
+   颜色不让用户自己调：同一含义永远同一颜色，标签才能一眼扫出来。
+   色卡 = 该标签的真实预览（符号 + 文本 + 样式）+ 语义名 + 使用场景。 */
+.custom-label-style-field { display: grid; gap: 8px; min-width: 0; }
+.custom-label-style-field > span { color: #64748b; font-size: 11px; font-weight: 700; }
+.custom-label-presets {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 8px;
+  max-height: 292px; overflow: auto; padding: 2px;
+}
+.custom-label-preset {
+  position: relative;
+  display: grid; gap: 5px; justify-items: start;
+  padding: 9px 10px 10px;
+  border: 1px solid #e2e8f0; border-radius: 10px; background: #fff;
+  text-align: left; cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+.custom-label-preset:hover { border-color: color-mix(in srgb, var(--preset-color) 55%, #cbd5e1); transform: translateY(-1px); box-shadow: 0 6px 16px rgba(15, 23, 42, .08); }
+.custom-label-preset.active {
+  border-color: var(--preset-color);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--preset-color) 22%, transparent), 0 8px 20px rgba(15, 23, 42, .10);
+}
+.custom-label-preset strong { font-size: 12px; color: #0f172a; }
+.custom-label-preset small { color: #94a3b8; font-size: 10.5px; line-height: 1.35; }
+.custom-label-preset-check { position: absolute; top: 8px; right: 8px; color: var(--preset-color); }
+.custom-label-preset-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  max-width: 100%; padding: 2px 8px; border-radius: 6px;
+  font-size: 11px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.custom-label-preset-chip i { font-style: normal; font-size: 10px; }
+.custom-label-preset-chip.style-soft {
+  border: 1px solid var(--preset-color);
+  background: color-mix(in srgb, var(--preset-color) 12%, white);
+  color: color-mix(in srgb, var(--preset-color) 78%, #111827);
+}
+.custom-label-preset-chip.style-solid { border: 1px solid var(--preset-color); background: var(--preset-color); color: #fff; }
+.custom-label-preset-chip.style-outline { border: 1px solid var(--preset-color); background: #fff; color: var(--preset-color); }
+.custom-label-style-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.custom-label-style-row > label { display: grid; gap: 4px; }
+.custom-label-style-row > label > span { color: #94a3b8; font-size: 10.5px; font-weight: 700; }
+.custom-label-symbols, .custom-label-chip-styles { display: flex; gap: 5px; flex-wrap: wrap; }
+.custom-label-symbol {
+  width: 26px; height: 26px; border: 1px solid #e2e8f0; border-radius: 7px; background: #fff;
+  color: #475569; font-size: 12px; cursor: pointer;
+}
+.custom-label-symbol:hover { border-color: var(--preset-color); color: var(--preset-color); }
+.custom-label-symbol.active { border-color: var(--preset-color); background: color-mix(in srgb, var(--preset-color) 12%, white); color: var(--preset-color); font-weight: 800; }
+.custom-label-chip-style {
+  height: 26px; padding: 0 12px; border: 1px solid #e2e8f0; border-radius: 999px; background: #fff;
+  color: #475569; font-size: 11.5px; font-weight: 700; cursor: pointer;
+}
+.custom-label-chip-style:hover { border-color: var(--preset-color); color: var(--preset-color); }
+.custom-label-chip-style.active { border-color: var(--preset-color); background: color-mix(in srgb, var(--preset-color) 12%, white); color: var(--preset-color); }
+.custom-label-advanced summary { color: #64748b; font-size: 11px; cursor: pointer; }
+.custom-label-advanced[open] summary { margin-bottom: 6px; }
+
+/* 日志行里的标签：新增「符号 + 三种样式」；颜色/位置/长度逻辑不变。 */
+.log-custom-label.style-solid { border-color: var(--custom-label-color); background: var(--custom-label-color); color: #fff; }
+.log-custom-label.style-outline { background: #fff; color: var(--custom-label-color); }
+.log-custom-label-symbol { margin-right: 4px; font-style: normal; font-size: 9.5px; opacity: .9; }
+
+/* 关键字带 () 但应用位置是「仅日志正文」时的提示：这种规则会静默不命中。 */
+.rule-keyword-warning {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  margin-top: 5px; padding: 6px 8px;
+  border: 1px solid #fde68a; border-radius: 7px; background: #fffbeb;
+  color: #92400e; font-size: 11px; line-height: 1.5;
+}
+.rule-keyword-warning code { padding: 0 4px; border-radius: 4px; background: #fef3c7; font: 11px "Cascadia Code", Consolas, monospace; }
+.rule-keyword-warning .button { margin-left: auto; height: 22px; }

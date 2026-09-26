@@ -30,6 +30,12 @@ export interface DisplayRule {
   customLabelTemplate?: string;
   /** 自定义标签颜色，同时用于时间线标签 marker。 */
   customLabelColor?: string;
+  /** 语义色盘里选的预设 id（异常/控制流程…）；只用于回显，颜色仍以 customLabelColor 为准。 */
+  customLabelPresetId?: string;
+  /** 标签前缀符号（✕ ▲ ✓ ▶…）：颜色之外的第二层区分。 */
+  customLabelSymbol?: string;
+  /** 标签样式：柔和 / 实心 / 描边。 */
+  customLabelStyle?: 'soft' | 'solid' | 'outline';
   /** 是否把自定义标签颜色投射到时间线。 */
   showLabelOnTimeline?: boolean;
   /**
@@ -80,6 +86,8 @@ export interface DisplayRuleMatch {
   supplementalText?: string;
   customLabelText?: string;
   customLabelColor?: string;
+  customLabelSymbol?: string;
+  customLabelStyle?: 'soft' | 'solid' | 'outline';
   showLabelOnTimeline?: boolean;
   parameters: Record<string, string>;
   sourceMessage: string;
@@ -135,6 +143,12 @@ function safeParseRules(value: string | null): DisplayRule[] {
         displayMode: candidate.displayMode === 'label' || candidate.displayMode === 'both' || candidate.displayMode === 'semantic' ? candidate.displayMode : 'semantic',
         customLabelTemplate: typeof candidate.customLabelTemplate === 'string' ? candidate.customLabelTemplate : '',
         customLabelColor: typeof candidate.customLabelColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(candidate.customLabelColor) ? candidate.customLabelColor : '#2563eb',
+        // 色盘选的预设、符号、样式都要跟着规则一起落库（白名单漏字段会让它们在保存后消失）。
+        customLabelPresetId: typeof candidate.customLabelPresetId === 'string' ? candidate.customLabelPresetId : undefined,
+        customLabelSymbol: typeof candidate.customLabelSymbol === 'string' ? candidate.customLabelSymbol : undefined,
+        customLabelStyle: candidate.customLabelStyle === 'solid' || candidate.customLabelStyle === 'outline' || candidate.customLabelStyle === 'soft'
+          ? candidate.customLabelStyle
+          : undefined,
         showLabelOnTimeline: candidate.showLabelOnTimeline !== false,
         liveWatch: candidate.liveWatch === true,
         supplementalDescription: typeof candidate.supplementalDescription === 'string' ? candidate.supplementalDescription : undefined,
@@ -358,6 +372,8 @@ export function matchDisplayRuleToMessage(rule: DisplayRule, rawOrMessage: strin
       text: rule.displayTemplate,
       customLabelText: displayMode !== 'semantic' && rule.customLabelTemplate?.trim() ? rule.customLabelTemplate.trim() : undefined,
       customLabelColor: displayMode !== 'semantic' ? (rule.customLabelColor || '#2563eb') : undefined,
+      customLabelSymbol: displayMode !== 'semantic' ? (rule.customLabelSymbol || undefined) : undefined,
+      customLabelStyle: displayMode !== 'semantic' ? (rule.customLabelStyle || 'soft') : undefined,
       showLabelOnTimeline: displayMode !== 'semantic' ? rule.showLabelOnTimeline !== false : undefined,
       supplementalText: rule.supplementalDescription?.trim() || undefined,
       parameters: {},
@@ -391,6 +407,8 @@ export function matchDisplayRuleToMessage(rule: DisplayRule, rawOrMessage: strin
       ? applyDisplayTemplate(rule.customLabelTemplate, rule.parameters, valuesById)
       : undefined,
     customLabelColor: displayMode !== 'semantic' ? (rule.customLabelColor || '#2563eb') : undefined,
+    customLabelSymbol: displayMode !== 'semantic' ? (rule.customLabelSymbol || undefined) : undefined,
+    customLabelStyle: displayMode !== 'semantic' ? (rule.customLabelStyle || 'soft') : undefined,
     showLabelOnTimeline: displayMode !== 'semantic' ? rule.showLabelOnTimeline !== false : undefined,
     supplementalText: rule.supplementalDescription?.trim()
       ? applyDisplayTemplate(rule.supplementalDescription, rule.parameters, valuesById)

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Braces,
   Check,
   EyeOff,
@@ -37,6 +38,7 @@ import {
 import { createMaskingRuleId, type MaskingRule, type MaskingRuleKind, type MaskingRuleScope } from '../rendering/maskingRules';
 import { recognizeSemanticSource } from '../api/resourceApi';
 import { createErrorMatchRule, type ErrorMatchRule } from '../parser/logParser';
+import { LABEL_CHIP_STYLES, LABEL_PRESETS, LABEL_SYMBOLS, labelPresetByColor } from '../rendering/labelPresets';
 import type { DataExtractionRule } from '../rendering/dataExtractionRules';
 import { createCustomFoldingRule, foldingRuleLogicLabel, type FoldingRule } from '../rendering/foldingRules';
 import { DataExtractionRulesPanel } from './DataExtractionRulesPanel';
@@ -745,7 +747,18 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
 
           <div className={`rule-form-grid ${semanticEditor.rule.kind === 'keyword' ? 'three-columns' : 'two-columns'}`}>
             <label><span>规则名称</span><input value={semanticEditor.rule.name} onChange={(event) => updateRule({ name: event.target.value })} placeholder="例如：安全初始化依赖组件"/></label>
-            {semanticEditor.rule.kind === 'keyword' && <label><span>函数名包含关键字</span><input value={semanticEditor.rule.keyword ?? ''} onChange={(event) => updateRule({ keyword: event.target.value })} placeholder="safe_initialize_default_dependencies()"/></label>}
+            {semanticEditor.rule.kind === 'keyword' && <label><span>函数名包含关键字</span><input value={semanticEditor.rule.keyword ?? ''} onChange={(event) => updateRule({ keyword: event.target.value })} placeholder="safe_initialize_default_dependencies()"/>
+              {/* 关键字带 () 只在「函数名」语境成立；选「仅日志正文」时正文里根本不会有
+                  `X()` 这种写法（日志通常写 `[X] >()`），规则会静默不命中。这里点明并给一键修正。 */}
+              {semanticEditor.rule.scope === 'log' && /\(\s*\)$/.test((semanticEditor.rule.keyword || '').trim()) && (
+                <span className="rule-keyword-warning">
+                  <AlertTriangle size={12}/>
+                  关键字里的 <code>()</code> 只在函数名里出现，「仅日志正文」要求正文里真的写着 <code>{semanticEditor.rule.keyword}</code>。
+                  你的日志一般写 <code>[{(semanticEditor.rule.keyword || '').trim().replace(/\(\s*\)$/, '')}] &gt;()</code>，点右侧按钮把 <code>()</code> 去掉即可命中。
+                  <button type="button" className="button secondary compact" onClick={() => updateRule({ keyword: (semanticEditor.rule.keyword || '').trim().replace(/\(\s*\)$/, '') })}>改成不带 ()</button>
+                </span>
+              )}
+            </label>}
             <label><span>应用位置</span><select value={semanticEditor.rule.scope} onChange={(event) => updateRule({ scope: event.target.value as DisplayRule['scope'] })}><option value="function">仅折叠函数标题</option><option value="log">仅日志正文</option><option value="both">函数标题 + 日志正文</option></select></label>
             <label><span>展示方式</span><select value={semanticEditor.rule.displayMode ?? 'semantic'} onChange={(event) => { const displayMode = event.target.value as DisplayRuleMode; updateRule({ displayMode, ...(displayMode !== 'semantic' && semanticEditor.rule.scope === 'function' ? { scope: displayMode === 'label' ? 'log' : 'both' } : {}) }); }}><option value="semantic">仅显示语义</option><option value="label">仅显示自定义标签</option><option value="both">语义 + 自定义标签</option></select></label>
           </div>
@@ -782,7 +795,57 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
             <div className="rule-step-heading rule-step-heading-with-action"><span>{semanticEditor.rule.kind === 'template' ? ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '4' : '3') : ((semanticEditor.rule.displayMode ?? 'semantic') === 'both' ? '2' : '1')}</span><div><strong>自定义标签</strong><small>显示在日志行「文件名/行号」前面，<b>建议 10 个字以内</b>（超出会截断显示，悬停仍可看到完整标签）；可使用固定文本、提取参数或两者组合。</small></div><AiAutoconfigButton onRun={() => autoConfigureSemantic('label')} disabled={!semanticEditor.sampleRaw.trim() && !semanticEditor.sampleMessage.trim()} disabledHint="先粘贴样例日志" label="AI 生成标签" compact title="按样例日志生成标签文本与颜色"/></div>
             <div className="custom-label-config-grid">
               <label className="custom-label-template-field"><span>标签文本</span><textarea ref={labelTemplateTextareaRef} className="rule-display-template-input" value={semanticEditor.rule.customLabelTemplate ?? ''} onChange={(event) => updateRule({ customLabelTemplate: event.target.value })} placeholder={semanticEditor.rule.kind === 'template' ? '例如：{参数1} 或 状态 {参数1}' : '例如：READY'}/></label>
-              <label className="custom-label-color-field"><span>标签颜色</span><div className="custom-label-color-control"><input type="color" value={semanticEditor.rule.customLabelColor ?? '#2563eb'} onChange={(event) => updateRule({ customLabelColor: event.target.value })}/><code>{semanticEditor.rule.customLabelColor ?? '#2563eb'}</code><span className="rule-custom-label-preview" style={{ '--rule-label-color': semanticEditor.rule.customLabelColor || '#2563eb' } as React.CSSProperties}>{semanticEditor.rule.customLabelTemplate || '标签预览'}</span></div></label>
+              <div className="custom-label-style-field">
+                <span>标签色盘</span>
+                {/* 颜色不让用户自己调：同一含义永远同一颜色，标签才能一眼扫出来。
+                    每个色卡带语义名 + 使用场景；颜色之外还有符号与样式两层区分。 */}
+                <div className="custom-label-presets" role="radiogroup" aria-label="标签色盘">
+                  {LABEL_PRESETS.map((preset) => {
+                    const active = (semanticEditor.rule.customLabelPresetId || labelPresetByColor(semanticEditor.rule.customLabelColor)?.id) === preset.id;
+                    const chipStyle = semanticEditor.rule.customLabelStyle || 'soft';
+                    return <button
+                      type="button"
+                      key={preset.id}
+                      role="radio"
+                      aria-checked={active}
+                      className={`custom-label-preset ${active ? 'active' : ''}`}
+                      style={{ '--preset-color': preset.color } as React.CSSProperties}
+                      title={preset.hint}
+                      onClick={() => updateRule({ customLabelColor: preset.color, customLabelPresetId: preset.id, customLabelSymbol: preset.symbol })}
+                    >
+                      <span className={`custom-label-preset-chip style-${chipStyle}`}>
+                        {preset.symbol && <i aria-hidden="true">{preset.symbol}</i>}
+                        {semanticEditor.rule.customLabelTemplate || preset.name}
+                      </span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.hint}</small>
+                      {active && <Check size={13} className="custom-label-preset-check" />}
+                    </button>;
+                  })}
+                </div>
+                <div className="custom-label-style-row">
+                  <label><span>标签符号</span><div className="custom-label-symbols">{LABEL_SYMBOLS.map((symbol) => <button
+                    type="button"
+                    key={symbol || 'none'}
+                    className={`custom-label-symbol ${(semanticEditor.rule.customLabelSymbol || '') === symbol ? 'active' : ''}`}
+                    style={{ '--preset-color': semanticEditor.rule.customLabelColor || '#2563eb' } as React.CSSProperties}
+                    title={symbol ? `标签前加「${symbol}」` : '不加符号'}
+                    onClick={() => updateRule({ customLabelSymbol: symbol })}
+                  >{symbol || '无'}</button>)}</div></label>
+                  <label><span>标签样式</span><div className="custom-label-chip-styles">{LABEL_CHIP_STYLES.map((style) => <button
+                    type="button"
+                    key={style.id}
+                    className={`custom-label-chip-style ${(semanticEditor.rule.customLabelStyle || 'soft') === style.id ? 'active' : ''}`}
+                    style={{ '--preset-color': semanticEditor.rule.customLabelColor || '#2563eb' } as React.CSSProperties}
+                    title={style.hint}
+                    onClick={() => updateRule({ customLabelStyle: style.id })}
+                  >{style.name}</button>)}</div></label>
+                </div>
+                <details className="custom-label-advanced">
+                  <summary>自定义颜色（高级）</summary>
+                  <div className="custom-label-color-control"><input type="color" value={semanticEditor.rule.customLabelColor ?? '#2563eb'} onChange={(event) => updateRule({ customLabelColor: event.target.value, customLabelPresetId: undefined })}/><code>{semanticEditor.rule.customLabelColor ?? '#2563eb'}</code><span className="rule-custom-label-preview" style={{ '--rule-label-color': semanticEditor.rule.customLabelColor || '#2563eb' } as React.CSSProperties}>{semanticEditor.rule.customLabelTemplate || '标签预览'}</span></div>
+                </details>
+              </div>
             </div>
             <label className="rule-switch custom-label-timeline-switch"><input type="checkbox" checked={semanticEditor.rule.showLabelOnTimeline !== false} onChange={(event) => updateRule({ showLabelOnTimeline: event.target.checked })}/> 在时间线上显示标签颜色</label><label className="rule-switch custom-label-timeline-switch"><input type="checkbox" checked={semanticEditor.rule.liveWatch === true} onChange={(event) => updateRule({ liveWatch: event.target.checked })}/> 实时监听这条规则（命中推送到时间线标签流）</label>
             {semanticEditor.rule.parameters.length > 0 && <div className="rule-placeholder-buttons"><span>插入标签参数：</span>{semanticEditor.rule.parameters.map((parameter) => <button type="button" key={parameter.id} onClick={() => insertLabelPlaceholder(parameter)}>{`{${parameter.label}}`}</button>)}</div>}
