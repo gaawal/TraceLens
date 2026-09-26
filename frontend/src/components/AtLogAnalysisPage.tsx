@@ -498,7 +498,7 @@ function isExplicitErrorLine(line: string): boolean {
   return /(?:\bERROR\b|\bFATAL\b|\bCRITICAL\b|\bALARM\b|AssertionError|\bFAILED\b|<failure\b|\bFAILURE\b)/i.test(line);
 }
 
-function NavigableLogTextViewer({ text, fileName, formatRules, categories = [], errorRules, emptyText = '没有可展示的内容。' }: { text: string; fileName: string; formatRules: readonly LogFormatParserRuleConfig[]; categories?: string[]; errorRules?: readonly ErrorMatchRule[]; emptyText?: string }) {
+function NavigableLogTextViewer({ text, fileName, formatRules, categories = [], errorRules, emptyText = '没有可展示的内容。', focusLine }: { text: string; fileName: string; formatRules: readonly LogFormatParserRuleConfig[]; categories?: string[]; errorRules?: readonly ErrorMatchRule[]; emptyText?: string; focusLine?: number }) {
   const rows = useMemo(() => text.split(/\r?\n/).filter((line) => line.length > 0).map((line, index) => {
     const parsed = parseLogLineByCategories(line, {
       sourceFileId: `atlog-nav-${fileName}`,
@@ -528,6 +528,17 @@ function NavigableLogTextViewer({ text, fileName, formatRules, categories = [], 
     const timer = window.setTimeout(() => rowRefs.current.get(errorIndexes[0])?.scrollIntoView({ block: 'center' }), 30);
     return () => window.clearTimeout(timer);
   }, [text, errorIndexes.join(',')]);
+
+  // 外部（例如报告页的「异常速览」）指定要看哪一行时，直接滚过去并标成当前行。
+  useEffect(() => {
+    if (focusLine === undefined) return;
+    const target = rowRefs.current.get(focusLine);
+    if (!target) return;
+    const position = errorIndexes.indexOf(focusLine);
+    if (position >= 0) setErrorCursor(position);
+    const timer = window.setTimeout(() => target.scrollIntoView({ block: 'center', behavior: 'smooth' }), 0);
+    return () => window.clearTimeout(timer);
+  }, [focusLine, errorIndexes.join(',')]);
 
   const activeRow = errorIndexes[errorCursor];
   return <div className="atlog-navigable-viewer">
@@ -809,72 +820,6 @@ function AtLogSourceTypeSelect({ selected, onChange }: { selected: Set<string>; 
       })}
     </div>}
   </div>;
-}
-
-function PytestLogPane({ analysis, formatRules, errorRules, onlyErrors = false }: { analysis: AtLogCaseAnalysis; formatRules: readonly LogFormatParserRuleConfig[]; errorRules: readonly ErrorMatchRule[]; onlyErrors?: boolean }) {
-  const assertionText = useMemo(() => buildDiagnosisAssertionText(analysis), [analysis]);
-  const [reportText, setReportText] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => {
-    const key = analysis.links.test_html ? 'test_html' : analysis.links.pytest_xml ? 'pytest_xml' : '';
-    const url = key ? analysis.links[key] : '';
-    const relative = url ? relativePathFromLink(analysis.base_url, url) : '';
-    if (!relative) { setReportText(analysis.report_excerpt || analysis.failure_text || ''); return; }
-    let active = true;
-    setLoading(true); setError('');
-    void readAtLogCaseFile({ url: analysis.base_url, relative_path: relative, max_bytes: 5 * 1024 * 1024 })
-      .then((value) => { if (active) setReportText(readableAtLogDocument(value.content, key)); })
-      .catch((exc) => { if (active) setError(exc instanceof Error ? exc.message : String(exc)); })
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [analysis.base_url, analysis.links.test_html, analysis.links.pytest_xml, analysis.report_excerpt, analysis.failure_text]);
-  const displayedReportText = onlyErrors ? filterAtLogErrorLines(reportText, errorRules) : reportText;
-  return <div className="atlog-pytest-source-pane">
-    <section className="atlog-diagnostic-pane atlog-pytest-assertion-pane">
-      <div className="atlog-pane-tabs"><strong>pytest 断言</strong><span className="atlog-pane-hint">已有断言解析</span></div>
-      <NavigableLogTextViewer text={assertionText} fileName="pytest-assertion.log" formatRules={formatRules} errorRules={errorRules} emptyText="没有 pytest 断言信息。"/>
-    </section>
-    <section className="atlog-diagnostic-pane">
-      <div className="atlog-pane-tabs"><strong>pytest HTML</strong><span className="atlog-pane-hint">已提取为可读文本</span></div>
-      {loading && <div className="atlog-empty-inline"><LoaderCircle className="spin" size={15}/> 正在读取 pytest HTML…</div>}
-      {error && <div className="atlog-inline-error"><AlertTriangle size={14}/>{error}</div>}
-      {!loading && !error && <NavigableLogTextViewer text={displayedReportText} fileName="pytest.html" formatRules={formatRules} errorRules={errorRules} emptyText="没有可展示的 pytest HTML 内容。"/>}
-    </section>
-  </div>;
-}
-
-function XytestLogPane({ analysis, formatRules, errorRules, startTime, endTime, onlyErrors = false }: { analysis: AtLogCaseAnalysis; formatRules: readonly LogFormatParserRuleConfig[]; errorRules: readonly ErrorMatchRule[]; startTime: string; endTime: string; onlyErrors?: boolean }) {
-  const [content, setContent] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => {
-    const url = analysis.links['xytest.log'];
-    const relative = url ? relativePathFromLink(analysis.base_url, url) : '';
-    if (!relative) { setContent(analysis.xytest_errors.map((row) => row.raw).join('\n')); return; }
-    let active = true;
-    setLoading(true); setError('');
-    void readAtLogCaseFile({ url: analysis.base_url, relative_path: relative, max_bytes: 6 * 1024 * 1024 })
-      .then((value) => { if (active) setContent(value.content); })
-      .catch((exc) => { if (active) setError(exc instanceof Error ? exc.message : String(exc)); })
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [analysis.base_url, analysis.links['xytest.log']]);
-  const filteredContent = useMemo(() => {
-    const startNs = timestampToNs(apiTime(startTime));
-    const endNs = timestampToNs(apiTime(endTime));
-    if (startNs === undefined || endNs === undefined) return content;
-    return content.split(/\r?\n/).filter((line) => {
-      const match = line.match(/(20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
-      if (!match) return true;
-      const value = timestampToNs(match[1].replace('T', ' '));
-      return value === undefined || (value >= startNs && value <= endNs);
-    }).join('\n');
-  }, [content, startTime, endTime]);
-  if (loading) return <div className="atlog-empty-inline"><LoaderCircle className="spin" size={15}/> 正在读取 xytest.log…</div>;
-  if (error) return <div className="atlog-inline-error"><AlertTriangle size={14}/>{error}</div>;
-  const displayedContent = onlyErrors ? filterAtLogErrorLines(filteredContent, errorRules) : filteredContent;
-  return <NavigableLogTextViewer text={displayedContent} fileName="xytest.log" formatRules={formatRules} categories={['run']} errorRules={errorRules} emptyText="xytest.log 没有可展示内容。"/>;
 }
 
 interface WorkstationEvidence {
@@ -1525,13 +1470,176 @@ function filterAtLogErrorLines(text: string, errorRules: readonly ErrorMatchRule
   return text.split(/\r?\n/).filter((line) => !line.trim() || errorRules.some((rule) => matchesErrorRule(line, rule)) || detectSeverity(line, '') === 'error').join('\n');
 }
 
+/** 报告文件里的异常行（和原文查看器同一套判定，保证「速览」和「原文高亮」一致）。 */
+function reportErrorLines(text: string, errorRules: readonly ErrorMatchRule[]): Array<{ index: number; lineNumber: number; text: string }> {
+  const result: Array<{ index: number; lineNumber: number; text: string }> = [];
+  text.split(/\r?\n/).forEach((line, index) => {
+    if (!line.trim()) return;
+    const isError = errorRules.some((rule) => matchesErrorRule(line, rule))
+      || (!errorRules.length && (simpleLineSeverity(line) === 'error' || isExplicitErrorLine(line)));
+    if (isError) result.push({ index, lineNumber: index + 1, text: line.replace(/\s+/g, ' ').slice(0, 240) });
+  });
+  return result;
+}
+
+/**
+ * 报告页：先用一屏讲清「什么问题、错在哪、关键报错是什么」，再按文件看原文。
+ *
+ * 之前是左右两栏塞三个面板（pytest 断言 / pytest HTML / xytest.log），两边都很窄、
+ * 全是原始文本，用户得自己从里面翻出报错 —— 一眼看不出问题在哪。
+ * 现在：结论条 → 异常速览（可点击定位）→ 单文件全宽原文（标签切换）。
+ */
 function CaseReportTab({ analysis, formatRules, errorRules, startTime, endTime }: { analysis: AtLogCaseAnalysis; formatRules: readonly LogFormatParserRuleConfig[]; errorRules: readonly ErrorMatchRule[]; startTime: string; endTime: string }) {
-  const [onlyErrors, setOnlyErrors] = useState(true);
-  return <section className="atlog-case-tab-panel atlog-case-report-tab-panel">
-    <div className="atlog-case-tab-toolbar"><strong>测试报告</strong><label className="atlog-inline-check"><input type="checkbox" checked={onlyErrors} onChange={(event) => setOnlyErrors(event.target.checked)}/>只看报错</label></div>
-    <div className="atlog-case-report-tab-grid">
-      <section className="atlog-diagnostic-pane"><div className="atlog-pane-tabs"><strong>pytest</strong>{analysis.links.test_html && <a href={analysis.links.test_html} target="_blank" rel="noreferrer" title="打开原始 pytest HTML"><ExternalLink size={14}/></a>}</div><PytestLogPane analysis={analysis} formatRules={formatRules} errorRules={errorRules} onlyErrors={onlyErrors}/></section>
-      <section className="atlog-diagnostic-pane"><div className="atlog-pane-tabs"><strong>xytest.log</strong>{analysis.links['xytest.log'] && <a href={analysis.links['xytest.log']} target="_blank" rel="noreferrer" title="打开原始 xytest.log"><ExternalLink size={14}/></a>}</div><XytestLogPane analysis={analysis} formatRules={formatRules} errorRules={errorRules} startTime={startTime} endTime={endTime} onlyErrors={onlyErrors}/></section>
+  const [onlyErrors, setOnlyErrors] = useState(false);
+  const [assertionOpen, setAssertionOpen] = useState(false);
+  const [focusLine, setFocusLine] = useState<number>();
+
+  /** 报告文件：pytest HTML → xytest.log → event.log → 其它补充报告。 */
+  const files = useMemo(() => {
+    const order = ['test_html', 'pytest_xml', 'xytest.log', 'event.log', 'failures_report.html', 'details_report.html', 'summary_report.html', 'summary.ini'];
+    return Object.keys(analysis.links)
+      .filter((key) => Boolean(analysis.links[key]))
+      .sort((left, right) => {
+        const li = order.indexOf(left); const ri = order.indexOf(right);
+        return (li < 0 ? order.length : li) - (ri < 0 ? order.length : ri);
+      });
+  }, [analysis.links]);
+  const [activeFile, setActiveFile] = useState(() => files[0] || '');
+  useEffect(() => { if (files.length && !files.includes(activeFile)) setActiveFile(files[0]); }, [files, activeFile]);
+
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    const url = analysis.links[activeFile];
+    const relative = url ? relativePathFromLink(analysis.base_url, url) : '';
+    setFocusLine(undefined);
+    if (!relative) {
+      // 没有文件链接时退回页面已有的证据文本，至少不是空白。
+      setContent(activeFile === 'xytest.log'
+        ? analysis.xytest_errors.map((row) => row.raw).join('\n')
+        : (analysis.report_excerpt || analysis.failure_text || ''));
+      return;
+    }
+    let active = true;
+    setLoading(true); setError('');
+    void readAtLogCaseFile({ url: analysis.base_url, relative_path: relative, max_bytes: 6 * 1024 * 1024 })
+      .then((value) => { if (active) setContent(activeFile === 'xytest.log' || activeFile === 'event.log' ? value.content : readableAtLogDocument(value.content, activeFile)); })
+      .catch((exc) => { if (active) setError(exc instanceof Error ? exc.message : String(exc)); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [activeFile, analysis.base_url, analysis.links[activeFile]]);
+
+  // xytest.log 还是按用例时间窗收一下，避免把整段时间的噪声都倒出来。
+  const scopedContent = useMemo(() => {
+    if (activeFile !== 'xytest.log') return content;
+    const startNs = timestampToNs(apiTime(startTime));
+    const endNs = timestampToNs(apiTime(endTime));
+    if (startNs === undefined || endNs === undefined) return content;
+    return content.split(/\r?\n/).filter((line) => {
+      const match = line.match(/(20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
+      if (!match) return true;
+      const value = timestampToNs(match[1].replace('T', ' '));
+      return value === undefined || (value >= startNs && value <= endNs);
+    }).join('\n');
+  }, [activeFile, content, startTime, endTime]);
+
+  const errors = useMemo(() => reportErrorLines(scopedContent, errorRules), [scopedContent, errorRules]);
+  const meta = analysis.assertion_meta || ({} as AtLogCaseAnalysis['assertion_meta']);
+  const summary = analysis.summary || {};
+  const passed = String(analysis.status || '') === 'passed';
+  const verdict = analysis.assertion_summary || analysis.conclusion || (passed ? '用例通过' : '用例失败');
+  const keyError = String(meta.error_msg || analysis.failure_text || '').trim().split(/\r?\n/)[0] || '';
+  const failureLocation = analysis.failure_location || undefined;
+  const locationText = failureLocation
+    ? `${failureLocation.file || ''}${failureLocation.line ? `:${failureLocation.line}` : ''}${failureLocation.function ? ` · ${failureLocation.function}` : ''}`
+    : '';
+  const displayed = onlyErrors ? filterAtLogErrorLines(scopedContent, errorRules) : scopedContent;
+  const lineCount = scopedContent ? scopedContent.split(/\r?\n/).filter(Boolean).length : 0;
+
+  return <section className="atlog-case-tab-panel atlog-report-panel">
+    {/* ① 结论条：一眼看到是什么问题 */}
+    <header className={`atlog-report-verdict ${passed ? 'passed' : 'failed'}`}>
+      <div className="atlog-report-verdict-head">
+        <span className="atlog-report-verdict-badge">{passed ? <Check size={14}/> : <AlertTriangle size={14}/>}{passed ? '通过' : '失败'}</span>
+        <strong>{verdict}</strong>
+        <span className="atlog-report-verdict-counts">
+          {typeof summary.tests === 'number' && <span>{summary.tests} 用例</span>}
+          {typeof summary.failures === 'number' && <span className={summary.failures ? 'danger' : ''}>{summary.failures} 失败</span>}
+          {typeof summary.errors === 'number' && <span className={summary.errors ? 'danger' : ''}>{summary.errors} 错误</span>}
+          {analysis.failure_time && <span>失败时刻 {String(analysis.failure_time).replace('T', ' ').slice(0, 19)}</span>}
+        </span>
+      </div>
+      {(meta.expect || meta.real) && <div className="atlog-report-verdict-diff">
+        {meta.expect && <span><b>期望</b><code>{meta.expect}</code></span>}
+        {meta.real && <span><b>实际</b><code className="danger">{meta.real}</code></span>}
+        {meta.relation_cn && <span><b>关系</b>{meta.relation_cn}</span>}
+      </div>}
+      {keyError && <div className="atlog-report-verdict-error" title={keyError}>
+        <span className="atlog-report-verdict-error-label">关键报错</span>
+        <code>{keyError}</code>
+        <button
+          type="button"
+          className="button ghost compact"
+          onClick={() => void navigator.clipboard?.writeText(String(meta.error_msg || analysis.failure_text || '')).catch(() => undefined)}
+        >复制</button>
+      </div>}
+      <div className="atlog-report-verdict-meta">
+        {locationText && <span><b>失败位置</b><code>{locationText}</code></span>}
+        {analysis.reason_category && <span><b>原因分类</b>{analysis.reason_category}</span>}
+        {analysis.call_chain.length > 0 && <span className="atlog-report-verdict-chain"><b>调用链</b>
+          {analysis.call_chain.slice(0, 6).map((frame, index) => <em key={`${frame.file || ''}-${index}`} title={`${frame.file || ''}${frame.line ? `:${frame.line}` : ''}`}>{frame.function || frame.file || `#${index + 1}`}</em>)}
+        </span>}
+      </div>
+      <details className="atlog-report-assertion" open={assertionOpen} onToggle={(event) => setAssertionOpen((event.currentTarget as HTMLDetailsElement).open)}>
+        <summary>断言详情 / 原始摘录</summary>
+        <pre>{buildDiagnosisAssertionText(analysis)}</pre>
+      </details>
+    </header>
+
+    <div className="atlog-report-body">
+      {/* ② 异常速览：这个文件里有几处异常，点一条直接定位 */}
+      <section className="atlog-report-errors">
+        <div className="atlog-report-errors-head">
+          <strong>异常速览</strong>
+          <span>{loading ? '读取中…' : errors.length ? `${errors.length} 处异常（${linkLabel(activeFile)}）` : `未识别到异常行（${linkLabel(activeFile)}）`}</span>
+        </div>
+        {errors.length > 0 && <div className="atlog-report-error-list">
+          {errors.slice(0, 40).map((item) => <button
+            type="button"
+            key={item.index}
+            className={focusLine === item.index ? 'active' : ''}
+            onClick={() => setFocusLine(item.index)}
+            title="跳到原文这一行"
+          >
+            <span className="atlog-report-error-line">L{item.lineNumber}</span>
+            <code>{item.text}</code>
+          </button>)}
+          {errors.length > 40 && <span className="atlog-report-error-more">还有 {errors.length - 40} 处，用下方「下一异常」继续看。</span>}
+        </div>}
+      </section>
+
+      {/* ③ 单文件全宽原文：标签切换，不再是左右两栏 */} 
+      <section className="atlog-report-file">
+        <div className="atlog-report-file-tabs">
+          {files.map((key) => <button type="button" key={key} className={key === activeFile ? 'active' : ''} onClick={() => setActiveFile(key)}>{linkLabel(key)}</button>)}
+          <span className="spacer"/>
+          {activeFile && analysis.links[activeFile] && <a href={analysis.links[activeFile]} target="_blank" rel="noreferrer" title="打开原始文件"><ExternalLink size={14}/></a>}
+          <label className="atlog-inline-check"><input type="checkbox" checked={onlyErrors} onChange={(event) => setOnlyErrors(event.target.checked)}/>只看报错</label>
+          {!loading && !error && lineCount > 0 && <span className="atlog-report-file-meta">{lineCount.toLocaleString()} 行{errors.length ? ` · 异常 ${errors.length} 处` : ''}</span>}
+        </div>
+        {loading && <div className="atlog-empty-inline"><LoaderCircle className="spin" size={16}/> 正在读取 {linkLabel(activeFile)}…</div>}
+        {error && <div className="atlog-inline-error"><AlertTriangle size={15}/>{error}</div>}
+        {!loading && !error && <NavigableLogTextViewer
+          text={displayed}
+          fileName={activeFile || 'report'}
+          formatRules={formatRules}
+          categories={activeFile === 'xytest.log' ? ['run'] : []}
+          errorRules={errorRules}
+          focusLine={focusLine}
+          emptyText={`${linkLabel(activeFile)} 没有可展示内容。`}
+        />}
+      </section>
     </div>
   </section>;
 }

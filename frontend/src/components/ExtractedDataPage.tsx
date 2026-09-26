@@ -56,6 +56,16 @@ function liveCaptureLabel(record: DataExtractionRecord): string {
   return `实时采集${window.length === 2 ? ` ${window[0]}–${window[1]}` : ''}${snapshot.hits ? ` · 命中 ${snapshot.hits.toLocaleString()} 条` : ''}`;
 }
 
+/** 采集时段只在真的跨了时间时才占用表格一格；一两秒内结束的采集显示「—」，别重复名字里的信息。 */
+function liveCaptureWindow(record: DataExtractionRecord): string {
+  const snapshot = liveCaptureSnapshot(record);
+  if (!snapshot?.started_at || !snapshot?.ended_at) return '';
+  const start = new Date(String(snapshot.started_at)).getTime();
+  const end = new Date(String(snapshot.ended_at)).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 2000) return '';
+  return `${String(snapshot.started_at).replace('T', ' ').slice(5, 19)} → ${String(snapshot.ended_at).replace('T', ' ').slice(11, 19)}`;
+}
+
 function resultLabel(record: DataExtractionRecord) {
   if (record.status === 'success') return { text: `命中 ${record.matched_rule_count} 项 · ${record.row_count.toLocaleString()} 行`, cls: 'success' };
   if (record.status === 'no_result') return { text: '未命中数据', cls: 'no-result' };
@@ -299,12 +309,21 @@ export function ExtractedDataPage({ sourceOperationFilter, onClearSourceOperatio
       {filtered.map((record) => {
         const result = resultLabel(record);
         const session = sessionFor(record);
-        return <tr key={record.id}>
-          <td><strong>{record.name}</strong><small>#{record.id} · {record.source_operation_id ? record.source_operation_id.slice(0, 12) : '无远程审计'}</small>{liveCaptureLabel(record) && <small className="data-live-record-tag">{liveCaptureLabel(record)} · 还原按命中回放，不重读日志</small>}</td>
+        // 记录行只留一眼有用的信息：名字 + 编号/审计号 + 任务/环境/时间窗/规则/结果/时间/操作。
+        // 其余细节（实时采集时段、命中数、回放方式等）放进悬停提示，不在表格里重复一遍名字。
+        const liveDetail = liveCaptureLabel(record);
+        const rowTitle = [
+          record.name,
+          liveDetail ? `${liveDetail}（还原按命中回放，不重读日志）` : '',
+          record.task_name ? `来源任务：${record.task_name}` : '',
+          record.source_operation_id ? `远程审计：${record.source_operation_id}` : '',
+        ].filter(Boolean).join('\n');
+        return <tr key={record.id} title={rowTitle}>
+          <td><strong>{record.name}</strong><small>#{record.id}{record.source_operation_id ? ` · ${record.source_operation_id.slice(0, 12)}` : ''}</small></td>
           <td>{record.task_name || '—'}</td>
           <td>{record.environment_name || (record.environment ? `环境 #${record.environment}` : '—')}</td>
           <td>{isLiveCaptureRecord(record)
-            ? <small className="data-live-range">实时采集 {String(liveCaptureSnapshot(record)?.started_at || '—').replace('T', ' ').slice(0, 19)} → {String(liveCaptureSnapshot(record)?.ended_at || '—').replace('T', ' ').slice(11, 19)}</small>
+            ? <small title={liveDetail}>{liveCaptureWindow(record) || '—'}</small>
             : <><small>{String(record.query_snapshot?.start_time || '—')}</small><span className="data-range-separator">→</span><small>{String(record.query_snapshot?.end_time || '—')}</small></>}</td>
           <td><div className="data-field-chips">{record.rule_snapshots.slice(0, 4).map((raw, index) => <span key={String((raw as { id?: string }).id || index)}>{String((raw as { name?: string }).name || `规则${index + 1}`)}</span>)}{record.rule_snapshots.length > 4 && <span>+{record.rule_snapshots.length - 4}</span>}</div></td>
           <td><span className={`data-record-status ${result.cls}`}>{result.text}</span>{session && <small className="data-session-ready">当前浏览器已还原</small>}</td>
