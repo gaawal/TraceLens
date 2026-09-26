@@ -3091,6 +3091,14 @@ function functionLogCategoryMetas(node: FunctionNode): Array<{ label: string; cl
   return metas;
 }
 
+/** 日志行上的自定义标签最多显示 10 个字：更长就截断（完整内容留在悬停提示里），
+    这样标签排在最前面也不会把文件名/行号挤掉或盖住。 */
+const LOG_LABEL_MAX_CHARS = 10;
+function clampLogLabel(text: string, max = LOG_LABEL_MAX_CHARS): string {
+  const value = String(text || '').trim();
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
 function LogRow({
   entry,
   selected,
@@ -3186,6 +3194,16 @@ function LogRow({
         {semanticMatch && <span className="log-inline-semantic" title={`用户语义 · ${semanticMatch.ruleName}\n${semanticMatch.text}${semanticMatch.supplementalText ? `\n补充说明：${semanticMatch.supplementalText}` : ''}`}>{semanticMatch.text}</span>}
       </span>
       <span className="log-row-meta">
+        {/* 标签排在最前面（文件名/行号之前），每个最多 10 个字，完整内容看悬停提示。 */}
+        {visibleCustomLabels.length > 0 && <span className="log-custom-labels" aria-label="自定义标签">
+          {visibleCustomLabels.map((match) => <span
+            key={`${match.ruleId}-${match.customLabelText}`}
+            className="log-custom-label"
+            style={{ '--custom-label-color': match.customLabelColor || '#2563eb' } as React.CSSProperties}
+            title={`${match.ruleName}\n${match.customLabelText}`}
+          >{clampLogLabel(match.customLabelText || '')}</span>)}
+          {hiddenCustomLabelCount > 0 && <span className="log-custom-label more" title={customLabelMatches.slice(3).map((match) => match.customLabelText).join('\n')}>+{hiddenCustomLabelCount}</span>}
+        </span>}
         {sourceText ? <button
           type="button"
           className={classNames('source-location-button', sourceCopied && 'copied')}
@@ -3197,15 +3215,6 @@ function LogRow({
         </button> : <span className="source-location-placeholder" />}
         {semanticMatch && <span className="semantic-origin-slot">
           <span className="semantic-origin-badge user" title={`用户语义 · ${semanticMatch.ruleName}\n${semanticMatch.text}${semanticMatch.supplementalText ? `\n补充说明：${semanticMatch.supplementalText}` : ''}`}>用户语义</span>
-        </span>}
-        {visibleCustomLabels.length > 0 && <span className="log-custom-labels" aria-label="自定义标签">
-          {visibleCustomLabels.map((match) => <span
-            key={`${match.ruleId}-${match.customLabelText}`}
-            className="log-custom-label"
-            style={{ '--custom-label-color': match.customLabelColor || '#2563eb' } as React.CSSProperties}
-            title={`${match.ruleName}\n${match.customLabelText}`}
-          >{match.customLabelText}</span>)}
-          {hiddenCustomLabelCount > 0 && <span className="log-custom-label more" title={customLabelMatches.slice(3).map((match) => match.customLabelText).join('\n')}>+{hiddenCustomLabelCount}</span>}
         </span>}
         {categoryMeta && <span className="log-category-slot">
           <span className={`log-category-badge ${categoryMeta.className}`}>{categoryMeta.label}</span>

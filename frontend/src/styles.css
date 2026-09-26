@@ -17811,3 +17811,25 @@ html.workstation-docked {
 .atlog-report-file-tabs > button.active { border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
 .atlog-report-file-tabs .spacer { flex: 1 1 auto; }
 .atlog-report-file-meta { color: #64748b; font-size: 11px; }
+
+/* 日志行上的自定义标签：排在**文件名/行号前面**，每个最多 10 个字（JS 已截断），
+   不换行、不伸缩、不覆盖其它信息。完整标签文本仍在悬停提示里。 */
+.log-row-meta { overflow: hidden; }
+.log-row-meta .log-custom-labels {
+  flex: none;
+  order: -1;                    /* 双保险：DOM 里已经在最前面了 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+  gap: 4px;
+  min-width: 0;
+  max-width: none;
+}
+.log-row-meta .log-custom-label {
+  flex: none;
+  max-width: 13em;              /* 兜底：超过 10 个字由 JS 加省略号 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
