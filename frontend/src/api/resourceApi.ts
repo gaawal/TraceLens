@@ -1184,6 +1184,29 @@ export interface TraceLensAssistantChoiceOption {
   detail?: string;
 }
 
+/** 批量建规则的**候选草稿**：先在对话里列出来让用户勾选，点「创建」才真的落库。 */
+export interface TraceLensAssistantRuleDraft {
+  name: string;
+  kind: 'keyword' | 'template' | string;
+  scope?: string;
+  keyword?: string;
+  sample_message?: string;
+  display_mode?: 'semantic' | 'label' | 'both' | string;
+  display_template?: string;
+  custom_label_template?: string;
+  custom_label_color?: string;
+  parameters?: Array<{ label: string; sample_value: string }>;
+  group?: { label?: string; count?: number; function_name?: string; component?: string; members?: string[] };
+}
+
+export interface TraceLensAssistantRuleDrafts {
+  mode?: string;
+  group_by?: string;
+  summary?: string;
+  warnings?: string[];
+  rules: TraceLensAssistantRuleDraft[];
+}
+
 /** 「让用户选择」工具发过来的结构化选项（前端渲染成固定选择组件，不用手打）。 */
 export interface TraceLensAssistantChoices {
   question: string;
@@ -1355,6 +1378,7 @@ export type TraceLensAssistantStreamEvent =
   | { type: 'token_usage'; usage: TraceLensAssistantTokenUsage }
   | { type: 'confirmation'; confirmation: TraceLensAssistantConfirmation }
   | { type: 'choices'; choices: TraceLensAssistantChoices }
+  | { type: 'rule_drafts'; drafts: TraceLensAssistantRuleDrafts }
   | { type: 'ui_action'; action: Record<string, unknown>; action_id?: string; run_id?: string }
   | { type: 'done'; message: string; confirmation_count?: number; memory?: string; result_cards?: TraceLensAssistantResultCard[]; suggested_actions?: string[] }
   | { type: 'error'; message: string };

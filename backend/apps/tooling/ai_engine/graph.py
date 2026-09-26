@@ -640,10 +640,35 @@ def _execute(state: ExecutionState) -> dict[str, Any]:
                     if a._run_cancelled(run_id):
                         raise a.AssistantCancelled("用户已终止当前分析。")
 
-                    result = {"status": "ok", "data": value}
-                    # 「让用户选择」只发 choices 事件，**绝不能**再发 ui_action：
+                    preview_drafts = False
+                    if tool.id == "bulk_generate_log_rules" and isinstance(value, dict) and value.get("rules"):
+                        # 批量建规则**不直接落库**：先把候选列成预览事件，用户勾选后点「创建」才真的创建
+                        # （用户明确要求：要列出选项 → 勾选 → 点创建）。
+                        draft_payload = value.get("ui_action") if isinstance(value.get("ui_action"), dict) else {}
+                        _emit(state, {"type": "rule_drafts", "drafts": {
+                            "mode": draft_payload.get("mode") or value.get("mode"),
+                            "group_by": value.get("group_by"),
+                            "summary": draft_payload.get("summary") or value.get("summary"),
+                            "warnings": list(value.get("warnings") or [])[:6],
+                            "rules": list(draft_payload.get("rules") or value.get("rules") or []),
+                        }})
+                        preview_drafts = True
+                        result = {
+                            "success": True,
+                            "waiting_for_user_confirmation": True,
+                            "message": (
+                                f"已把 {len(value.get('rules') or [])} 条候选规则列给用户预览（界面会带勾选框）。"
+                                "本轮请**立即结束**：用一句话说明「已列出候选，勾选后点创建」，"
+                                "不要再调用工具、不要把规则逐条念一遍。"
+                            ),
+                        }
+                    else:
+                        result = {"status": "ok", "data": value}
+                    # 「让用户选择」「规则预览」都只发自己的事件，**绝不能**再发 ui_action：
                     # 前端不会给一个不存在的页面动作回执，发了就会让整轮一直等回执（卡在"运行中"）。
-                    action = None if interactive_choice else (a._extract_ui_action(value) or evidence_action(tool.id, arguments, value))
+                    action = None if (interactive_choice or preview_drafts) else (
+                        a._extract_ui_action(value) or evidence_action(tool.id, arguments, value)
+                    )
                     if action:
                         ui_actions.append(action)
                         action_id = uuid.uuid4().hex

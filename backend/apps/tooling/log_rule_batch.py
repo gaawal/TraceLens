@@ -175,12 +175,55 @@ def group_samples(samples: Iterable[Sample], *, group_by: str = "similar") -> li
         group.count += max(1, sample.count)
         if len(group.members) < 6:
             group.members.append(sample.display)
+        # 参数要取**整组**的并集：组里每行可能带不同的 key（dof/point/code/cause/trace…）。
+        # 只用第一行的参数，模型引用到别的 key 时就会因"占位符没有对应参数"被前端校验直接拦下。
+        existing = {key for key, _ in group.parameters}
+        for key, value in extract_parameters(sample.message):
+            if key in existing or len(group.parameters) >= MAX_PARAMETERS:
+                continue
+            existing.add(key)
+            group.parameters.append((key, value))
         if not group.function_name and sample.function_name:
             group.function_name = sample.function_name
         if not group.component and sample.component:
             group.component = sample.component
     ordered = sorted(groups.values(), key=lambda item: (-item.count, item.label))
     return ordered[:MAX_GROUPS]
+
+
+def sanitize_placeholders(text: str, labels: Iterable[str]) -> tuple[str, list[str]]:
+    """把模板里**没有对应参数**的 `{x}` 去掉，返回 (清理后的文本, 被去掉的名字)。
+
+    前端的 `validateDisplayRule` 会直接拒绝「语义/标签里引用了不存在的参数」，所以模型多写一个
+    `{trace}` 就会让整条候选被跳过（实测 10 条里 9 条因此被拦）。这里先清理并留痕，规则才能真正用上。"""
+    known = {str(label).strip() for label in labels if str(label).strip()}
+    dropped: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1).strip()
+        if name in known:
+            return match.group(0)
+        if name:
+            dropped.append(name)
+        return ""
+
+    # 先处理 `key={未知参数}` 这种成对写法：把 `key=` 一起去掉，别留下 `code=` 这种半截。
+    def replace_paired(match: "re.Match[str]") -> str:
+        name = match.group(1).strip()
+        if name in known:
+            return match.group(0)
+        if name:
+            dropped.append(name)
+        return ""
+
+    paired = re.sub(r"[A-Za-z_][\w.]*\s*[=:]\s*\{([^{}]+)\}", replace_paired, str(text or ""))
+    cleaned = re.sub(r"\{([^{}]+)\}", replace, paired)
+    # 去掉占位符后容易留下 ", ," "，，" 这种残渣。
+    cleaned = re.sub(r"([，,、;；])\s*(?=[，,、;；])", "", cleaned)
+    cleaned = re.sub(r"\s+([，,、;；。])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = cleaned.strip("，,、;；")
+    return cleaned, dropped
 
 
 def candidate_spec(
@@ -222,8 +265,11 @@ def candidate_spec(
     parameters = [
         {"label": key, "sample_value": value}
         for key, value in group.parameters
-        if value and (value in group.message)
+        if value and (value in group.message or any(value in member for member in group.members))
     ][:MAX_PARAMETERS]
+    parameter_labels = [item["label"] for item in parameters]
+    semantic_text, dropped_semantic = sanitize_placeholders(semantic_text, parameter_labels)
+    label_text, dropped_label = sanitize_placeholders(label_text, parameter_labels)
     if kind == "template" and not parameters:
         # 模板规则必须有参数样例，否则保存校验会直接拦下；没有 k=v 就退回关键字规则。
         kind = "keyword"
@@ -251,6 +297,8 @@ def candidate_spec(
             "component": group.component,
             "members": group.members[:4],
         },
+        # 模型写了但样例里没有对应参数的占位符（已从文案里去掉，供上层提示用户）。
+        "dropped_placeholders": sorted({*dropped_semantic, *dropped_label})[:8],
     }
 
 

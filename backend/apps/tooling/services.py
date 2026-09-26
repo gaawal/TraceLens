@@ -2357,6 +2357,9 @@ def bulk_generate_log_rules(payload: dict[str, Any]) -> dict[str, Any]:
         f"{group_label}识别出 {len(groups)} 组日志，已生成 {len(candidates)} 条{mode_label}规则"
         f"（{semantic_count} 条含语义、{label_count} 条含标签），保存后立刻生效。"
     )
+    dropped_total = sorted({name for item in candidates for name in (item.get("dropped_placeholders") or [])})
+    if dropped_total:
+        warnings.append("以下占位符在样例里找不到对应参数，已从文案里去掉了：" + "、".join(dropped_total[:6]))
     if warnings:
         summary += " 注意：" + "；".join(warnings[:2])
     return {
@@ -2380,6 +2383,7 @@ def bulk_generate_log_rules(payload: dict[str, Any]) -> dict[str, Any]:
                 "sample_message": item["sample_message"],
                 "parameters": item["parameters"],
                 "group": item["group"],
+                "dropped_placeholders": item.get("dropped_placeholders") or [],
             }
             for item in candidates
         ],

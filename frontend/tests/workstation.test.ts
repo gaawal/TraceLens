@@ -515,3 +515,42 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   fav.saveFavoriteEnvironmentIds([]);
   console.log('Workstation checks passed: 环境收藏只存在本浏览器（localStorage），支持订阅、脏数据过滤与失效清理.');
 }
+
+// --- 关键字规则的占位符必须真的取值 -----------------------------------------
+// Regression: AI 批量生成的是**关键字**规则（关键字=函数名），语义说明里带 {step}/{wafer}
+// 这类占位符；以前关键字规则把语义说明原样返回、不替换，界面上就显示成"占位符没有参数"。
+{
+  const {matchDisplayRuleToMessage, matchDisplayRulesToFunction} = await import('../src/rendering/displayRules');
+  const rule = {
+    id: 'r-keyword', name: '载台回零', enabled: true, kind: 'keyword', scope: 'both',
+    keyword: 'Stage_WSP_HOME()',
+    displayTemplate: '回零位流程第 {step} 步，晶圆 {wafer}',
+    displayMode: 'both',
+    customLabelTemplate: '回零位',
+    customLabelColor: '#10b981',
+    parameters: [
+      {id: 'p-step', label: 'step', sampleValue: '1/6'},
+      {id: 'p-wafer', label: 'wafer', sampleValue: 'W01'},
+    ],
+  };
+  const direct = matchDisplayRuleToMessage(rule, 'Stage_WSP_HOME() >() enter stage homing stage start step=3/6 wafer=W09 lot=LOT-1');
+  assert.equal(direct?.text, '回零位流程第 3/6 步，晶圆 W09', '关键字规则也要把 step/wafer 取出来替换');
+  assert.equal(direct?.parameters?.['p-step'], '3/6');
+
+  // 函数级语义：取值要用真实日志行（node.name 只有函数名）
+  const node = {
+    kind: 'function', id: 'f1', name: 'Stage_WSP_HOME()', component: 'WSP', processId: '1', threadId: '2',
+    rpc: {raw: '-', id: '', kind: 'none'},
+    source: {raw: 'wsp:Stage_WSP_HOME:324', file: 'wsp', function: 'Stage_WSP_HOME', line: 324},
+    startEntry: {id: 'e1', timestamp: '2026-09-26 11:17:53.828', message: 'Stage_WSP_HOME() >() enter stage homing stage start step=5/6 wafer=W02',
+      component: 'WSP', source: {raw: 'wsp', file: 'wsp', function: 'F', line: 324}, severity: 'normal', raw: ''},
+    children: [], incomplete: false,
+  };
+  const byFunction = matchDisplayRulesToFunction([rule], node as never);
+  assert.equal(byFunction?.text, '回零位流程第 5/6 步，晶圆 W02');
+
+  // 取不到就保留占位符（别悄悄渲染成空）
+  const missing = matchDisplayRuleToMessage(rule, 'Stage_WSP_HOME() >() enter stage homing stage start 无参数');
+  assert.equal(missing?.text, '回零位流程第 {step} 步，晶圆 {wafer}');
+  console.log('Workstation checks passed: 关键字规则的 {参数} 占位符会就地取值替换.');
+}

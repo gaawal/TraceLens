@@ -346,6 +346,43 @@ function compileTemplatePattern(tokens: readonly DisplayPatternToken[]): Compile
   }
 }
 
+/**
+ * **关键字规则**的参数取值。
+ *
+ * 关键字规则没有模板 token（那是 `template` 规则才有的），以前直接把语义说明原样返回，
+ * 于是 AI 生成的 `…第 {step} 步（晶圆 {wafer}）` 把占位符**原样渲染**出来 —— 用户看到的
+ * 就是"占位符没有参数"。这里就地取值：
+ * ① 参数名本身就是日志里的 key（`step=`）→ 抓 `key=值`（跨行、带引号都能抓）；
+ * ② 否则退化成参数样例字面量（只有同一条样例日志才会命中）；
+ * ③ 都拿不到就保留占位符（宁可看见 `{x}`，也别悄悄渲染成空）。
+ */
+function keywordTemplateValues(
+  rule: DisplayRule,
+  message: string,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  const text = String(message || '');
+  rule.parameters.forEach((parameter) => {
+    const label = String(parameter.label || '').trim();
+    if (label) {
+      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      try {
+        const match = new RegExp(`${escaped}\\s*[=:]\\s*(?:"([^"]*)"|'([^']*)'|([^\\s,;]+))`).exec(text);
+        const captured = (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+        if (captured) {
+          values[parameter.id] = captured;
+          return;
+        }
+      } catch {
+        // 参数名里有正则元字符且转义失败时，走下面的字面量兜底。
+      }
+    }
+    const sample = String(parameter.sampleValue || '').trim();
+    if (sample && text.includes(sample)) values[parameter.id] = sample;
+  });
+  return values;
+}
+
 function applyDisplayTemplate(
   template: string,
   parameters: readonly DisplayRuleParameter[],
@@ -366,17 +403,20 @@ export function matchDisplayRuleToMessage(rule: DisplayRule, rawOrMessage: strin
   if (rule.kind === 'keyword') {
     const keyword = rule.keyword?.trim();
     if (!keyword || !message.includes(keyword)) return undefined;
+    const keywordValues = keywordTemplateValues(rule, message);
     return {
       ruleId: rule.id,
       ruleName: rule.name,
-      text: rule.displayTemplate,
-      customLabelText: displayMode !== 'semantic' && rule.customLabelTemplate?.trim() ? rule.customLabelTemplate.trim() : undefined,
+      text: applyDisplayTemplate(rule.displayTemplate, rule.parameters, keywordValues),
+      customLabelText: displayMode !== 'semantic' && rule.customLabelTemplate?.trim()
+        ? applyDisplayTemplate(rule.customLabelTemplate.trim(), rule.parameters, keywordValues)
+        : undefined,
       customLabelColor: displayMode !== 'semantic' ? (rule.customLabelColor || '#2563eb') : undefined,
       customLabelSymbol: displayMode !== 'semantic' ? (rule.customLabelSymbol || undefined) : undefined,
       customLabelStyle: displayMode !== 'semantic' ? (rule.customLabelStyle || 'soft') : undefined,
       showLabelOnTimeline: displayMode !== 'semantic' ? rule.showLabelOnTimeline !== false : undefined,
       supplementalText: rule.supplementalDescription?.trim() || undefined,
-      parameters: {},
+      parameters: keywordValues,
       sourceMessage: message,
     };
   }
@@ -468,13 +508,17 @@ export function matchDisplayRulesToFunction(
     if (rule.kind === 'keyword') {
       const keyword = rule.keyword?.trim();
       if (keyword && node.name.includes(keyword)) {
+        // 取值用**真实日志行**（node.name 只有函数名，取不到 step=/wafer= 这些）。
+        const functionValues = keywordTemplateValues(rule, node.startEntry.message || node.name);
         return {
           ruleId: rule.id,
           ruleName: rule.name,
-          text: rule.displayTemplate,
-          supplementalText: rule.supplementalDescription?.trim() || undefined,
-          parameters: {},
-          sourceMessage: node.name,
+          text: applyDisplayTemplate(rule.displayTemplate, rule.parameters, functionValues),
+          supplementalText: rule.supplementalDescription?.trim()
+            ? applyDisplayTemplate(rule.supplementalDescription, rule.parameters, functionValues)
+            : undefined,
+          parameters: functionValues,
+          sourceMessage: node.startEntry.message || node.name,
           sourceEntryId: node.startEntry.id,
         };
       }

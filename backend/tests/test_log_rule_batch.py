@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from apps.tooling import log_rule_batch as batch
@@ -124,3 +126,41 @@ def test_bulk_tool_requires_samples():
         bulk_generate_log_rules({"mode": "semantic", "samples": []})
     with pytest.raises(ToolInputError):
         bulk_generate_log_rules({"mode": "semantic", "samples": ["这不是日志", "也不是"]})
+
+
+# --- 参数取整组并集 + 清掉模型编出来的占位符 ---------------------------------
+# Regression: 语义/标签里引用不存在的参数会被前端 validateDisplayRule 直接拦掉
+# （实测一次批量 10 条里被拦了 9 条），而且关键字规则以前根本不替换占位符。
+
+def test_group_parameters_cover_every_member():
+    lines = [
+        "[2026-09-26 11:17:53.828] [INFO] [WSP] [1] [2] [wsp] [normal] [wsp:CheckPositionError:88] CheckPositionError() >() enter check dof=6 code=ERR_X",
+        "[2026-09-26 11:17:54.360] [INFO] [WSP] [1] [2] [wsp] [normal] [wsp:CheckPositionError:88] CheckPositionError() <() leave check dof=6 code=ERR_X cause=ERR_Y trace=TR-1",
+    ]
+    samples = [batch.parse_sample(line) for line in lines]
+    group = batch.group_samples([item for item in samples if item], group_by="function")[0]
+    labels = [key for key, _ in group.parameters]
+    assert labels == ["dof", "code", "cause", "trace"], f"参数要取整组并集，实际 {labels}"
+
+    rule = batch.build_candidates([group], mode="both")[0]
+    assert {item["label"] for item in rule["parameters"]} >= {"dof", "cause", "trace"}
+
+
+def test_unknown_placeholders_are_stripped_from_candidate_text():
+    cleaned, dropped = batch.sanitize_placeholders("检查位置误差，dof={dof}，错误码 code={code}，追踪号 {trace}", ["dof"])
+    assert cleaned == "检查位置误差，dof={dof}，错误码，追踪号", cleaned
+    assert dropped == ["code", "trace"]
+    # 已知参数原样保留
+    assert batch.sanitize_placeholders("第 {step} 步 / {wafer}", ["step", "wafer"]) == ("第 {step} 步 / {wafer}", [])
+
+
+def test_candidates_never_reference_unknown_parameters():
+    """候选文案里不允许留任何"没有对应参数"的占位符（前端校验的同一条规则）。"""
+    samples = [batch.parse_sample(LINE_HOME_IN), batch.parse_sample(LINE_MOVE_A), batch.parse_sample(LINE_MOVE_B)]
+    samples = [item for item in samples if item]
+    for group_by in ("function", "similar"):
+        for rule in batch.build_candidates(batch.group_samples(samples, group_by=group_by), mode="both"):
+            labels = {item["label"] for item in rule["parameters"]}
+            for text in (rule["display_template"], rule["custom_label_template"]):
+                used = set(re.findall(r"\{([^{}]+)\}", text or ""))
+                assert used <= labels, f"占位符 {used - labels} 没有对应参数：{text}"

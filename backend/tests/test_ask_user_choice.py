@@ -63,8 +63,11 @@ def test_choice_tool_is_registered_and_always_offered_to_the_agent():
     graph = (ROOT / "backend/apps/tooling/ai_engine/graph.py").read_text(encoding="utf-8")
     assert 'selected_tool_ids.add("ask_user_choice")' in graph, "必须无条件投放给 Agent（不属于某个领域）"
     assert '"type": "choices", "choices": choice_payload' in graph
-    # choices 分支之后的 ui_action 计算必须跳过，否则会一直等一个不存在的回执。
-    assert "action = None if interactive_choice else" in graph
+    # choices / rule_drafts 分支之后的 ui_action 计算必须跳过，否则会一直等一个不存在的回执。
+    assert "action = None if (interactive_choice or preview_drafts) else" in graph
+    # 批量建规则只发预览事件（用户勾选后点「创建」才真的创建）。
+    assert '"type": "rule_drafts", "drafts": {' in graph
+    assert "preview_drafts = True" in graph
 
 
 def test_router_tells_the_model_to_ask_before_bulk_generating():

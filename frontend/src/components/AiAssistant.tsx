@@ -45,6 +45,7 @@ import {
   transcribeTraceLensVoice,
   type TraceLensAiModelOption,
   type TraceLensAssistantChoices,
+  type TraceLensAssistantRuleDrafts,
   type TraceLensAssistantConfirmation,
   type TraceLensAssistantResultCard,
   type TraceLensAssistantTrace,
@@ -109,6 +110,8 @@ interface AssistantMessage {
   confirmations?: TraceLensAssistantConfirmation[];
   /** 结构化选项：渲染成固定选择组件，点一下就把选项内容发回去。 */
   choices?: TraceLensAssistantChoices;
+  /** 批量建规则的候选草稿：勾选后点「创建」才真的创建（预览阶段不落库）。 */
+  ruleDrafts?: TraceLensAssistantRuleDrafts;
   resultCards?: TraceLensAssistantResultCard[];
   suggestions?: string[];
   /** 整理成案例 — the extracted conclusion attached to the message it came from. */
@@ -512,6 +515,109 @@ function loadFabPosition(): FabPosition {
 
 function currentContext(): Record<string, unknown> { return collectPageContext(); }
 
+
+/**
+ * 批量建规则的**预览 + 勾选 + 创建**卡片。
+ *
+ * 用户明确要求：先把要创建的规则列出来，勾选之后点「创建」才真的创建 ——
+ * 所以预览阶段**不碰规则库**，点创建时再走页面已有的 `apply_log_display_rules` 动作
+ * （复用同一套原生校验/去重/保存/渲染逻辑，不另起一条写库路径）。
+ */
+function AssistantRuleDraftCard({ drafts, onDone }: {
+  drafts: TraceLensAssistantRuleDrafts;
+  onDone: (detail: string) => void;
+}) {
+  const rules = drafts.rules || [];
+  const [checked, setChecked] = useState<string[]>(() => rules.map((_, index) => String(index)));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const semanticCount = rules.filter((rule) => (rule.display_mode ?? 'semantic') !== 'label').length;
+  const labelCount = rules.filter((rule) => (rule.display_mode ?? 'semantic') !== 'semantic').length;
+  const groupLabel = drafts.group_by === 'function' ? '按函数方法分组' : '按同类特征分组';
+
+  function toggle(index: number) {
+    if (busy) return;
+    const key = String(index);
+    setChecked((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]);
+  }
+
+  async function create() {
+    if (busy || !checked.length) return;
+    setBusy(true);
+    setError('');
+    const selected = rules.filter((_, index) => checked.includes(String(index)));
+    try {
+      const receipt = await new Promise<{ status?: string; detail?: string }>((resolve) => {
+        const detail = {
+          type: 'apply_log_display_rules',
+          mode: drafts.mode,
+          summary: drafts.summary,
+          rules: selected,
+          __complete: (value: { status?: string; detail?: string }) => resolve(value || {}),
+        };
+        window.dispatchEvent(new CustomEvent('tracelens:assistant-ui', { detail }));
+        window.setTimeout(() => resolve({ status: 'timeout', detail: '页面没有在 10 秒内完成创建' }), 10000);
+      });
+      if (receipt.status === 'success') {
+        onDone(String(receipt.detail || `已创建 ${selected.length} 条规则`));
+      } else {
+        setError(String(receipt.detail || '创建失败'));
+        setBusy(false);
+      }
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : String(exc));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="ai-rule-drafts" role="group" aria-label="待创建的规则">
+      <div className="ai-rule-drafts-head">
+        <ListChecks size={16} />
+        <div>
+          <strong>将创建 {rules.length} 条规则</strong>
+          <small>{groupLabel} · {semanticCount} 条语义、{labelCount} 条标签 · 勾选后点「创建」才会真正创建</small>
+        </div>
+      </div>
+      <div className="ai-rule-drafts-list">
+        {rules.map((rule, index) => {
+          const key = String(index);
+          const active = checked.includes(key);
+          const label = String(rule.custom_label_template || '').trim();
+          const color = String(rule.custom_label_color || '#2563eb');
+          return (
+            <label className={`ai-rule-draft${active ? ' active' : ''}`} key={`${rule.name}-${index}`}>
+              <input type="checkbox" checked={active} disabled={busy} onChange={() => toggle(index)} />
+              <span className="ai-rule-draft-body">
+                <span className="ai-rule-draft-title">
+                  <strong>{rule.name}</strong>
+                  {label && <em className="ai-rule-draft-label" style={{ '--draft-label-color': color } as CSSProperties}>{label}</em>}
+                  <i className="ai-rule-draft-kind">{rule.kind === 'template' ? '模板匹配' : '关键字匹配'}</i>
+                  {typeof rule.group?.count === 'number' && <i className="ai-rule-draft-count">{rule.group.count} 条日志</i>}
+                </span>
+                <span className="ai-rule-draft-match" title={rule.kind === 'template' ? (rule.sample_message || '') : (rule.keyword || '')}>
+                  {rule.kind === 'template' ? `正文：${String(rule.sample_message || '').slice(0, 90)}` : `关键字：${rule.keyword || ''}`}
+                </span>
+                {String(rule.display_template || '').trim() && <span className="ai-rule-draft-semantic">语义：{rule.display_template}</span>}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      {drafts.warnings && drafts.warnings.length > 0 && (
+        <ul className="ai-rule-drafts-warnings">{drafts.warnings.slice(0, 4).map((item) => <li key={item}>{item}</li>)}</ul>
+      )}
+      {error && <div className="ai-rule-drafts-error">{error}</div>}
+      <div className="ai-rule-drafts-actions">
+        <button type="button" className="button ghost compact" disabled={busy} onClick={() => setChecked([])}>全不选</button>
+        <button type="button" className="button ghost compact" disabled={busy} onClick={() => setChecked(rules.map((_, index) => String(index)))}>全选</button>
+        <button type="button" className="button primary compact" disabled={busy || checked.length === 0} onClick={() => void create()}>
+          {busy ? <LoaderCircle className="spin" size={14}/> : <Plus size={14}/>} 创建 {checked.length} 条规则
+        </button>
+      </div>
+    </div>
+  );
+}
 
 /**
  * 「让用户选择」的固定选择组件。
@@ -2563,6 +2669,13 @@ export function AiAssistant() {
               });
               return;
             }
+            if (event.type === 'rule_drafts') {
+              const drafts = event.drafts && typeof event.drafts === 'object' ? event.drafts as TraceLensAssistantRuleDrafts : undefined;
+              if (drafts && Array.isArray(drafts.rules) && drafts.rules.length) {
+                updateMessage(conversationId, assistantId, (message) => ({ ...message, ruleDrafts: drafts }));
+              }
+              return;
+            }
             if (event.type === 'choices') {
               const choices = event.choices && typeof event.choices === 'object' ? event.choices as TraceLensAssistantChoices : undefined;
               if (choices && Array.isArray(choices.options) && choices.options.length) {
@@ -3020,6 +3133,15 @@ export function AiAssistant() {
                         onRegenerate={(notes) => void requestCaseDraft(activeConversation.id, message.id, notes)}
                         onSave={(result) => void saveCaseDraft(result)}
                         onDismiss={() => patchMessage(activeConversation.id, message.id, { caseDraft: undefined })}
+                      />
+                    )}
+                    {message.role === 'assistant' && message.ruleDrafts && (
+                      <AssistantRuleDraftCard
+                        drafts={message.ruleDrafts}
+                        onDone={(detail) => patchMessage(activeConversation.id, message.id, {
+                          ruleDrafts: undefined,
+                          content: `${message.content || ''}${message.content ? '\n\n' : ''}${detail}`.trim(),
+                        })}
                       />
                     )}
                     {message.role === 'assistant' && message.choices && (
