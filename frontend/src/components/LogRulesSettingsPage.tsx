@@ -20,12 +20,9 @@ import { autoconfigureRule, type SemanticRuleAutoconfigResult } from '../api/res
 import { AiAutoconfigButton, type AiAutoconfigOutcome } from './AiAutoconfigButton';
 import {
   buildPatternTokens,
-  collectFunctionNameCandidates,
   createDisplayRuleId,
   extractDisplayRuleMessage,
-  functionNameMatchesKeyword,
   markParameterOccurrences,
-  normalizeFunctionName,
   matchDisplayRuleToMessage,
   removeParameterMarks,
   renderPatternPreview,
@@ -39,7 +36,7 @@ import {
 } from '../rendering/displayRules';
 import { createMaskingRuleId, type MaskingRule, type MaskingRuleKind, type MaskingRuleScope } from '../rendering/maskingRules';
 import { recognizeSemanticSource } from '../api/resourceApi';
-import { createErrorMatchRule, parseLogLineByCategories, type ErrorMatchRule } from '../parser/logParser';
+import { createErrorMatchRule, type ErrorMatchRule } from '../parser/logParser';
 import type { DataExtractionRule } from '../rendering/dataExtractionRules';
 import { createCustomFoldingRule, foldingRuleLogicLabel, type FoldingRule } from '../rendering/foldingRules';
 import { DataExtractionRulesPanel } from './DataExtractionRulesPanel';
@@ -627,77 +624,23 @@ export function LogRulesSettingsPage({ errorRules, displayRules, maskingRules, f
       setSemanticEditor({ ...semanticEditor, testState: { success: false, message: validation } });
       return;
     }
-    const testInput = semanticEditor.testInput.trim() ? semanticEditor.testInput : semanticEditor.sampleMessage;
-    if (rule.kind === 'keyword' && rule.scope === 'function') {
-      // 「函数名包含关键字」必须按**函数名**判定，而不是拿关键字去正文里做字面匹配：
-      // 解析器把函数名统一成 `MoveAbsolute()`，日志正文里却常写成
-      // `[MoveAbsolute] >() enter …`，字面匹配永远命中不了。
-      // 候选来自：打开编辑器时的来源函数名 + 测试日志解析出的函数名 + 文本里能认出来的函数名。
-      const parsed = parseLogLineByCategories(testInput, {
-        sourceFileId: 'display-rule-test',
-        sourceFileName: 'test.log',
-        lineNumber: 1,
-        idPrefix: 'display-rule-test',
-      }, [], []);
-      const candidates = [
-        sourceSeed?.functionName,
-        parsed.entry?.boundaryFunctionName,
-        parsed.entry?.functionName,
-        ...collectFunctionNameCandidates(testInput),
-      ].filter((value): value is string => Boolean(value && value.trim()));
-      const matchedName = candidates.find((name) => functionNameMatchesKeyword(name, rule.keyword || ''));
-      if (matchedName) {
-        setSemanticEditor({
-          ...semanticEditor,
-          testState: { success: true, message: `${matchedName} → ${rule.displayTemplate}` },
-        });
-        return;
-      }
-      if (candidates.length) {
-        setSemanticEditor({
-          ...semanticEditor,
-          testState: {
-            success: false,
-            message: `函数名 ${[...new Set(candidates)].join(' / ')} 未命中关键字 ${rule.keyword || ''}（函数名里的 () 可以省略不写）`,
-          },
-        });
-        return;
-      }
-    }
-    const input = testInput;
-    const result = matchDisplayRuleToMessage(rule, input);
-    if (result) {
+    if (rule.kind === 'keyword' && rule.scope === 'function' && sourceSeed?.functionName) {
+      const matched = Boolean(rule.keyword?.trim() && sourceSeed.functionName.includes(rule.keyword.trim()));
       setSemanticEditor({
         ...semanticEditor,
-        testState: { success: true, message: [((rule.displayMode ?? 'semantic') !== 'label' && result.text) ? `语义：${result.text}` : '', ((rule.displayMode ?? 'semantic') !== 'semantic' && result.customLabelText) ? `标签：[${result.customLabelText}]` : ''].filter(Boolean).join(' · ') || '规则已命中' },
+        testState: matched
+          ? { success: true, message: `${sourceSeed.functionName} → ${rule.displayTemplate}` }
+          : { success: false, message: `函数名 ${sourceSeed.functionName} 未命中关键字 ${rule.keyword || ''}` },
       });
       return;
     }
-    // 关键字是函数名、但正文里只有 `[MoveAbsolute]` 这种写法时，与其只丢一句「未命中」，
-    // 不如告诉用户应用位置选错了（这是最容易被这个格式绊倒的地方）。
-    if (rule.kind === 'keyword' && /\(\s*\)$/.test((rule.keyword || '').trim())) {
-      const parsedLog = parseLogLineByCategories(input, {
-        sourceFileId: 'display-rule-test', sourceFileName: 'test.log', lineNumber: 1, idPrefix: 'display-rule-test',
-      }, [], []);
-      const names = [
-        parsedLog.entry?.boundaryFunctionName,
-        parsedLog.entry?.functionName,
-        ...collectFunctionNameCandidates(input),
-      ].filter((value): value is string => Boolean(value && value.trim()));
-      if (names.some((name) => functionNameMatchesKeyword(name, rule.keyword || ''))) {
-        setSemanticEditor({
-          ...semanticEditor,
-          testState: {
-            success: false,
-            message: `关键字「${rule.keyword}」是函数名，正文里没有这种写法。把应用位置改成「仅折叠函数标题」（或「函数标题 + 日志正文」）即可命中；只想匹配正文就把关键字写成 ${normalizeFunctionName(rule.keyword || '')}。`,
-          },
-        });
-        return;
-      }
-    }
+    const input = semanticEditor.testInput.trim() ? semanticEditor.testInput : semanticEditor.sampleMessage;
+    const result = matchDisplayRuleToMessage(rule, input);
     setSemanticEditor({
       ...semanticEditor,
-      testState: { success: false, message: '未命中。请检查固定语句、参数选区和测试日志是否一致。' },
+      testState: result
+        ? { success: true, message: [((rule.displayMode ?? 'semantic') !== 'label' && result.text) ? `语义：${result.text}` : '', ((rule.displayMode ?? 'semantic') !== 'semantic' && result.customLabelText) ? `标签：[${result.customLabelText}]` : ''].filter(Boolean).join(' · ') || '规则已命中' }
+        : { success: false, message: '未命中。请检查固定语句、参数选区和测试日志是否一致。' },
     });
   }
   function saveSemantic() {

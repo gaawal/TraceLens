@@ -19,13 +19,10 @@ import {
 import type { DisplayRule, DisplayRuleEditorRequest, DisplayRuleKind, DisplayRuleParameter, ParameterMark } from '../rendering/displayRules';
 import type { LogEntry } from '../types';
 import { RuleExchangePanel } from './RuleExchangePanel';
-import { parseLogLineByCategories } from '../parser/logParser';
 import {
   buildPatternTokens,
-  collectFunctionNameCandidates,
   createDisplayRuleId,
   extractDisplayRuleMessage,
-  functionNameMatchesKeyword,
   markParameterOccurrences,
   matchDisplayRuleToMessage,
   removeParameterMarks,
@@ -393,36 +390,6 @@ export function SettingsCenter({
       return;
     }
     const input = editor.testInput.trim() ? editor.testInput : editor.sampleMessage;
-    // 「函数名包含关键字」按函数名判定：解析器给函数名补了 `()`，日志正文里却常写成
-    // `[MoveAbsolute] >() …`，拿关键字去正文里做字面匹配永远命中不了。
-    if (rule.kind === 'keyword' && rule.scope === 'function') {
-      const parsed = parseLogLineByCategories(input, {
-        sourceFileId: 'display-rule-test',
-        sourceFileName: 'test.log',
-        lineNumber: 1,
-        idPrefix: 'display-rule-test',
-      }, [], []);
-      const candidates = [
-        parsed.entry?.boundaryFunctionName,
-        parsed.entry?.functionName,
-        ...collectFunctionNameCandidates(input),
-      ].filter((value): value is string => Boolean(value && value.trim()));
-      const matchedName = candidates.find((name) => functionNameMatchesKeyword(name, rule.keyword || ''));
-      if (matchedName) {
-        setEditor({ ...editor, testState: { success: true, message: `${matchedName} → ${rule.displayTemplate}` } });
-        return;
-      }
-      if (candidates.length) {
-        setEditor({
-          ...editor,
-          testState: {
-            success: false,
-            message: `函数名 ${[...new Set(candidates)].join(' / ')} 未命中关键字 ${rule.keyword || ''}（函数名里的 () 可以省略不写）`,
-          },
-        });
-        return;
-      }
-    }
     const result = matchDisplayRuleToMessage(rule, input);
     setEditor({
       ...editor,
