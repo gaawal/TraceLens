@@ -1,4 +1,5 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, BookOpenCheck, Edit3, Eye, RefreshCw, Search, ShieldCheck, Trash2, X } from 'lucide-react';
 import { deleteAbnormalCase, listAbnormalCases, updateAbnormalCase, type AbnormalCase, type AbnormalCaseFeatureGroup } from '../api/resourceApi';
@@ -31,6 +32,7 @@ function historyAction(action: string): string {
  * the two entry points into that flow: 检索历史案例 and AI 诊断.
  */
 export function KnowledgeBasePage() {
+  const imeGuard = useImeCompositionGuard();
   const [cases, setCases] = useState<AbnormalCase[]>([]);
   const [query, setQuery] = useState('');
   const [enabledFilter, setEnabledFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
@@ -185,7 +187,7 @@ export function KnowledgeBasePage() {
           {(['all', 'enabled', 'disabled'] as const).map((value) => <button type="button" className={enabledFilter === value ? 'active' : ''} key={value} onClick={() => setEnabledFilter(value)}>{value === 'all' ? '全部' : value === 'enabled' ? '启用' : '停用'}</button>)}
         </div>
         <div className="remote-unified-text-search knowledge-unified-search">
-          <Search size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void refresh(); }} placeholder="搜索案例 / 模块 / 错误码 / 根因…"/>
+          <Search size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} onCompositionStart={imeGuard.onCompositionStart} onCompositionEnd={imeGuard.onCompositionEnd} onKeyDown={(event) => { if (event.key === 'Enter' && !imeGuard.isComposing(event)) void refresh(); }} placeholder="搜索案例 / 模块 / 错误码 / 根因…"/>
           {query && <button type="button" onClick={() => { setQuery(''); void refresh(''); }} aria-label="清空搜索"><X size={13}/></button>}
         </div>
         <button className="button primary remote-search-apply" onClick={() => void refresh()} disabled={loading}><Search size={14}/> 搜索</button>

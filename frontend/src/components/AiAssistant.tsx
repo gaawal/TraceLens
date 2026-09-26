@@ -49,6 +49,7 @@ import {
   type TraceLensCaseDraftResponse,
 } from '../api/resourceApi';
 import { executeUiAction } from '../assistant/workstation';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import {
   DEFAULT_EVIDENCE_MAX_CHARS,
   EVIDENCE_MAX_CHARS_PRESETS,
@@ -1409,6 +1410,8 @@ export function AiAssistant() {
   const [voiceError, setVoiceError] = useState('');
   const [voiceAvailable, setVoiceAvailable] = useState(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // 输入法选词时的回车不能当发送：中文候选词上屏那一下也带 Enter。
+  const imeGuard = useImeCompositionGuard();
   /**
    * 是否「吸附在底部」：只有用户自己往上翻时才松开。
    *
@@ -3028,8 +3031,13 @@ export function AiAssistant() {
                         else if (trigger === ' ') { closeComposerPopovers(); }
                       }}
                       onFocus={() => closeComposerPopovers()}
+                      onCompositionStart={imeGuard.onCompositionStart}
+                      onCompositionEnd={imeGuard.onCompositionEnd}
                       onKeyDown={(event) => {
                         if (event.key === 'Escape') { closeComposerPopovers(); return; }
+                        // 输入法还在选词（或刚上屏）时，回车只是确认候选词 —— 这里绝不能发送，
+                        // 否则用户中文还没打完就被发出去了。
+                        if (event.key === 'Enter' && imeGuard.isComposing(event)) return;
                         // ⌘/Ctrl+Enter 插话：push everything queued (plus this input) into
                         // the analysis that is running right now.
                         if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {

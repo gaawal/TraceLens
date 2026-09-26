@@ -19,6 +19,7 @@ import {
 import type { DisplayRule, DisplayRuleEditorRequest, DisplayRuleKind, DisplayRuleParameter, ParameterMark } from '../rendering/displayRules';
 import type { LogEntry } from '../types';
 import { RuleExchangePanel } from './RuleExchangePanel';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import {
   buildPatternTokens,
   createDisplayRuleId,
@@ -134,6 +135,8 @@ export function SettingsCenter({
   const templateTextareaRef = useRef<HTMLTextAreaElement>(null);
   const handledEditorRequestRef = useRef<string>();
 
+  // 输入法选词时的回车不能当提交（异常关键字这类中文输入尤其容易踩）。
+  const imeGuard = useImeCompositionGuard();
   const filteredDisplayRules = useMemo(() => {
     const keyword = ruleSearch.trim().toLocaleLowerCase();
     if (!keyword) return displayRules.map((rule, index) => ({ rule, index }));
@@ -472,8 +475,10 @@ export function SettingsCenter({
               <input
                 value={keywordDraft}
                 onChange={(event) => onKeywordDraftChange(event.target.value)}
+                onCompositionStart={imeGuard.onCompositionStart}
+                onCompositionEnd={imeGuard.onCompositionEnd}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
+                  if (event.key === 'Enter' && !imeGuard.isComposing(event)) {
                     event.preventDefault();
                     onAddErrorKeywords();
                   }

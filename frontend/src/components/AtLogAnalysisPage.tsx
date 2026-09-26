@@ -1,4 +1,5 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import { useEffect, useMemo, useRef, useState, type ComponentType, type DragEvent, type NamedExoticComponent, type ReactNode } from 'react';
 import ExcelJS from 'exceljs';
 import { afterPaint } from '../assistant/workstation';
@@ -2177,6 +2178,7 @@ function ReportFilePanel({ result, onClose }: { result: AtLogReportFileAnalysis;
 }
 
 export function AtLogAnalysisPage({ TimelineComponent, errorRules, onOpenEnvironmentCpdReports, onOpenEnvironmentLogLocator }: AtLogAnalysisPageProps) {
+  const imeGuard = useImeCompositionGuard();
   const [singleUrl, setSingleUrl] = useState(() => ATLOG_PAGE_CACHE.singleUrl);
   const [workbooks, setWorkbooks] = useState<ImportedWorkbook[]>(() => {
     const cached = ATLOG_PAGE_CACHE.workbooks?.length ? ATLOG_PAGE_CACHE.workbooks : [{ id: MANUAL_WORKBOOK_ID, name: '手工用例', cases: [] }];
@@ -2566,8 +2568,12 @@ export function AtLogAnalysisPage({ TimelineComponent, errorRules, onOpenEnviron
         <input
           value={singleUrl}
           onChange={(event) => setSingleUrl(event.target.value)}
+          onCompositionStart={imeGuard.onCompositionStart}
+          onCompositionEnd={imeGuard.onCompositionEnd}
           onKeyDown={(event) => {
             if (event.key !== 'Enter') return;
+            // 中文输入法选词的回车只上屏，不触发展开/解析。
+            if (imeGuard.isComposing(event)) return;
             event.preventDefault();
             const raw = singleUrl.trim();
             if (!raw) return;

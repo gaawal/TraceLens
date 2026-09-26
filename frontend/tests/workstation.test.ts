@@ -286,3 +286,23 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(appendLogContinuation({ message: 'a', raw: 'a' }, '  b').message, 'a\n  b');
   console.log('多行日志续行兼容检查通过');
 }
+
+// --- 输入法选词时的回车不能当发送 -------------------------------------------------
+// 中文输入法把候选词上屏那一次也会带 Enter；过去直接当成「发送」，话没打完就发出去了。
+{
+  const { imeCompositionBlocksSubmit } = await import('../src/utils/imeComposition');
+  const now = 1_000_000;
+  // ① 组合态中 → 拦
+  assert.equal(imeCompositionBlocksSubmit({ composing: true, lastCompositionEndAt: 0, now }), true);
+  // ② 事件自己报了 isComposing → 拦
+  assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: 0, now, event: { isComposing: true } }), true);
+  // ③ 有的浏览器把「确认候选词」报成 isComposing=false + keyCode 229 → 也拦
+  assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: 0, now, event: { keyCode: 229 } }), true);
+  // ④ 刚结束输入法的宽限期内 → 拦（Safari 上那次回车会晚于 compositionend）
+  assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: now - 30, now, graceMs: 80 }), true);
+  // ⑤ 正常打字间隔远大于宽限期 → 放行
+  assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: now - 500, now, graceMs: 80 }), false);
+  // ⑥ 从没进过输入法 → 放行
+  assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: 0, now }), false);
+  console.log('输入法回车守卫检查通过');
+}

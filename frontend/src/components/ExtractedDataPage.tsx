@@ -1,4 +1,5 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Database, Download, Eye, FileSearch, LoaderCircle, Merge, RefreshCw, RotateCcw, Search, Trash2, X } from 'lucide-react';
 import { DataVisualizationDialog } from './DataVisualizationDialog';
@@ -75,6 +76,7 @@ function resultLabel(record: DataExtractionRecord) {
 }
 
 export function ExtractedDataPage({ sourceOperationFilter, onClearSourceOperationFilter, onOpenSourceLog }: Props) {
+  const imeGuard = useImeCompositionGuard();
   const [records, setRecords] = useState<DataExtractionRecord[]>([]);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -297,7 +299,7 @@ export function ExtractedDataPage({ sourceOperationFilter, onClearSourceOperatio
   return <main className="data-page">
     <section className="data-page-header">
       <div><span className="eyebrow">DATA EXTRACTION</span><h1>数据提取</h1><p>这里只保存数据提取过程与可重放快照；实际数据需要时由浏览器重新还原，生成后可预览或下载。</p></div>
-      <div className="data-page-actions"><label><Search size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void refresh(); }} placeholder="搜索提取记录 / 环境 / 任务…"/></label><button className="button secondary compact" onClick={() => void refresh()}><RefreshCw className={loading ? 'spin' : ''} size={14}/> 刷新</button></div>
+      <div className="data-page-actions"><label><Search size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} onCompositionStart={imeGuard.onCompositionStart} onCompositionEnd={imeGuard.onCompositionEnd} onKeyDown={(event) => { if (event.key === 'Enter' && !imeGuard.isComposing(event)) void refresh(); }} placeholder="搜索提取记录 / 环境 / 任务…"/></label><button className="button secondary compact" onClick={() => void refresh()}><RefreshCw className={loading ? 'spin' : ''} size={14}/> 刷新</button></div>
     </section>
 
     {sourceOperationFilter && <div className="data-filter-banner"><Database size={15}/><span>仅显示来源日志任务 <strong>{sourceOperationFilter.slice(0, 16)}</strong> 的提取记录</span><button onClick={onClearSourceOperationFilter}><X size={13}/> 清除筛选</button></div>}

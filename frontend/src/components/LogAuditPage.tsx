@@ -1,4 +1,5 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
+import { useImeCompositionGuard } from '../utils/imeComposition';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp,
@@ -123,6 +124,7 @@ function auditFileTimeLabel(file: LogAuditRecord['matched_files'][number]): stri
 
 function AuditMatchedFilesPanel({ item }: { item: LogAuditRecord }) {
   const files = item.matched_files || [];
+  const imeGuard = useImeCompositionGuard();
   const [copiedKey, setCopiedKey] = useState('');
 
   async function copyFile(file: LogAuditRecord['matched_files'][number], key: string) {
@@ -191,6 +193,7 @@ function AuditTable({ rows, environments, onRetry, onOpenData, sortOrder, onSort
 
 export function LogAuditPage({ onRetry, onOpenData }: Props) {
   const initialRange = defaultRange(1);
+  const imeGuard = useImeCompositionGuard();
   const [filters, setFilters] = useState<Filters>({ ...initialRange, result: '', subsystem: '', module: '', sourceCategory: '', query: '' });
   const [applied, setApplied] = useState(filters);
   const [quickRange, setQuickRange] = useState('1天');
@@ -329,7 +332,7 @@ export function LogAuditPage({ onRetry, onOpenData }: Props) {
         <span className="remote-time-separator">—</span>
         <SmartDateTimeInput value={filters.endTime} label="结束时间" onChange={(value) => { setFilters((current) => ({ ...current, endTime: value })); setQuickRange(''); }} />
         <div className="remote-unified-text-search audit-unified-text-search">
-          <Search size={15}/><input value={filters.query} onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))} onKeyDown={(event) => { if (event.key === 'Enter') applySearch(); }} placeholder="搜索操作IP / 环境 / 关键字 / 错误…"/>
+          <Search size={15}/><input value={filters.query} onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))} onCompositionStart={imeGuard.onCompositionStart} onCompositionEnd={imeGuard.onCompositionEnd} onKeyDown={(event) => { if (event.key === 'Enter' && !imeGuard.isComposing(event)) applySearch(); }} placeholder="搜索操作IP / 环境 / 关键字 / 错误…"/>
           {filters.query && <button type="button" onClick={() => setFilters((current) => ({ ...current, query: '' }))} aria-label="清空搜索"><X size={13}/></button>}
         </div>
         <button type="button" className="button primary remote-search-apply" onClick={applySearch} disabled={busy}><Search size={15}/> 搜索</button>
