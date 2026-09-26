@@ -306,3 +306,25 @@ console.log('Workstation checks passed: async actions, fail-closed dispatch, abo
   assert.equal(imeCompositionBlocksSubmit({ composing: false, lastCompositionEndAt: 0, now }), false);
   console.log('输入法回车守卫检查通过');
 }
+
+// --- 已完成对话不重播逐字动画 -----------------------------------------------------
+// 打开一条已经完成的对话（历史记录 / 快照恢复）时，结论和过程文本要一次性显示；
+// 只有本次真的看着它跑完的任务才逐字展开。
+{
+  const { isRunInProgress, shouldAnimateTextReplay } = await import('../src/utils/textReplay');
+  assert.equal(isRunInProgress({ status: 'running' }), true);
+  assert.equal(isRunInProgress({ status: 'queued' }), true);
+  assert.equal(isRunInProgress({ status: 'completed' }), false);
+  assert.equal(isRunInProgress(undefined), false);
+
+  // 本次跑过、且没命中缓存 → 逐字展开
+  assert.equal(shouldAnimateTextReplay({ job_id: 'j1', status: 'completed', cache_hit: false }, 'j1'), true);
+  // 快照/缓存恢复的已完成任务 → 不展开
+  assert.equal(shouldAnimateTextReplay({ job_id: 'j1', status: 'completed', cache_hit: true }, 'j1'), false);
+  // 刚打开历史对话（本会话没见过它跑） → 不展开
+  assert.equal(shouldAnimateTextReplay({ job_id: 'j2', status: 'completed' }, 'j1'), false);
+  assert.equal(shouldAnimateTextReplay({ job_id: 'j3', status: 'completed' }, ''), false);
+  // 没有任务 → 不展开
+  assert.equal(shouldAnimateTextReplay(undefined, 'j1'), false);
+  console.log('已完成对话回看判定检查通过');
+}

@@ -1,5 +1,6 @@
 import { registerPageContextReader } from '../assistant/contextRegistry';
 import { useImeCompositionGuard } from '../utils/imeComposition';
+import { isRunInProgress, shouldAnimateTextReplay } from '../utils/textReplay';
 import { useEffect, useMemo, useRef, useState, type ComponentType, type DragEvent, type NamedExoticComponent, type ReactNode } from 'react';
 import ExcelJS from 'exceljs';
 import { afterPaint } from '../assistant/workstation';
@@ -1255,12 +1256,14 @@ function formatTokenCount(value: number | undefined): string {
   return count > 0 ? count.toLocaleString() : '—';
 }
 
-function TypewriterText({ text, className = '' }: { text: string; className?: string }) {
-  const [visible, setVisible] = useState('');
+function TypewriterText({ text, className = '', instant = false }: { text: string; className?: string; instant?: boolean }) {
+  const [visible, setVisible] = useState(() => (instant ? String(text || '') : ''));
   useEffect(() => {
     const content = String(text || '');
+    // 已经完成的对话再打开时直接显示全文：逐字展开只属于「正在跑」的过程。
+    if (instant) { setVisible(content); return undefined; }
     setVisible('');
-    if (!content) return;
+    if (!content) return undefined;
     let cursor = 0;
     const timer = window.setInterval(() => {
       cursor += 1;
@@ -1268,7 +1271,7 @@ function TypewriterText({ text, className = '' }: { text: string; className?: st
       if (cursor >= content.length) window.clearInterval(timer);
     }, 10);
     return () => window.clearInterval(timer);
-  }, [text]);
+  }, [text, instant]);
   return <span className={`atlog-ai-typewriter ${className}`}>{visible}<i aria-hidden="true"/></span>;
 }
 
@@ -1278,19 +1281,21 @@ function mergeAiEvents(current: AtLogAiJobEvent[], incoming: AtLogAiJobEvent[]):
   return Array.from(bySeq.values()).sort((left, right) => Number(left.seq || 0) - Number(right.seq || 0)).slice(-240);
 }
 
-function GrowingTypewriterText({ text }: { text: string }) {
+function GrowingTypewriterText({ text, instant = false }: { text: string; instant?: boolean }) {
   const [visible, setVisible] = useState('');
   const visibleRef = useRef('');
   const targetRef = useRef(String(text || ''));
 
   useEffect(() => {
     const next = String(text || '');
+    // 已完成的对话回看时直接给全文；只有运行过程中才逐字追。
+    if (instant) { visibleRef.current = next; setVisible(next); targetRef.current = next; return; }
     if (!next.startsWith(visibleRef.current)) {
       visibleRef.current = '';
       setVisible('');
     }
     targetRef.current = next;
-  }, [text]);
+  }, [text, instant]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1402,6 +1407,17 @@ function AiDiagnosisConversation({
 }) {
   const [processOpen, setProcessOpen] = useState(false);
   const running = ['queued', 'running'].includes(job?.status || '');
+  /**
+   * 逐字展开只属于「本次真的看着它跑」的过程。
+   *
+   * 打开一条已经完成的对话（或用例快照里恢复的诊断）时，文本、过程记录都要一次性显示 ——
+   * 再从头一个字一个字敲一遍纯属浪费用户时间。这里记住本会话里真正跑过的 job id，
+   * 只有它跑出来的结论/过程才逐字展开。
+   */
+  const watchedJobIdRef = useRef('');
+  if (isRunInProgress(job)) watchedJobIdRef.current = String(job?.job_id || '');
+  // 打开已完成的对话不重播逐字动画，只有本次看着跑的任务才逐字展开。
+  const animateStream = shouldAnimateTextReplay(job, watchedJobIdRef.current);
   const transcript = compactReasonTranscript(job, events);
   const liveStage = job?.current_stage;
   const liveProgress = diagnosisStageProgress(job);
@@ -1444,7 +1460,7 @@ function AiDiagnosisConversation({
         {running && <div className="atlog-ai-process-progress" aria-label={`诊断进度 ${Math.round(liveProgress)}%`}><i style={{ width: `${Math.max(2, Math.min(100, liveProgress))}%` }}/></div>}
         {processOpen && <div className="atlog-ai-chat-stream">
           <AiDiagnosisLiveStages events={events} job={job}/>
-          {transcript ? <div className="atlog-ai-live-reason"><GrowingTypewriterText text={transcript}/></div> : !running && <span>本轮没有额外过程信息。</span>}
+          {transcript ? <div className="atlog-ai-live-reason"><GrowingTypewriterText text={transcript} instant={!animateStream}/></div> : !running && <span>本轮没有额外过程信息。</span>}
         </div>}
       </div>
     </div>}
@@ -1453,7 +1469,7 @@ function AiDiagnosisConversation({
       <div className="atlog-ai-chat-avatar"><Sparkles size={17}/></div>
       <div className="atlog-ai-chat-bubble">
         <div className="atlog-ai-chat-title"><strong>诊断结论</strong><span>{result.report.confidence ?? 0}%</span></div>
-        <p className="atlog-ai-chat-conclusion"><TypewriterText text={result.report.root_cause || result.report.summary || '当前证据不足，未形成明确根因。'}/></p>
+        <p className="atlog-ai-chat-conclusion"><TypewriterText text={result.report.root_cause || result.report.summary || '当前证据不足，未形成明确根因。'} instant={!animateStream}/></p>
         <AiEvidenceCards evidence={displayedEvidence}/>
         <div className="atlog-ai-chat-footer">
           {usage && <span>Token：{formatTokenCount(usage.input_tokens)} 输入 / {formatTokenCount(usage.output_tokens)} 输出</span>}

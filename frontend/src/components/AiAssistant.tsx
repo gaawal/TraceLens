@@ -50,6 +50,7 @@ import {
 } from '../api/resourceApi';
 import { executeUiAction } from '../assistant/workstation';
 import { useImeCompositionGuard } from '../utils/imeComposition';
+import { toolDisplayName } from '../assistant/toolNames';
 import {
   DEFAULT_EVIDENCE_MAX_CHARS,
   EVIDENCE_MAX_CHARS_PRESETS,
@@ -863,7 +864,7 @@ function TaskTrace({ message, open, onToggle }: { message: AssistantMessage; ope
           </span>
           <span className="ai-task-summary-copy">
             <strong>{summaryTitle}</strong>
-            {runningTrace?.tool_id && <code className="ai-task-summary-tool">{runningTrace.tool_id}</code>}
+            {runningTrace?.tool_id && <code className="ai-task-summary-tool" title={runningTrace.tool_id}>{toolDisplayName(runningTrace.tool_id)}</code>}
             <small>{summaryDetail}</small>
             {running && typeof task.progress === 'number' ? (
               <span className="ai-task-progress" aria-label={`分析进度 ${Math.round(task.progress)}%`}>
@@ -907,8 +908,8 @@ function TaskTrace({ message, open, onToggle }: { message: AssistantMessage; ope
                     <span className="ai-task-stage-status">{traceStatusLabel(trace.status)}</span>
                   </div>
                   {trace.tool_id && (
-                    <div className="ai-task-stage-tool" title="本步骤实际调用的原子工具">
-                      <code>{trace.tool_id}</code>
+                    <div className="ai-task-stage-tool" title={`本步骤实际调用的原子工具：${trace.tool_id}`} data-tool-id={trace.tool_id}>
+                      <code>{toolDisplayName(trace.tool_id)}</code>
                     </div>
                   )}
                   {sanitizeToolDetail(trace.detail || '') && <p>{sanitizeToolDetail(trace.detail || '')}</p>}
@@ -1013,12 +1014,19 @@ function contextChips(context: Record<string, unknown>): string[] {
   return chips.filter(Boolean).slice(0, 5);
 }
 
-function useProgressiveText(content: string) {
-  const [visible, setVisible] = useState('');
+/**
+ * 逐字展开助手回答。
+ *
+ * `streaming` 才逐字追：这条消息**此刻**正在流式输出时才需要那种「一个字一个字出来」的
+ * 过程感。打开一条已经完成的对话（消息是历史记录，或本轮已经结束）时，直接显示全文 ——
+ * 否则每次回看都要从头把整篇答案重敲一遍。
+ */
+function useProgressiveText(content: string, streaming = false) {
+  const [visible, setVisible] = useState(() => (streaming ? '' : content));
   const targetRef = useRef(content);
   targetRef.current = content;
   useEffect(() => {
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setVisible(content); return; }
+    if (!streaming || window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setVisible(content); return; }
     const tick = () => setVisible((previous) => {
       const target = targetRef.current;
       if (previous === target) return previous;
@@ -1029,7 +1037,7 @@ function useProgressiveText(content: string) {
     tick();
     const timer = window.setInterval(tick, 24);
     return () => window.clearInterval(timer);
-  }, [content]);
+  }, [content, streaming]);
   return visible;
 }
 
@@ -1038,13 +1046,16 @@ function AssistantRichContent({
   onNext,
   disabled,
   extraNext = [],
+  streaming = false,
 }: {
   content: string;
   onNext: (action: string) => void;
   disabled?: boolean;
   extraNext?: string[];
+  /** 这条消息是否正在流式输出；只有它才逐字展开。 */
+  streaming?: boolean;
 }) {
-  const visibleContent = useProgressiveText(content);
+  const visibleContent = useProgressiveText(content, streaming === true);
   const parsed = splitAssistantAnswer(visibleContent);
   const next = [...parsed.next];
   extraNext.map(String).map((item) => item.trim()).filter(Boolean).forEach((item) => {
@@ -2878,7 +2889,13 @@ export function AiAssistant() {
                     {message.content && (
                       <div className="ai-assistant-bubble">
                         {message.role === 'assistant'
-                          ? <AssistantRichContent content={message.content} extraNext={message.suggestions} disabled={Boolean(sendingConversationId)} onNext={(action) => void send(action)} />
+                          ? <AssistantRichContent
+                              content={message.content}
+                              extraNext={message.suggestions}
+                              disabled={Boolean(sendingConversationId)}
+                              streaming={message.task?.status === 'running'}
+                              onNext={(action) => void send(action)}
+                            />
                           : message.content}
                         {message.role === 'assistant' && message.task?.status === 'running' && <span className="ai-stream-caret" aria-hidden="true" />}
                       </div>
