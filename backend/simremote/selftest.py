@@ -1395,7 +1395,7 @@ def check_log_call_chain() -> None:
     # 新增剧本时写错语言（或关键字表被改回中文）会立刻失败。
     #
     # 注意走 ``body_text``：移动点位正文里带 ``{ … }`` 花括号，模板里存的是转义过的
-    # ``{{ … }}``，直接看会看到 ``{{ x:0.003 }}``。校验要按**最终写进日志的样子**判。
+    # ``{{ … }}``，直接看会看到 ``{{ "x":0.003 }}``。校验要按**最终写进日志的样子**判。
     cjk_pattern = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
     offenders: list[str] = []
     rendered_total = 0
@@ -1458,7 +1458,8 @@ def check_multiline_record_fixture() -> None:
     * 还要查"剧本里真的有人用它"，否则夹具写了却没接线，日志里根本不会出现。
 
     三条一起查：**形态**（物理行数 > 1，且续行不以 ``[`` 开头）、**内容**（六自由度 +
-    功率 + 对比度 + ``x1``…``x4`` / ``y1``…``y3`` 全在）、**接线**（spwsp 实时剧本里
+    功率 + 对比度 + ``x1``…``x4`` / ``y1``…``y3`` 全在，**且整个字典能
+    ``json.loads``** —— 键必须带双引号、不能有尾随逗号）、**接线**（spwsp 实时剧本里
     确实有一行正文用了它）。
     """
     from . import livesim, loggen
@@ -1475,18 +1476,38 @@ def check_multiline_record_fixture() -> None:
     if heading_continuations:
         problems.append(f"续行以 '[' 开头，不再是无时间戳的裸续行：{heading_continuations[:2]}")
 
-    missing_dof = [axis for axis in loggen.MOVE_POINT_DOF if f"'{axis}':" not in body]
+    # 快照与点位正文用同一套引号规则：**键与字符串值都带双引号**（花括号里是合法
+    # JSON）。以前这里查的是 Python repr 风格的单引号，用户提出"字典要能 json 解析"
+    # 之后一并改成双引号 —— 顺便也就把"整个快照能不能 json.loads"变成可断言的了。
+    missing_dof = [axis for axis in loggen.MOVE_POINT_DOF if f'"{axis}":' not in body]
     if missing_dof:
         problems.append(f"缺自由度 {missing_dof}")
-    for token in ("'power_mW':", "'contrast':", "'interferometer':"):
+    for token in ('"power_mW":', '"contrast":', '"interferometer":'):
         if token not in body:
             problems.append(f"缺字段 {token}")
+    if "'" in body:
+        problems.append("正文里还留着 Python repr 的单引号（JSON 只认双引号）")
 
-    channels = [axis for axis in loggen.INTERFEROMETER_CHANNELS if f"'{axis}':" in body]
+    channels = [axis for axis in loggen.INTERFEROMETER_CHANNELS if f'"{axis}":' in body]
     if channels != list(loggen.INTERFEROMETER_CHANNELS):
         problems.append(
             f"干涉仪通道 {channels} 与 {list(loggen.INTERFEROMETER_CHANNELS)} 不符"
         )
+
+    # 字典要**真的能 json.loads**：无引号的键、Python 风格的单引号、尾随逗号
+    # 三种写法都"看着像字典"，只有真解析一遍才能同时把它们挡下来。
+    try:
+        parsed = loggen.parse_scan_metric(body)
+    except ValueError as exc:
+        problems.append(f"快照字典 json.loads 失败：{exc}")
+    else:
+        flat = set(parsed) | set(parsed.get("position", {})) | set(parsed.get("interferometer", {}))
+        expected_keys = {"position", "power_mW", "contrast", "interferometer",
+                         "stage_speed_mm_s", "status"}
+        if not expected_keys <= set(parsed):
+            problems.append(f"快照缺字段 {sorted(expected_keys - set(parsed))}")
+        if not set(loggen.INTERFEROMETER_CHANNELS) <= flat:
+            problems.append("解析出来的字典里少干涉仪通道")
 
     wired = any(
         loggen.SCAN_METRIC_MARKER in loggen.body_text(step_body)
@@ -1502,7 +1523,8 @@ def check_multiline_record_fixture() -> None:
         "；".join(problems)
         if problems
         else f"{len(rows)} 行记录 · 六自由度/功率/对比度齐全 · "
-        f"干涉仪 {'/'.join(loggen.INTERFEROMETER_CHANNELS)} 七路 · 已接入 spwsp 实时流",
+        f"干涉仪 {'/'.join(loggen.INTERFEROMETER_CHANNELS)} 七路 · "
+        f"json.loads 通过 · 已接入 spwsp 实时流",
     )
 
 
@@ -1511,16 +1533,23 @@ def check_wsp_move_points() -> None:
 
     形如::
 
-        move absolute { x:0.003, y:0.999, z:0.008, rx:0.0009, ry:-0.0013,
-                        rz:0.0021, speed:120.0, mode:absolute,
-                        point:load_position, status:settled }
+        move absolute { "x":0.003, "y":0.999, "z":0.008, "rx":0.0009, "ry":-0.0013,
+                        "rz":0.0021, "speed":120.0, "mode":"absolute",
+                        "point":"load_position", "status":"settled" }
 
     工件台是 **6-DOF 台**，所以点位行必须给全 ``x, y, z, rx, ry, rz``
     六个自由度（而且顺序就是这个）；少写几个轴会被本条与
     ``wsp 点位行六自由度齐全`` 一起拦下来。
 
     字段顺序、数值精度、点位名都固定（点位表在 ``loggen.WSP_MOVE_POINTS``），
-    这样才能当检索锚点用 —— 用户按 ``x:`` / ``point:load_position`` 就能捞出来。
+    这样才能当检索锚点用 —— 用户按 ``"x":`` / ``"point":"load_position"``
+    就能捞出来。
+
+    🔴 **花括号里必须是合法 JSON**：键与 ``mode`` / ``point`` / ``status`` 都带
+    双引号。用户提过这条 —— 不带引号的 ``{ x:1.250, … }`` 看着像字典，
+    ``json.loads`` 却直接抛 ``JSONDecodeError``，"看着能解析、一用就崩"最坑人。
+    所以除了格式正则，还会**真的 ``json.loads`` 一遍**（见
+    ``wsp 点位正文可被 json.loads 解析``）。
 
     三路都查，缺一路就可能"剧本对了但落盘不对"：
 
@@ -1548,7 +1577,7 @@ def check_wsp_move_points() -> None:
             if not pattern.fullmatch(text):
                 template_bad.append(f"{label}/{function}: {text}")
                 continue
-            covered_points.add(text.split("point:", 1)[1].split(",", 1)[0])
+            covered_points.add(loggen.point_name_of(text))
     for _key, _level, function, _phase, body in livesim._SCRIPT:
         if "move absolute" not in body:
             continue
@@ -1557,7 +1586,7 @@ def check_wsp_move_points() -> None:
         if not pattern.fullmatch(text):
             template_bad.append(f"实时/{function}: {text}")
             continue
-        covered_points.add(text.split("point:", 1)[1].split(",", 1)[0])
+        covered_points.add(loggen.point_name_of(text))
 
     expected_points = {row[0] for row in loggen.WSP_MOVE_POINTS}
     missing_points = sorted(expected_points - covered_points)
@@ -1600,18 +1629,58 @@ def check_wsp_move_points() -> None:
         else f"{target.remote_path} 里没有点位行（先跑 scripts/sim.sh init）",
     )
 
+    # 2a) JSON 层：**真的 json.loads 一遍**（用户提的那条要求）。
+    #     格式正则只能证明"看起来像字典"；不带引号的 ``{ x:1.250, … }`` 同样能写出
+    #     一个好看的正则去放行它，问题恰恰是它解析不了。所以这一条不看正则，
+    #     直接把花括号那段交给 json.loads —— 剧本层与落盘层都要过。
+    def dof_candidates() -> list[str]:
+        """剧本层所有点位正文（已还原花括号）。2a 与 2b 共用同一批样本。"""
+        texts: list[str] = [
+            loggen.body_text(body)
+            for _label, program in loggen.ALL_PROGRAMS
+            for _f, _p, _l, body in program
+            if "move absolute" in body
+        ]
+        texts += [
+            loggen.body_text(body)
+            for _key, _level, _function, _phase, body in livesim._SCRIPT
+            if "move absolute" in body
+        ]
+        return texts
+
+    json_bad: list[str] = []
+    json_checked = 0
+    for text in dof_candidates():
+        json_checked += 1
+        try:
+            parsed = loggen.parse_move_point(text)
+        except ValueError as exc:
+            json_bad.append(f"{text[:60]}…（{exc}）")
+            continue
+        # 解析出来的字典要真的是"那一条点位"，别是解析了一个空对象就放行。
+        if parsed.get("mode") != "absolute" or not parsed.get("point"):
+            json_bad.append(f"{text[:60]}…（缺 mode/point：{sorted(parsed)}）")
+    for line in landed:
+        tail = line[line.index("move absolute"):]
+        json_checked += 1
+        try:
+            loggen.parse_move_point(tail)
+        except ValueError as exc:
+            json_bad.append(f"落盘 {tail[:60]}…（{exc}）")
+    _record(
+        "wsp 点位正文可被 json.loads 解析",
+        json_checked > 0 and not json_bad,
+        f"{len(json_bad)} 条解析失败（如 {json_bad[0]}）" if json_bad
+        else f"{json_checked} 条点位行（剧本 + 落盘）全部 json.loads 成功 · "
+             f"键与字符串值均带双引号",
+    )
+
     # 2b) 六自由度：点位行必须按 x, y, z, rx, ry, rz 的顺序给全六个轴。
     #     工件台是 6-DOF 台，只写平动或只写一个转角都会让这行"看起来像点位、其实不是"。
     #     正则在 :func:`loggen.dof_of_point` 里（``rx`` 要排在 ``x`` 前面交替，
-    #     否则 ``rx:`` 会被单字母分支先吃掉一个 ``x``），这里只比轴序。
-    dof_texts: list[str] = []
-    for _label, program in loggen.ALL_PROGRAMS:
-        dof_texts += [loggen.body_text(body) for _f, _p, _l, body in program if "move absolute" in body]
-    dof_texts += [
-        loggen.body_text(body)
-        for _key, _level, _function, _phase, body in livesim._SCRIPT
-        if "move absolute" in body
-    ]
+    #     否则 ``rx`` 会被单字母分支先吃掉；键名两侧的引号是可选的，现在写的是
+    #     ``"x":``），这里只比轴序。
+    dof_texts = dof_candidates()
     expected_dof = list(loggen.MOVE_POINT_DOF)
     dof_seen = {tuple(loggen.dof_of_point(text)) for text in dof_texts}
     dof_bad = sorted(item for item in dof_seen if list(item) != expected_dof)
@@ -1735,7 +1804,7 @@ def check_wsp_spiral_trajectory() -> None:
             body = item[-1]
             if "move absolute" not in body:
                 continue
-            order.append(loggen.body_text(body).split("point:", 1)[1].split(",", 1)[0])
+            order.append(loggen.point_name_of(body))
         return order
 
     def _contains_run(haystack: list[str], needle: list[str]) -> bool:
@@ -1788,7 +1857,7 @@ def check_wsp_point_call_boundaries() -> None:
     三行一组：
 
         MoveAbsolute() >() enter stage absolute move start dof=6 point=spiral_07 profile=scan
-        MoveAbsolute() move absolute { x:…, point:spiral_07, status:settled }
+        MoveAbsolute() move absolute { "x":…, "point":"spiral_07", "status":"settled" }
         MoveAbsolute() <() leave stage absolute move end dof=6 point=spiral_07 elapsed=… status=ok
 
     ⚠️ 少了这条断言，**退回"一次调用里连打几十条点位"不会触发任何既有断言**：
@@ -1851,7 +1920,7 @@ def check_wsp_point_call_boundaries() -> None:
             if "move absolute" not in body:
                 continue
             # 正文要落在**它自己那个函数**的调用里：wsp 的回零正文也写
-            # ``move absolute { point:origin … }``（记的是参考点坐标），
+            # ``move absolute { … "point":"origin" … }``（记的是参考点坐标），
             # 它属于 ``HomeStage`` 调用，不算"没有边界"。
             if stack and stack[-1][0] == function:
                 stack[-1][1] += 1

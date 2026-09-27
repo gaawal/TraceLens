@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import random
@@ -282,8 +283,16 @@ PHASE_KEYWORDS: dict[str, str] = {
 # ``wsp``（工件台点位）组件的日志不是泛泛的"扫片正文"，而是**固定的绝对移动点位**，
 # 并且是**完整六自由度**（工件台本来就是 6-DOF 台：三个平动 + 三个转动）：
 #
-#     move absolute { x:0.003, y:0.999, z:0.008, rx:0.0009, ry:-0.0013, rz:0.0021,
-#                     speed:120.0, mode:absolute, point:load_position, status:settled }
+#     move absolute { "x":0.003, "y":0.999, "z":0.008, "rx":0.0009, "ry":-0.0013,
+#                     "rz":0.0021, "speed":120.0, "mode":"absolute",
+#                     "point":"load_position", "status":"settled" }
+#
+# 🔴 **键与字符串值一律带双引号 —— 花括号里就是一个合法的 JSON 对象。**
+# 用户提过这件事：字典不带引号（``{ x:1.250, … }``）看着像字典，其实
+# ``json.loads`` 直接抛 ``JSONDecodeError``，"看着能解析、一用就崩"最坑人。
+# 所以数值字段照 JSON 写裸数字（``1.250`` / ``-0.0003`` / ``300.0`` 都合法），
+# 键与 ``mode`` / ``point`` / ``status`` 这三个字符串值必须加 ``"``。
+# 要取出来用，直接 :func:`parse_move_point`（内部就是 ``json.loads``）。
 #
 # 三个"固定"，是为了让它可被当检索锚点用：
 #   * 字段顺序固定（x / y / z / rx / ry / rz / speed / mode / point / status）；
@@ -330,7 +339,7 @@ SPIRAL_Z = 0.015
 SPIRAL_SPEED = 300.0
 
 #: 螺线点位的名字前缀：``spiral_01`` … ``spiral_{SPIRAL_STEPS:02d}``。
-#: 检索"台的运动轨迹"就按 ``point:spiral_`` 捞 —— 按序读到的坐标序列就是轨迹。
+#: 检索"台的运动轨迹"就按 ``"point":"spiral_`` 捞 —— 按序读到的坐标序列就是轨迹。
 SPIRAL_POINT_PREFIX = "spiral_"
 
 
@@ -415,11 +424,15 @@ _MOVE_POINT_BY_NAME = {row[0]: row[1:] for row in WSP_MOVE_POINTS}
 #: 六自由度的**轴顺序**。生成与校验都以它为准，避免哪天又被砍掉几个轴。
 MOVE_POINT_DOF: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
 
+#: 移动点位正文的**固定前缀**。冒号右边就是一个 JSON 对象，见 :func:`parse_move_point`。
+MOVE_POINT_PREFIX = "move absolute "
+
 #: 一条移动点位正文的**校验正则**，与 :func:`move_point` 的输出严格对应。
+#: 键与字符串值都带双引号（花括号内是合法 JSON），数值照 JSON 写裸数字。
 MOVE_POINT_PATTERN = (
-    r"move absolute \{ x:-?\d+\.\d{3}, y:-?\d+\.\d{3}, z:-?\d+\.\d{3}, "
-    r"rx:-?\d+\.\d{4}, ry:-?\d+\.\d{4}, rz:-?\d+\.\d{4}, speed:\d+\.\d, mode:absolute, "
-    r"point:[a-z0-9_]+, status:[a-z]+ \}"
+    r'move absolute \{ "x":-?\d+\.\d{3}, "y":-?\d+\.\d{3}, "z":-?\d+\.\d{3}, '
+    r'"rx":-?\d+\.\d{4}, "ry":-?\d+\.\d{4}, "rz":-?\d+\.\d{4}, "speed":\d+\.\d, '
+    r'"mode":"absolute", "point":"[a-z0-9_]+", "status":"[a-z]+" \}'
 )
 
 
@@ -479,6 +492,11 @@ def move_point(
     平动 x/y/z + 转动 rx/ry/rz 共**六自由度**，顺序固定为
     ``x, y, z, rx, ry, rz``（就是工件台的位置/姿态向量）。
 
+    🔴 **花括号里是合法 JSON**：键与 ``mode`` / ``point`` / ``status`` 三个字符串值
+    都带双引号，数值字段是裸数字。所以这行日志能被直接 ``json.loads`` —— 反过来写
+    （``{ x:1.250, … }``）就是"看着像字典、其实解析不了"，用户点过这一条。
+    要取回字典用 :func:`parse_move_point`，别自己切字符串。
+
     ⚠️ 正文里带 ``{ ... }`` 花括号，而剧本是要过 ``str.format`` 的（模板变量
     ``{trace}`` / ``{elapsed}``）。直接把它当模板存进去会被 ``format`` 当占位符解析并
     抛 ``KeyError`` / ``ValueError``。所以这里返回的是**已转义**的模板片段
@@ -486,9 +504,9 @@ def move_point(
     用 :func:`body_text` 反解。
     """
     text = (
-        f"move absolute {{ x:{x:.3f}, y:{y:.3f}, z:{z:.3f}, "
-        f"rx:{rx:.4f}, ry:{ry:.4f}, rz:{rz:.4f}, "
-        f"speed:{speed:.1f}, mode:absolute, point:{point}, status:{status} }}"
+        f'{MOVE_POINT_PREFIX}{{ "x":{x:.3f}, "y":{y:.3f}, "z":{z:.3f}, '
+        f'"rx":{rx:.4f}, "ry":{ry:.4f}, "rz":{rz:.4f}, '
+        f'"speed":{speed:.1f}, "mode":"absolute", "point":"{point}", "status":"{status}" }}'
     )
     return text.replace("{", "{{").replace("}", "}}")
 
@@ -544,13 +562,49 @@ def move_call_rows(
     return tuple(rows)
 
 
+def parse_move_point(text: str) -> dict:
+    """把一条点位正文反解成字典 —— **内部就是 ``json.loads``，不做字符串切分**。
+
+    点位正文（``move absolute { "x":…, "status":"settled" }``）的花括号里是合法
+    JSON，所以这里直接交给 ``json.loads``：一来省掉一整套脆弱的
+    ``split("point:")[1].split(",")[0]``（字段顺序或引号一变就静默取错），
+    二来它本身就是"这行到底能不能被当 JSON 解析"的校验 —— 校验类代码全部走
+    这个函数，格式与生成就天然同源了。
+
+    入参可以是**已转义**的模板片段，内部用 :func:`body_text` 先还原。
+    """
+    body = body_text(text).strip()
+    if not body.startswith(MOVE_POINT_PREFIX):
+        raise ValueError(f"不是点位正文（缺前缀 {MOVE_POINT_PREFIX!r}）：{body[:60]!r}")
+    payload = body[len(MOVE_POINT_PREFIX):]
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"点位正文不是合法 JSON：{payload[:80]!r}（{exc}）") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"点位正文的 JSON 不是对象：{type(parsed).__name__}")
+    return parsed
+
+
+def point_name_of(text: str) -> str:
+    """从一条点位正文里取出点位名（``"point":"spiral_07"`` -> ``spiral_07``）。
+
+    校验类代码一律用它，别自己 ``split("point:")`` —— 键名带不带引号、字段顺序
+    有没有变，都不该影响"这条是哪次移动"。
+    """
+    return str(parse_move_point(text)["point"])
+
+
 def dof_of_point(text: str) -> list[str]:
     """从一条（还原后的）点位正文里按**出现顺序**抽出自由度字段名。
 
-    用来断言"六个轴一个都没少"。``rx:`` 要排在 ``x:`` 前面交替，否则 ``rx`` 会被
-    单字母分支先吃掉一个 ``x``。
+    用来断言"六个轴一个都没少"。两处细节都不能省：
+
+    * ``rx|ry|rz`` 要排在 ``[xyz]`` 前面交替，否则 ``rx`` 会被单字母分支先吃掉；
+    * 键名两侧的引号是**可选**的（``"x":`` 与 ``x:`` 都要认），所以引号写在
+      捕获组外面 —— 匹配的是 ``"x":``，取回来的仍然只有 ``x``。
     """
-    return re.findall(r"(rx|ry|rz|[xyz]):", text)
+    return re.findall(r'''["']?((?:rx|ry|rz|[xyz]))["']?:''', text)
 
 
 def body_text(body: str) -> str:
@@ -572,10 +626,13 @@ def body_text(body: str) -> str:
 # 都是没有时间戳的裸续行，一直持续到下一条记录的时间戳出现为止。
 #
 #     [2026-09-26 00:05:12.345] [INFO] [SPWSP] [20123] [30145] [spwsp] [normal]
-#         [spwsp:CaptureScanMetrics:412] [CaptureScanMetrics] scan metric snapshot …
-#       'position': {'x': 1.250, 'y': 2.400, …},
-#       'power_mW': 248.63,
+#         [spwsp:CaptureScanMetrics:412] CaptureScanMetrics() scan metric snapshot …
+#       "position": {"x": 1.250, "y": 2.400, …},
+#       "power_mW": 248.63,
 #       …
+#
+# 续行里的花括号整体是**合法 JSON**（键与字符串值双引号），跟 ``move_point`` 一致 ——
+# 日志里的字典一律按 JSON 写，别用 Python ``repr`` 的单引号。
 #
 # ⚠️ 这种日志会**打穿「按行首时间戳切记录」的解析器**。本项目里就是
 # ``apps/logsources/services/remote_logs.py`` 的三条消费路径：
@@ -614,8 +671,11 @@ def scan_metric_body(
     """一条**跨多行**的扫片测量快照正文（花括号已转义，可直接进 ``str.format``）。
 
     一次调用打印：工件台当前**六自由度位置** + 该位置采到的**功率 / 对比度** +
-    激光器镜干涉仪七路通道（``x1``…``x4`` / ``y1``…``y3``）的**对比度字典**，
-    形状就是真机台里 ``pprint`` 一个测量结果字典的样子。
+    激光器镜干涉仪七路通道（``x1``…``x4`` / ``y1``…``y3``）的**对比度字典**。
+    形状就是真机台里把一次测量结果 ``json.dumps(..., indent=2)`` 落下来的样子 ——
+    **键与字符串值一律双引号，花括号里是合法 JSON**（理由见 :func:`move_point`：
+    字典不带引号就 ``json.loads`` 不了；以前这里写的是 Python ``repr`` 风格的单引号，
+    同样过不了 JSON，一并改成双引号）。
 
     返回的是**已转义**的模板片段（``{{ … }}``），理由同 :func:`move_point`：
     正文要过 ``str.format``，不转义会被当成占位符解析并抛 ``KeyError``。
@@ -629,24 +689,46 @@ def scan_metric_body(
         ) from None
 
     lines = [
-        f"{SCAN_METRIC_MARKER} point={name} dof=6 {{",
-        f"  'position': {{'x': {x:.3f}, 'y': {y:.3f}, 'z': {z:.3f}, "
-        f"'rx': {rx:.4f}, 'ry': {ry:.4f}, 'rz': {rz:.4f}}},",
-        f"  'power_mW': {power_mw:.2f},",
-        f"  'contrast': {contrast:.4f},",
-        "  'interferometer': {",
+        f'{SCAN_METRIC_MARKER} point={name} dof=6 {{',
+        f'  "position": {{"x": {x:.3f}, "y": {y:.3f}, "z": {z:.3f}, '
+        f'"rx": {rx:.4f}, "ry": {ry:.4f}, "rz": {rz:.4f}}},',
+        f'  "power_mW": {power_mw:.2f},',
+        f'  "contrast": {contrast:.4f},',
+        '  "interferometer": {',
     ]
-    lines += [
-        f"    '{axis}': {channel_contrast(axis, base=contrast):.4f},"
-        for axis in INTERFEROMETER_CHANNELS
-    ]
+    # ⚠️ **最后一对键值不带逗号** —— 尾随逗号在 Python 里合法、在 JSON 里非法，
+    # 留着它这个字典就 ``json.loads`` 不了（形状看着完全正确，一解析才炸）。
+    last = len(INTERFEROMETER_CHANNELS) - 1
+    for index, axis in enumerate(INTERFEROMETER_CHANNELS):
+        tail = "" if index == last else ","
+        lines.append(f'    "{axis}": {channel_contrast(axis, base=contrast):.4f}{tail}')
     lines += [
         "  },",
-        f"  'stage_speed_mm_s': {speed:.1f},",
-        f"  'status': '{status}',",
+        f'  "stage_speed_mm_s": {speed:.1f},',
+        f'  "status": "{status}"',
         "}",
     ]
     return "\n".join(lines).replace("{", "{{").replace("}", "}}")
+
+
+def parse_scan_metric(text: str) -> dict:
+    """把测量快照正文反解成字典（首行那句前缀之后就是一个**合法 JSON 对象**）。
+
+    与 :func:`parse_move_point` 一并构成"日志里的字典都能 ``json.loads``"的约定：
+    校验类代码走这个函数，而不是去 ``split("'position':")`` —— 那种写法在引号从
+    单引号改双引号、或尾随逗号被加回来时**不会报错，只会取错**。
+    """
+    body = body_text(text).strip()
+    start = body.find("{")
+    if start < 0:
+        raise ValueError(f"快照正文里没有字典：{body[:60]!r}")
+    try:
+        parsed = json.loads(body[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"快照字典不是合法 JSON（{exc}）：{body[start:start + 80]!r}") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"快照字典不是 JSON 对象：{type(parsed).__name__}")
+    return parsed
 
 
 def stage_codes_of(rows) -> tuple[str, ...]:  # noqa: ANN001 - 迭代即可

@@ -546,11 +546,13 @@ print(f"""
              注意头一行要等十几秒才出现：远端 tail -F 的 stdout 是管道（全缓冲），
              要攒满几 KB 才 flush 一次。真实机台同样如此，不是模拟器卡住了。
    点位日志：wsp 是工件台点位组件，日志正文是固定的六自由度点位行
-             move absolute {{ x:…, y:…, z:…, rx:…, ry:…, rz:… }}
+             move absolute {{ "x":…, "y":…, "z":…, "rx":…, "ry":…, "rz":…, "status":"settled" }}
+             花括号里是**合法 JSON**（键与字符串值都带双引号），
+             整段 json.loads 就能取回字典；点位名在 "point" 字段里。
              （每个点位各是一次 MoveAbsolute 调用，三行一组：
-               MoveAbsolute() >() enter … point:spiral_nn …
-               MoveAbsolute() move absolute {{ … point:spiral_nn … }}
-               MoveAbsolute() <() leave … point:spiral_nn elapsed=… status=ok）
+               MoveAbsolute() >() enter … point=spiral_nn …
+               MoveAbsolute() move absolute {{ … "point":"spiral_nn" … }}
+               MoveAbsolute() <() leave … point=spiral_nn elapsed=… status=ok）
    CPD 测校：环境资源 → CPD 测校报告，选子系统 / 模块
    用例分析：ATLog 用例分析页粘贴下面的用例 URL""")
 PY

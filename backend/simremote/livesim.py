@@ -25,12 +25,13 @@
   编码器抖动 → 伺服补偿发热 → 冷却流量不足 → 光源互锁跳闸 → 扫片侧
   WARN/ERROR/FATAL 三级升级 → 复位重试；
 * 其中 ``wsp`` 这条流是**工件台点位**日志：正文是一条固定格式的
-  ``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``（**完整六自由度**，
+  ``move absolute { "x":…, "y":…, "z":…, "rx":…, "ry":…, "rz":… }``
+  （**完整六自由度**，花括号里是**合法 JSON**，键与字符串值双引号；
   点位表见 ``loggen.WSP_MOVE_POINTS``）。**每个点位各是一次 ``MoveAbsolute``
   调用** —— 入口 / 点位正文 / 出口三行一组（见 :func:`_wsp_call`），
   所以每条点位正文都落在自己的边界里，前端能折出"这一次移动"、并读出它花了多久。
   曝光那一段走的是**螺旋步进轨迹** —— 从曝光场中心起步、一圈圈向外盘到边缘
-  （``point:spiral_01`` … ``spiral_24``，几何参数见 ``loggen.SPIRAL_*``），
+  （``"point":"spiral_01"`` … ``"spiral_24"``，几何参数见 ``loggen.SPIRAL_*``），
   所以把 wsp 的点位正文按序读下来，读到的就是工件台的运动轨迹本身。
   它自己也带一条 WARN → ERROR → FATAL 的停位异常链，所以单独订阅它同样有料；
 * 因为前端「实时监听」一次只盯一个模块，需要被单独盯住的流（``spwsp`` / ``wsp``，
@@ -167,7 +168,9 @@ OBSERVER_KEYS: tuple[str, ...] = ("spwsp", "wsp")
 #: "正常节拍"的判定标记：在这条流里找得到任意一个，就说明它不只是异常刷屏。
 NORMAL_BEAT_MARKERS: tuple[str, ...] = (
     "position error within tolerance",
-    "status:settled",
+    # 点位正文的 JSON 收尾字段。字典带引号之后这里必须跟着写成 ``"status":"settled"``，
+    # 否则 wsp 这条流会被判成"只有异常、没有正常节拍"。
+    '"status":"settled"',
 )
 
 
@@ -232,8 +235,8 @@ _ROUND_ROWS: tuple[tuple[str, str | None, str, str, str, str], ...] = (
     # ---- 阶段⓪：工件台回零（wsp 点位流）----
     # wsp 这条流记的是**工件台运动轨迹**，所以它跟着主流程一路走：回零 → 上片点 →
     # 对准点 → 扫描点 → 停位检查 → 卸片点。正文是一条固定格式的移动点位
-    # （``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``，六自由度），
-    # 点位表在 ``loggen.WSP_MOVE_POINTS``。
+    # （``move absolute { "x":…, "y":…, … "status":"settled" }``，六自由度，
+    # 花括号里是合法 JSON），点位表在 ``loggen.WSP_MOVE_POINTS``。
     #
     # ⚠️ **一个点位 = 一次 ``MoveAbsolute`` 调用**（入口 / 点位正文 / 出口，
     # 由 ``_wsp_call`` 展开）：点位正文必须落在**它自己那一次调用**的边界里，

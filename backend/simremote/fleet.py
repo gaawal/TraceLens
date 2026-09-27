@@ -231,8 +231,8 @@ RUN_ROOT = LOG_ROOT + "/run"
 SUBSYSTEM_MODULES: dict[str, tuple[str, ...]] = {
     "spwsp": ("spwsp", "lgsw", "wtrm"),
     # wsp = 工件台点位子系统。它的 fm 日志专门记**绝对移动点位**
-    # （``move absolute { x:…, y:…, z:…, rx:…, ry:…, rz:… }``，六自由度），
-    # 内容规则见 loggen.WSP_MOVE_POINTS。
+    # （``move absolute { "x":…, "y":…, "z":…, "rx":…, "ry":…, "rz":… }``，
+    # 六自由度，花括号里是合法 JSON），内容规则见 loggen.WSP_MOVE_POINTS。
     "wsp": ("wsp",),
     "mecore": ("mecore", "cpcore", "metrl"),
     "cpfr": ("cpfr", "frhyd"),
